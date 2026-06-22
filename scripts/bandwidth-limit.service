@@ -1,0 +1,12 @@
+[Unit]
+Description=Cap network bandwidth (tc) to 150 Mbit/s both directions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bandwidth-limit.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
