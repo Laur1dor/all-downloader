@@ -1,0 +1,111 @@
+services:
+  bot:
+    build: .
+    container_name: tiktok-bot
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      # SOCKS proxy (xray) for adaptive VLESS fallback; empty = always direct.
+      PROXY_URL: ${PROXY_URL:-}
+      # HTTP proxy for spotdl (Spotify API is geo-blocked); empty = direct.
+      SPOTDL_HTTP_PROXY: ${SPOTDL_HTTP_PROXY:-}
+    extra_hosts:
+      # Telegram API resolved statically, bypassing DNS (provider DNS may be unreliable).
+      - "api.telegram.org:149.154.167.220"
+      - "osx.telegram.org:149.154.167.220"
+    volumes:
+      - ./data:/app/data        # data/cookies.txt for Instagram/PornHub auth
+    ports:
+      - "30080:30080"           # health endpoint, useful for external uptime monitors
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:30080/health', timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # Adaptive VLESS routing: xray exposes a local SOCKS/HTTP proxy fed by the
+  # subscription/configs. The bot routes a platform through it only while that
+  # platform is unreachable directly. Enable with the "vless" profile and set
+  # PROXY_URL=socks5h://xray:2080 in .env.
+  xray:
+    build:
+      context: .
+      dockerfile: Dockerfile.xray
+    container_name: xray
+    profiles: ["vless"]
+    environment:
+      VLESS_SUBSCRIPTION: ${VLESS_SUBSCRIPTION:-}
+      VLESS_CONFIGS: ${VLESS_CONFIGS:-}
+      VLESS_CONFIGS_FILE: ${VLESS_CONFIGS_FILE:-}
+      VLESS_UPDATE_INTERVAL: ${VLESS_UPDATE_INTERVAL:-21600}
+    volumes:
+      - ./data:/app/data:ro     # optional: data/vless.txt referenced by VLESS_CONFIGS_FILE
+    restart: unless-stopped
+
+  # Routes the Bot API server's traffic to Telegram through the VLESS proxy.
+  # Telegram's MTProto is often DPI-throttled even where HTTPS works, so the
+  # self-hosted Bot API needs the tunnel to reach Telegram. The bot reaches the
+  # Bot API via this container's "telegram-bot-api" network alias.
+  tun2socks:
+    image: xjasonlyu/tun2socks:latest
+    container_name: tun2socks
+    profiles: ["local-api"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun"]
+    environment:
+      LOGLEVEL: info
+      PROXY: socks5://xray:2080
+    networks:
+      default:
+        aliases: [telegram-bot-api]
+    depends_on: [xray]
+    restart: unless-stopped
+
+  # Self-hosted Bot API server: removes the 50 MB upload limit (up to 2 GB).
+  # Needs TELEGRAM_API_ID/TELEGRAM_API_HASH in .env (https://my.telegram.org)
+  # and TELEGRAM_API_URL=http://telegram-bot-api:8081 for the bot.
+  # Start with the "local-api" profile (requires the "vless" proxy too).
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.botapi
+    container_name: telegram-bot-api
+    profiles: ["local-api"]
+    network_mode: "service:tun2socks"   # all Telegram traffic via the VLESS tunnel
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+    depends_on: [tun2socks]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres-tiktok
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  bot-api-data:

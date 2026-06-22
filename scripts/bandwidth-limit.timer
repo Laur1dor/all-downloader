@@ -1,0 +1,9 @@
+[Unit]
+Description=Reapply bandwidth cap from the admin-controlled rate file
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=20
+
+[Install]
+WantedBy=timers.target

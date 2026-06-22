@@ -1,0 +1,28 @@
+# Secrets and runtime data
+.env
+data/
+logs/
+*.session
+
+# Personal / generated data — not part of the source
+info.txt
+db_backup.sql
+*.sql
+deploy.tgz
+*.zip
+*.rar
+
+# Separate, unrelated private project — must never be part of this repo
+tgtime/
+
+# Personal operations guide — only ever goes to the PRIVATE repo (force-added)
+PRIVATE-GUIDE.md
+
+# Python / tooling
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Claude Code local settings
+.claude/
