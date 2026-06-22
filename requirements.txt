@@ -1,0 +1,8 @@
+aiogram==3.28.2
+gallery-dl==1.32.2  # photo posts (Instagram/TikTok) that yt-dlp cannot handle
+curl_cffi==0.15.0  # browser TLS impersonation for sites that block by fingerprint (PornHub)
+aiohttp==3.13.5  # newest version allowed by aiogram 3.28.x
+asyncpg==0.31.0
+python-dotenv==1.2.2
+yt-dlp==2026.6.9
+PySocks==1.7.1  # SOCKS proxy support for gallery-dl (VLESS fallback routing)
