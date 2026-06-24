@@ -12,6 +12,8 @@ services:
       SPOTDL_HTTP_PROXY: ${SPOTDL_HTTP_PROXY:-}
       # Free public fallback pool (xray's second SOCKS inbound); empty = disabled.
       GOIDA_PROXY_URL: ${GOIDA_PROXY_URL:-}
+      # Curated bypass pool for IP-reputation-blocked sites (DDoS-Guard etc.).
+      BYPASS_PROXY_URL: ${BYPASS_PROXY_URL:-}
     extra_hosts:
       # Telegram API resolved statically, bypassing DNS (provider DNS may be unreliable).
       - "api.telegram.org:149.154.167.220"
@@ -53,6 +55,8 @@ services:
       # Free public fallback pool (exposed on its own SOCKS :2079).
       GOIDA_SUBSCRIPTIONS: ${GOIDA_SUBSCRIPTIONS:-}
       GOIDA_POOL_SIZE: ${GOIDA_POOL_SIZE:-50}
+      # Curated premium bypass pool (comma-sep vless://) on SOCKS :2078.
+      BYPASS_CONFIGS: ${BYPASS_CONFIGS:-}
     volumes:
       - ./data:/app/data:ro     # optional: data/vless.txt referenced by VLESS_CONFIGS_FILE
     restart: unless-stopped

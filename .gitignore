@@ -3,6 +3,8 @@
 data/
 logs/
 *.session
+# WireGuard/AmneziaWG configs contain private keys
+*.conf
 
 # Personal / generated data — not part of the source
 info.txt
