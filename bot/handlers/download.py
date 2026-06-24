@@ -463,7 +463,7 @@ async def _run_link(
                         not isinstance(exc, DownloadCancelledError | FileTooLargeError)
                         and getattr(exc, "retry_via_proxy", False)
                         and not force_proxy
-                        and forced_proxy()
+                        and forced_proxy(platform)
                     ):
                         logger.info("Retrying %s via proxy after a block error", url)
                         force_proxy = True
@@ -477,7 +477,7 @@ async def _run_link(
         # hide the post type until yt-dlp resolves them).
         if platform in PHOTO_CAPABLE_PLATFORMS and not isinstance(exc, FileTooLargeError):
             await _safe_edit(status_message, "🔍 Видео не нашлось — проверяю, нет ли там фото…")
-            album_proxy = bool(getattr(exc, "retry_via_proxy", False) and forced_proxy())
+            album_proxy = bool(getattr(exc, "retry_via_proxy", False) and forced_proxy(platform))
             if await _deliver_album(
                 message, db, status_message, url, settings, platform, user_id,
                 started, url_cache, album_proxy,
@@ -981,7 +981,7 @@ async def _run_audio_flow(
                         not isinstance(exc, DownloadCancelledError | FileTooLargeError)
                         and getattr(exc, "retry_via_proxy", False)
                         and not force_proxy
-                        and forced_proxy()
+                        and forced_proxy(platform)
                     ):
                         force_proxy = True
                         continue

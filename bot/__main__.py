@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -55,7 +56,7 @@ async def run() -> None:
 
     await config.load(db)
 
-    proxy_router = configure_router(settings.proxy_url)
+    proxy_router = configure_router(settings.proxy_url, os.getenv("GOIDA_PROXY_URL") or None)
     await proxy_router.start()
     if proxy_router.enabled:
         logger.info("Adaptive VLESS routing enabled (fallback proxy: %s)", settings.proxy_url)
