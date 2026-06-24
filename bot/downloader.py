@@ -310,7 +310,8 @@ def _base_options(cookies_file: Path | None, url: str = "", force_proxy: bool = 
             options["impersonate"] = target
     if any(host == h or host.endswith("." + h) for h in _NOCHECKCERT_HOSTS):
         options["nocheckcertificate"] = True
-    proxy = forced_proxy() if force_proxy else (proxy_for(detect_platform(url)) if url else None)
+    _plat = detect_platform(url) if url else ""
+    proxy = forced_proxy(_plat) if force_proxy else (proxy_for(_plat) if url else None)
     if proxy:
         options["proxy"] = proxy
     return options
@@ -960,7 +961,8 @@ async def download_album(
     """Async context manager yielding album media; temp files are always removed."""
     tmpdir = tempfile.mkdtemp(prefix="tg-album-")
     host = (urlparse(url).hostname or "").lower()
-    proxy = forced_proxy() if force_proxy else proxy_for(detect_platform(url))
+    _plat = detect_platform(url)
+    proxy = forced_proxy(_plat) if force_proxy else proxy_for(_plat)
     try:
         try:
             if host.endswith("rule34.xxx"):

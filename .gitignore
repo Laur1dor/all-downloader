@@ -18,6 +18,9 @@ tgtime/
 # Personal operations guide — only ever goes to the PRIVATE repo (force-added)
 PRIVATE-GUIDE.md
 
+# Private context/handoff artifact — never publish (contains infra/secrets refs)
+PROJECT-CONTEXT.md
+
 # Python / tooling
 .venv/
 __pycache__/

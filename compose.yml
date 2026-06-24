@@ -10,6 +10,8 @@ services:
       PROXY_URL: ${PROXY_URL:-}
       # HTTP proxy for spotdl (Spotify API is geo-blocked); empty = direct.
       SPOTDL_HTTP_PROXY: ${SPOTDL_HTTP_PROXY:-}
+      # Free public fallback pool (xray's second SOCKS inbound); empty = disabled.
+      GOIDA_PROXY_URL: ${GOIDA_PROXY_URL:-}
     extra_hosts:
       # Telegram API resolved statically, bypassing DNS (provider DNS may be unreliable).
       - "api.telegram.org:149.154.167.220"
@@ -48,6 +50,9 @@ services:
       VLESS_CONFIGS: ${VLESS_CONFIGS:-}
       VLESS_CONFIGS_FILE: ${VLESS_CONFIGS_FILE:-}
       VLESS_UPDATE_INTERVAL: ${VLESS_UPDATE_INTERVAL:-21600}
+      # Free public fallback pool (exposed on its own SOCKS :2079).
+      GOIDA_SUBSCRIPTIONS: ${GOIDA_SUBSCRIPTIONS:-}
+      GOIDA_POOL_SIZE: ${GOIDA_POOL_SIZE:-50}
     volumes:
       - ./data:/app/data:ro     # optional: data/vless.txt referenced by VLESS_CONFIGS_FILE
     restart: unless-stopped

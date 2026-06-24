@@ -19,9 +19,42 @@ import sys
 import urllib.parse
 import urllib.request
 
+import tomllib
+
+ROUTING_FILE = os.getenv("ROUTING_FILE", "/app/data/routing.toml")
+
+# Domains per platform, for pinning a dedicated node by domain-routing when a
+# [services] entry in routing.toml is a vless:// link. Default is "<name>.com".
+_SERVICE_DOMAINS = {
+    "rule34": ["rule34.xxx"],
+    "rule34video": ["rule34video.com"],
+    "twitter": ["x.com", "twitter.com"],
+    "joidb": ["the-joi-database.com"],
+    "yandexmusic": ["music.yandex.ru", "music.yandex.com"],
+    "tiktok": ["tiktok.com"],
+    "youtube": ["youtube.com", "youtu.be"],
+    "instagram": ["instagram.com"],
+}
+
+
+def _pinned_services() -> dict[str, str]:
+    """Platforms whose routing.toml policy is a vless:// link → dedicated node."""
+    try:
+        with open(ROUTING_FILE, "rb") as fh:
+            services = tomllib.load(fh).get("services", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return {k: v for k, v in services.items() if isinstance(v, str) and v.startswith("vless://")}
+
 SOCKS_PORT = int(os.getenv("XRAY_SOCKS_PORT", "2080"))
 HTTP_PORT = int(os.getenv("XRAY_HTTP_PORT", "2081"))
 PROBE_URL = os.getenv("XRAY_PROBE_URL", "https://www.google.com/generate_204")
+
+# Free public pool (e.g. AvenCores/goida-vpn-configs). Exposed on its own SOCKS
+# port with a random-pick balancer, so the main node stays clean and a separate
+# pool of throwaway nodes is available for IP-banned sites / main-node fallback.
+GOIDA_SOCKS_PORT = int(os.getenv("GOIDA_SOCKS_PORT", "2079"))
+GOIDA_POOL_SIZE = int(os.getenv("GOIDA_POOL_SIZE", "50"))
 
 
 def _b64_maybe(text: str) -> str:
@@ -60,6 +93,41 @@ def collect_links() -> list[str]:
         if link not in seen:
             seen.append(link)
     return seen
+
+
+def collect_goida_links() -> list[str]:
+    """VLESS links from the free public subscriptions, taken in order, capped.
+
+    The aggregators mix many protocols; we keep only VLESS (the majority) so no
+    extra parsers are needed, and cap the count so the observatory stays light.
+    """
+    urls = [s.strip() for s in os.getenv("GOIDA_SUBSCRIPTIONS", "").split(",") if s.strip()]
+    seen: list[str] = []
+    for url in urls:
+        try:
+            text = _b64_maybe(_fetch(url))
+        except Exception as exc:
+            print(f"WARN: goida subscription {url!r} failed: {exc}", file=sys.stderr)
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("vless://") and line not in seen:
+                seen.append(line)
+                if len(seen) >= GOIDA_POOL_SIZE:
+                    return seen
+    return seen
+
+
+def _links_to_outbounds(links: list[str], prefix: str) -> tuple[list[dict], list[str]]:
+    outbounds, tags = [], []
+    for index, link in enumerate(links):
+        tag = f"{prefix}{index}"
+        try:
+            outbounds.append(vless_to_outbound(link, tag))
+            tags.append(tag)
+        except Exception as exc:
+            print(f"WARN: cannot parse a config: {exc}", file=sys.stderr)
+    return outbounds, tags
 
 
 def vless_to_outbound(link: str, tag: str) -> dict:
@@ -142,44 +210,90 @@ def vless_to_outbound(link: str, tag: str) -> dict:
     }
 
 
-def build_config(links: list[str]) -> dict:
-    proxy_tags = []
-    outbounds = []
-    for index, link in enumerate(links):
-        tag = f"vless-{index}"
-        try:
-            outbounds.append(vless_to_outbound(link, tag))
-            proxy_tags.append(tag)
-        except Exception as exc:
-            print(f"WARN: cannot parse a config: {exc}", file=sys.stderr)
-
+def build_config(links: list[str], goida_links: list[str] | None = None) -> dict:
+    outbounds, proxy_tags = _links_to_outbounds(links, "vless-")
     if not proxy_tags:
         raise SystemExit("No usable VLESS configs found (check VLESS_SUBSCRIPTION/VLESS_CONFIGS).")
+
+    goida_outbounds, goida_tags = _links_to_outbounds(goida_links or [], "gvless-")
+    outbounds += goida_outbounds
 
     outbounds += [
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"},
     ]
 
-    return {
+    inbounds = [
+        {
+            "tag": "socks",
+            "listen": "0.0.0.0",
+            "port": SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        },
+        {
+            "tag": "http",
+            "listen": "0.0.0.0",
+            "port": HTTP_PORT,
+            "protocol": "http",
+        },
+    ]
+    # Main pool: lowest-ping live node. Routed from the socks/http inbounds.
+    balancers = [{"tag": "proxy", "selector": ["vless-"], "strategy": {"type": "leastPing"}}]
+    rules = [{"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"}]
+
+    # Per-service pinned nodes (routing.toml entries that are vless:// links):
+    # a dedicated outbound + a domain rule that wins over the balancer.
+    for service, link in _pinned_services().items():
+        tag = f"svc-{service}"
+        try:
+            outbounds.append(vless_to_outbound(link, tag))
+        except Exception as exc:
+            print(f"WARN: pinned node for {service} unparsable: {exc}", file=sys.stderr)
+            continue
+        domains = _SERVICE_DOMAINS.get(service, [f"{service}.com"])
+        rules.insert(0, {
+            "type": "field",
+            "domain": [f"domain:{d}" for d in domains],
+            "outboundTag": tag,
+        })
+
+    # Free goida pool on its own inbound. leastLoad over a burst-health-checked
+    # set rotates among the *live* nodes (random over all would keep hitting dead
+    # ones); dead nodes drop out continuously, nothing is cached.
+    burst = None
+    if goida_tags:
+        inbounds.append({
+            "tag": "goida-socks",
+            "listen": "0.0.0.0",
+            "port": GOIDA_SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        })
+        balancers.append({
+            "tag": "goida",
+            "selector": ["gvless-"],
+            "strategy": {"type": "leastLoad", "settings": {"expected": 8, "maxRTT": "4s"}},
+        })
+        rules.insert(
+            0, {"type": "field", "inboundTag": ["goida-socks"], "balancerTag": "goida"}
+        )
+        burst = {
+            "subjectSelector": ["gvless-"],
+            "pingConfig": {
+                "destination": PROBE_URL,
+                "interval": "90s",
+                "sampling": 2,
+                "timeout": "8s",
+            },
+        }
+
+    config = {
         "log": {"loglevel": "warning"},
-        "inbounds": [
-            {
-                "tag": "socks",
-                "listen": "0.0.0.0",
-                "port": SOCKS_PORT,
-                "protocol": "socks",
-                "settings": {"udp": True, "auth": "noauth"},
-            },
-            {
-                "tag": "http",
-                "listen": "0.0.0.0",
-                "port": HTTP_PORT,
-                "protocol": "http",
-            },
-        ],
+        "inbounds": inbounds,
         "outbounds": outbounds,
-        # Observatory pings each node; the balancer routes to the live, fastest one.
+        # Observatory continuously pings the main pool; dead nodes drop from the
+        # leastPing balancer automatically (no stale pick survives).
         "observatory": {
             "subjectSelector": ["vless-"],
             "probeUrl": PROBE_URL,
@@ -187,21 +301,23 @@ def build_config(links: list[str]) -> dict:
         },
         "routing": {
             "domainStrategy": "AsIs",
-            "balancers": [
-                {"tag": "proxy", "selector": ["vless-"], "strategy": {"type": "leastPing"}}
-            ],
-            "rules": [{"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"}],
+            "balancers": balancers,
+            "rules": rules,
         },
     }
+    if burst is not None:
+        config["burstObservatory"] = burst
+    return config
 
 
 def main() -> None:
     output = sys.argv[1] if len(sys.argv) > 1 else "/etc/xray/config.json"
-    config = build_config(collect_links())
+    config = build_config(collect_links(), collect_goida_links())
     with open(output, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
-    nodes = sum(1 for o in config["outbounds"] if o["tag"].startswith("vless-"))
-    print(f"xray config written to {output}: {nodes} node(s)")
+    main_nodes = sum(1 for o in config["outbounds"] if o["tag"].startswith("vless-"))
+    goida_nodes = sum(1 for o in config["outbounds"] if o["tag"].startswith("gvless-"))
+    print(f"xray config: {output} — {main_nodes} main node(s), {goida_nodes} goida node(s)")
 
 
 if __name__ == "__main__":
