@@ -56,7 +56,11 @@ async def run() -> None:
 
     await config.load(db)
 
-    proxy_router = configure_router(settings.proxy_url, os.getenv("GOIDA_PROXY_URL") or None)
+    proxy_router = configure_router(
+        settings.proxy_url,
+        os.getenv("GOIDA_PROXY_URL") or None,
+        os.getenv("BYPASS_PROXY_URL") or None,
+    )
     await proxy_router.start()
     if proxy_router.enabled:
         logger.info("Adaptive VLESS routing enabled (fallback proxy: %s)", settings.proxy_url)

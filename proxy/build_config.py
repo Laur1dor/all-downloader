@@ -56,6 +56,16 @@ PROBE_URL = os.getenv("XRAY_PROBE_URL", "https://www.google.com/generate_204")
 GOIDA_SOCKS_PORT = int(os.getenv("GOIDA_SOCKS_PORT", "2079"))
 GOIDA_POOL_SIZE = int(os.getenv("GOIDA_POOL_SIZE", "50"))
 
+# Curated "bypass" pool: a few premium VLESS nodes (in BYPASS_CONFIGS) on their
+# own SOCKS port, leastPing with health failover — for sites that block by IP
+# reputation (e.g. DDoS-Guard) where the free/main exits get blocked.
+BYPASS_SOCKS_PORT = int(os.getenv("BYPASS_SOCKS_PORT", "2078"))
+
+
+def collect_bypass_links() -> list[str]:
+    inline = os.getenv("BYPASS_CONFIGS", "").replace(",", "\n")
+    return [ln.strip() for ln in inline.splitlines() if ln.strip().startswith("vless://")]
+
 
 def _b64_maybe(text: str) -> str:
     stripped = "".join(text.split())
@@ -210,13 +220,19 @@ def vless_to_outbound(link: str, tag: str) -> dict:
     }
 
 
-def build_config(links: list[str], goida_links: list[str] | None = None) -> dict:
+def build_config(
+    links: list[str],
+    goida_links: list[str] | None = None,
+    bypass_links: list[str] | None = None,
+) -> dict:
     outbounds, proxy_tags = _links_to_outbounds(links, "vless-")
     if not proxy_tags:
         raise SystemExit("No usable VLESS configs found (check VLESS_SUBSCRIPTION/VLESS_CONFIGS).")
 
     goida_outbounds, goida_tags = _links_to_outbounds(goida_links or [], "gvless-")
     outbounds += goida_outbounds
+    bypass_outbounds, bypass_tags = _links_to_outbounds(bypass_links or [], "byp-")
+    outbounds += bypass_outbounds
 
     outbounds += [
         {"tag": "direct", "protocol": "freedom"},
@@ -288,14 +304,32 @@ def build_config(links: list[str], goida_links: list[str] | None = None) -> dict
             },
         }
 
+    # Curated bypass pool on its own inbound: leastPing with health failover.
+    observatory_subjects = ["vless-"]
+    if bypass_tags:
+        inbounds.append({
+            "tag": "bypass-socks",
+            "listen": "0.0.0.0",
+            "port": BYPASS_SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        })
+        balancers.append(
+            {"tag": "bypass", "selector": ["byp-"], "strategy": {"type": "leastPing"}}
+        )
+        rules.insert(
+            0, {"type": "field", "inboundTag": ["bypass-socks"], "balancerTag": "bypass"}
+        )
+        observatory_subjects.append("byp-")
+
     config = {
         "log": {"loglevel": "warning"},
         "inbounds": inbounds,
         "outbounds": outbounds,
-        # Observatory continuously pings the main pool; dead nodes drop from the
-        # leastPing balancer automatically (no stale pick survives).
+        # Observatory continuously pings the main + bypass pools; dead nodes drop
+        # from their leastPing balancers automatically (no stale pick survives).
         "observatory": {
-            "subjectSelector": ["vless-"],
+            "subjectSelector": observatory_subjects,
             "probeUrl": PROBE_URL,
             "probeInterval": "60s",
         },
@@ -312,12 +346,12 @@ def build_config(links: list[str], goida_links: list[str] | None = None) -> dict
 
 def main() -> None:
     output = sys.argv[1] if len(sys.argv) > 1 else "/etc/xray/config.json"
-    config = build_config(collect_links(), collect_goida_links())
+    config = build_config(collect_links(), collect_goida_links(), collect_bypass_links())
     with open(output, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
-    main_nodes = sum(1 for o in config["outbounds"] if o["tag"].startswith("vless-"))
-    goida_nodes = sum(1 for o in config["outbounds"] if o["tag"].startswith("gvless-"))
-    print(f"xray config: {output} — {main_nodes} main node(s), {goida_nodes} goida node(s)")
+    n = lambda p: sum(1 for o in config["outbounds"] if o["tag"].startswith(p))  # noqa: E731
+    print(f"xray config: {output} — {n('vless-')} main, {n('gvless-')} goida, "
+          f"{n('byp-')} bypass node(s)")
 
 
 if __name__ == "__main__":

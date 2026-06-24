@@ -54,9 +54,13 @@ _DEFAULT_ROUTING: dict = {
 class ProxyRouter:
     """Decides, per platform, whether to go direct or through which pool."""
 
-    def __init__(self, proxy_url: str | None, goida_url: str | None = None) -> None:
+    def __init__(
+        self, proxy_url: str | None, goida_url: str | None = None,
+        bypass_url: str | None = None,
+    ) -> None:
         self._proxy_url = proxy_url or None
         self._goida_url = goida_url or None
+        self._bypass_url = bypass_url or None
         # Optimistic start: assume the gateway's DPI bypass works.
         self._direct_ok: dict[str, bool] = dict.fromkeys(_PROBE_URLS, True)
         self._proxy_ok = False
@@ -117,6 +121,8 @@ class ProxyRouter:
             return None
         if policy == "goida":
             return self._goida_url or self._proxy_url
+        if policy == "bypass":
+            return self._bypass_url or self._goida_url or self._proxy_url
         if policy == "main":
             return self._main_or_fallback()
         # adaptive: direct while it works, otherwise the main node (or fallback)
@@ -127,8 +133,12 @@ class ProxyRouter:
     def forced_proxy(self, platform: str = "") -> str | None:
         """Proxy for a content-level retry (a post that blocks this IP). Honours
         the platform's pool so a goida-routed site retries via a new random exit."""
-        if platform and self._policy_for(platform) == "goida":
-            return self._goida_url or self._proxy_url
+        if platform:
+            policy = self._policy_for(platform)
+            if policy == "bypass":
+                return self._bypass_url or self._goida_url or self._proxy_url
+            if policy == "goida":
+                return self._goida_url or self._proxy_url
         return self._proxy_url
 
     async def start(self) -> None:
@@ -182,9 +192,11 @@ class ProxyRouter:
 _router = ProxyRouter(None)
 
 
-def configure_router(proxy_url: str | None, goida_url: str | None = None) -> ProxyRouter:
+def configure_router(
+    proxy_url: str | None, goida_url: str | None = None, bypass_url: str | None = None
+) -> ProxyRouter:
     global _router
-    _router = ProxyRouter(proxy_url, goida_url)
+    _router = ProxyRouter(proxy_url, goida_url, bypass_url)
     return _router
 
 
