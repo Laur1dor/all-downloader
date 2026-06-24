@@ -1,0 +1,28 @@
+# Per-platform routing. Copy to data/routing.toml; edits apply live (hot-reload,
+# no restart needed). If the file is absent, sensible built-in defaults are used.
+
+[defaults]
+# Policy for platforms not listed in [services] below:
+#   "adaptive" — direct while it works, the main VLESS node when blocked
+#   "direct"   — always straight out
+#   "main"     — always via the main VLESS node (socks :2080)
+#   "goida"    — always via the free public pool (socks :2079, random exit)
+policy = "adaptive"
+
+# If the main node is down, route everything that used it through the goida pool,
+# so one dead node never takes the whole bot down. Set "" to disable fallback.
+main_fallback = "goida"
+
+[services]
+# platform = "direct" | "main" | "goida" | "adaptive" | "vless://..."
+tiktok      = "main"      # IP-banned for some regions — always via the node
+rule34      = "goida"     # Cloudflare bans datacenter IPs — use throwaway exits
+rule34video = "goida"
+# instagram = "adaptive"
+# youtube   = "direct"
+# pornhub   = "adaptive"
+
+# Per-service dedicated node (off by default): paste a vless:// link and it is
+# pinned for this platform via xray domain-routing — top priority for it.
+# Uncomment and fill in to use:
+# pornhub   = "vless://uuid@host:443?security=reality&pbk=...&sid=...&sni=..."
