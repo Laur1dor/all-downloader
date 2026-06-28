@@ -6,6 +6,10 @@
 автоматически уводить заблокированные платформы через VLESS-прокси) и на загрузку
 файлов до **2 ГБ** через собственный Bot API сервер.
 
+> ▶️ **Готовый к работе бот: [@TikTokDownloaderFF_bot](https://t.me/TikTokDownloaderFF_bot)** —
+> можно пользоваться прямо сейчас, ничего не разворачивая. /
+> **Live bot: [@TikTokDownloaderFF_bot](https://t.me/TikTokDownloaderFF_bot)** — use it now, no setup needed.
+
 **Языки:** [Русский](#-русская-версия) · [English](#-english-version)
 
 ---
