@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -105,11 +106,23 @@ def collect_links() -> list[str]:
     return seen
 
 
+# Russian exits are useless here (the bot serves a region that blocks the very
+# sites it downloads from), so they are skipped by their share-link label.
+_RU_MARKERS = ("\U0001f1f7\U0001f1fa", "russia", "россия", "russian")
+
+
+def _is_russian(link: str) -> bool:
+    label = link.split("#", 1)[1] if "#" in link else ""
+    label = urllib.parse.unquote(label)
+    return any(m in label or m in label.lower() for m in _RU_MARKERS)
+
+
 def collect_goida_links() -> list[str]:
     """VLESS links from the free public subscriptions, taken in order, capped.
 
     The aggregators mix many protocols; we keep only VLESS (the majority) so no
-    extra parsers are needed, and cap the count so the observatory stays light.
+    extra parsers are needed, drop Russian exits, and cap the count so the
+    observatory stays light.
     """
     urls = [s.strip() for s in os.getenv("GOIDA_SUBSCRIPTIONS", "").split(",") if s.strip()]
     seen: list[str] = []
@@ -121,7 +134,7 @@ def collect_goida_links() -> list[str]:
             continue
         for line in text.splitlines():
             line = line.strip()
-            if line.startswith("vless://") and line not in seen:
+            if line.startswith("vless://") and line not in seen and not _is_russian(line):
                 seen.append(line)
                 if len(seen) >= GOIDA_POOL_SIZE:
                     return seen
@@ -149,6 +162,10 @@ def vless_to_outbound(link: str, tag: str) -> dict:
 
     network = params.get("type", "tcp")
     security = params.get("security", "none")
+    # Free configs sometimes carry junk (e.g. security=false) that makes xray
+    # reject the whole config — clamp to a value xray accepts.
+    if security not in ("reality", "tls", "none"):
+        security = "none"
 
     stream: dict = {"network": network, "security": security}
 
@@ -344,11 +361,36 @@ def build_config(
     return config
 
 
+def _xray_accepts(path: str) -> bool:
+    """True if xray can load the config. A single malformed free node would
+    otherwise make xray reject the whole config and never start."""
+    try:
+        r = subprocess.run(["xray", "run", "-test", "-c", path],
+                           capture_output=True, timeout=40)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True  # can't test (e.g. binary missing) → don't block startup
+
+
+def _write(path: str, config: dict) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2)
+
+
 def main() -> None:
     output = sys.argv[1] if len(sys.argv) > 1 else "/etc/xray/config.json"
-    config = build_config(collect_links(), collect_goida_links(), collect_bypass_links())
-    with open(output, "w", encoding="utf-8") as fh:
-        json.dump(config, fh, indent=2)
+    links, bypass = collect_links(), collect_bypass_links()
+    goida = collect_goida_links()
+    config = build_config(links, goida, bypass)
+    _write(output, config)
+    # The main + bypass pools are curated/valid; only the free goida pool can
+    # carry a node xray rejects. If the full config fails to load, drop goida so
+    # xray (and the whole bot, which tunnels through it) always comes up.
+    if goida and not _xray_accepts(output):
+        print("WARN: config rejected by xray — rebuilding without the goida pool",
+              file=sys.stderr)
+        config = build_config(links, [], bypass)
+        _write(output, config)
     n = lambda p: sum(1 for o in config["outbounds"] if o["tag"].startswith(p))  # noqa: E731
     print(f"xray config: {output} — {n('vless-')} main, {n('gvless-')} goida, "
           f"{n('byp-')} bypass node(s)")
