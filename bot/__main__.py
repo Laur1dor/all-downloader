@@ -30,6 +30,7 @@ async def _set_command_menus(bot: Bot, settings: Settings) -> None:
     """Public menu for everyone; the admin's chat additionally shows /admin24."""
     public = [
         BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="suggest", description="💡 Предложить идею или сайт"),
         BotCommand(command="restart", description="Перезапустить бота"),
     ]
     await bot.set_my_commands(public)
