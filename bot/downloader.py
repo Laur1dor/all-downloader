@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
@@ -187,9 +187,11 @@ def is_youtube_music(url: str) -> bool:
     return (urlparse(url).hostname or "").lower() == "music.youtube.com"
 
 
-# the-joi-database.com embeds its HLS stream in page JS; the generic extractor
-# misses it, so the .m3u8 manifest URL is scraped out and handed to yt-dlp.
+# the-joi-database.com serves its HLS stream through the player's API endpoint
+# (data-hls-source="/api/stream/<id>"); older pages embedded a raw .m3u8 URL in
+# the JS. Either way the manifest URL is scraped out and handed to yt-dlp.
 _M3U8_RE = re.compile(r'https?://[^"\' \\]+\.m3u8[^"\' \\]*')
+_JOIDB_HLS_RE = re.compile(r"""data-hls-source=["']([^"']+)["']""")
 
 
 def _curl_get(url: str, *, proxy: str | None = None, **kwargs):
@@ -224,6 +226,13 @@ def _fetch_html(url: str, proxy: str | None = None, attempts: int = 3) -> str:
 
 def _resolve_joidb_sync(url: str, proxy: str | None) -> str:
     html = _fetch_html(url, proxy=proxy)
+    # Preferred: the player's HLS API endpoint (data-hls-source="/api/stream/…"),
+    # resolved against the page URL since it is a site-relative path. Its response
+    # is a valid HLS master playlist that yt-dlp reads directly.
+    match = _JOIDB_HLS_RE.search(html)
+    if match:
+        return urljoin(url, match.group(1).replace("&amp;", "&"))
+    # Fallback: an embedded absolute .m3u8 URL (older page layout).
     match = _M3U8_RE.search(html)
     if not match:
         raise DownloadFailedError("Не удалось найти видео на странице.")
@@ -274,9 +283,12 @@ async def resolve_download_url(url: str) -> str:
     return url
 
 
-# Sites that block by TLS fingerprint (PornHub/Cloudflare/Rule34Video) need
-# browser impersonation, which requires the optional curl_cffi backend.
-_IMPERSONATE_HOSTS = ("pornhub.com", "rule34video.com")
+# Sites that block by TLS fingerprint (PornHub/Cloudflare) need browser
+# impersonation, which requires the optional curl_cffi backend. Rule34Video is
+# deliberately NOT here: it routes through WARP (routing.toml), and DDoS-Guard
+# 504s a chrome-impersonated fingerprint arriving from a Cloudflare WARP IP —
+# the plain TLS stack passes, so impersonation must stay off for it.
+_IMPERSONATE_HOSTS = ("pornhub.com",)
 
 
 def _impersonate_target():
@@ -407,9 +419,13 @@ def _download_sync(url: str, options: dict) -> tuple[Path, dict]:
 
 
 # Error signatures that a different exit IP (the VLESS proxy) is likely to clear.
+# The 5xx/gateway set covers DDoS-Guard "under attack" 502/504s (rule34video),
+# which block by IP reputation and often clear from a different exit pool.
 _BLOCK_MARKERS = (
     "ip address is blocked", "403", "forbidden", "not available in your country",
     "geo restrict", "geo-restrict", "rate-limit", "too many requests",
+    "http error 502", "http error 503", "http error 504",
+    "bad gateway", "gateway timeout", "service unavailable",
 )
 
 
@@ -932,7 +948,9 @@ def _scrape_rule34_sync(url: str, tmpdir: str, proxy: str | None = None) -> Albu
             break
         time.sleep(1.0)
     if not seen:
-        raise DownloadFailedError("По этой ссылке не нашлось ни видео, ни фото.")
+        raise DownloadFailedError(
+            "По этой ссылке не нашлось ни видео, ни фото.", retry_via_proxy=True
+        )
 
     # A video post embeds both a poster image and the clip — prefer the video.
     # Video lives on a dedicated CDN (nymp4.*); the image host (wimg.*) 403s for it.
@@ -943,15 +961,61 @@ def _scrape_rule34_sync(url: str, tmpdir: str, proxy: str | None = None) -> Albu
     media_url = videos[0] if videos else seen[0]
     ext = Path(urlparse(media_url).path).suffix.lower() or ".jpg"
     dest = Path(tmpdir) / f"rule34{ext}"
-    # The video CDN returns 403 without a Referer pointing back to the post page.
-    response = _curl_get(
-        media_url, proxy=proxy, headers={**_BROWSER_HEADERS, "Referer": url},
-        timeout=120, stream=True,
+    # The media CDN returns 403 without a Referer pointing back to the post page,
+    # and through a flaky proxy exit the body can arrive truncated or as an HTML
+    # challenge page — writing that blindly gives Telegram a corrupt image that
+    # renders with the wrong proportions. Validate the response and, on failure,
+    # rotate the fingerprint (the pooled proxy also rotates its exit) and retry.
+    last_reason = "no response"
+    for target in ("chrome", "safari", "chrome131"):
+        try:
+            response = _curl_get(
+                media_url, proxy=proxy,
+                headers={**_BROWSER_HEADERS, "Referer": url},
+                impersonate=target, timeout=120, stream=True,
+            )
+        except Exception as exc:  # transient network/TLS — try the next fingerprint
+            last_reason = f"network error ({exc})"
+            time.sleep(1.0)
+            continue
+        if response.status_code != 200:
+            last_reason = f"HTTP {response.status_code}"
+            response.close()
+            time.sleep(1.0)
+            continue
+        expected = int(response.headers.get("Content-Length") or 0)
+        with dest.open("wb") as fh:
+            for chunk in response.iter_content():
+                fh.write(chunk)
+        if _rule34_media_ok(dest, expected):
+            return AlbumMedia(items=[dest], music=None)
+        last_reason = "truncated or invalid body"
+        time.sleep(1.0)
+    logger.info("rule34 media download failed: %s (%s)", media_url, last_reason)
+    raise DownloadFailedError(
+        "Не удалось скачать медиа rule34 (нестабильное соединение). Попробуйте ещё раз.",
+        retry_via_proxy=True,
     )
-    with dest.open("wb") as fh:
-        for chunk in response.iter_content():
-            fh.write(chunk)
-    return AlbumMedia(items=[dest], music=None)
+
+
+def _rule34_media_ok(path: Path, expected_len: int) -> bool:
+    """Reject a truncated download or an HTML challenge/error page saved as media.
+
+    A corrupt image is the usual cause of rule34 pictures losing their aspect
+    ratio in Telegram, so we drop anything that is too small, starts like HTML,
+    or is shorter than the server-declared Content-Length.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size < 1024:  # too small to be real media
+        return False
+    if expected_len and size < expected_len:  # stream dropped mid-transfer
+        return False
+    with path.open("rb") as fh:
+        head = fh.read(64).lstrip().lower()
+    return not (head.startswith(b"<!doctype") or head.startswith(b"<html") or head[:1] == b"<")
 
 
 @asynccontextmanager

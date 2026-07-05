@@ -3,21 +3,31 @@
 
 [defaults]
 # Policy for platforms not listed in [services] below:
-#   "adaptive" — direct while it works, the main VLESS node when blocked
+#   "adaptive" — direct while it works, otherwise the pool cascade below
 #   "direct"   — always straight out
-#   "main"     — always via the main VLESS node (socks :2080)
-#   "goida"    — always via the free public pool (socks :2079, random exit)
+#   "main"     — pool cascade, ending on the personal VLESS node (socks :2080)
+#   "goida"    — pool cascade, preferring the free public pool (socks :2079)
+#   "bypass"   — pool cascade, preferring the curated bypass pool (socks :2078)
+# Every cascade tries the healthy pools in order and puts the personal node
+# LAST, so day-to-day traffic never loads it — it only carries traffic once
+# every free/curated pool is down.
 policy = "adaptive"
 
-# If the main node is down, route everything that used it through the goida pool,
-# so one dead node never takes the whole bot down. Set "" to disable fallback.
+# If the main node is down, route everything that used it through the goida
+# pool instead, so one dead node never takes the whole bot down.
 main_fallback = "goida"
 
 [services]
-# platform = "direct" | "main" | "goida" | "adaptive" | "vless://..."
-tiktok      = "main"      # IP-banned for some regions — always via the node
+# platform = "direct" | "main" | "goida" | "bypass" | "adaptive"
+#          | "vless://..."   (dedicated node, pinned via xray domain-routing)
+#          | "socks5h://..." (dedicated external proxy, e.g. a WARP container)
+tiktok      = "main"      # IP-banned for some regions — always via a pool
 rule34      = "goida"     # Cloudflare bans datacenter IPs — use throwaway exits
-rule34video = "goida"
+# Some anti-bot systems (e.g. DDoS-Guard) bind their clearance to a single IP
+# for the whole session; a pool that picks a new random exit per connection
+# (goida/bypass) can't hold that clearance. A single stable egress — such as
+# Cloudflare WARP, exposed as a SOCKS proxy by its own container — fixes this.
+# rule34video = "socks5h://warp:1080"
 # instagram = "adaptive"
 # youtube   = "direct"
 # pornhub   = "adaptive"
