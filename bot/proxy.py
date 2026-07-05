@@ -1,20 +1,30 @@
-"""Config-driven per-platform routing.
+"""Config-driven per-platform routing with a health-checked pool cascade.
 
 Each platform is routed by a policy from ``data/routing.toml`` (hot-reloaded, no
 restart needed):
 
   direct       — always straight out
-  main         — always via the main VLESS node (socks :2080)
-  goida        — always via the free public pool (socks :2079, random exit)
-  adaptive     — direct while it works, main node when blocked
+  goida        — via the free public pool (socks :2079), then bypass, then main
+  bypass       — via the curated bypass pool (socks :2078), then goida, then main
+  main         — reliable cascade: goida → bypass → main (personal node last)
+  adaptive     — direct while it works, otherwise the cascade above
+  socks5h://.. — a dedicated external proxy pinned for this platform (e.g. WARP
+                 for DDoS-Guard sites that need one stable Cloudflare exit IP)
   vless://...  — a node pinned for this platform in xray by domain-routing
-                 (the bot routes it via the main socks; xray sends it to that node)
+                 (routed via the main socks; xray sends it to that node)
 
-If the main node is down, anything routed through it falls back to the goida pool
-(``defaults.main_fallback``), so one dead node never takes the whole bot down.
-The goida pool is health-checked continuously by xray's observatory (dead nodes
-drop out) and picks a random exit each connection, so banned-site retries land on
-different IPs with no stale caching.
+Pool cascade & the personal node
+--------------------------------
+The operator's personal VLESS node (``main`` / socks :2080) is treated as a
+**last resort**: every cascade puts it last, so normal traffic rides the free
+``goida`` pool and the curated ``bypass`` pool and only touches the personal
+node when *both* of those are down. This keeps the personal subscription
+unloaded during day-to-day use while still guaranteeing an exit exists.
+
+Health checks are multi-level:
+  * xray's observatory drops individual dead nodes *inside* each pool;
+  * this router probes each *pool* every ``_CHECK_INTERVAL`` seconds and skips a
+    whole pool that is down, cascading to the next live one.
 """
 
 from __future__ import annotations
@@ -43,11 +53,21 @@ _PROXY_TEST_URL = "https://www.google.com/generate_204"
 _CHECK_INTERVAL = 120.0
 _PROBE_TIMEOUT = 8.0
 
+# Preferred pool order per policy. "main" (the personal node) is ALWAYS last so
+# day-to-day traffic never loads the operator's personal subscription while a
+# free/bypass pool is alive.
+_CASCADES: dict[str, tuple[str, ...]] = {
+    "goida": ("goida", "bypass", "main"),
+    "bypass": ("bypass", "goida", "main"),
+    "main": ("goida", "bypass", "main"),
+    "adaptive": ("goida", "bypass", "main"),
+}
+
 _ROUTING_FILE = Path(os.getenv("ROUTING_FILE", "data/routing.toml"))
 # Used when routing.toml is missing/unreadable — matches the old hardcoded policy.
 _DEFAULT_ROUTING: dict = {
     "defaults": {"policy": "adaptive", "main_fallback": "goida"},
-    "services": {"tiktok": "main", "rule34": "goida", "rule34video": "goida"},
+    "services": {"tiktok": "main", "rule34": "goida", "rule34video": "bypass"},
 }
 
 
@@ -63,8 +83,9 @@ class ProxyRouter:
         self._bypass_url = bypass_url or None
         # Optimistic start: assume the gateway's DPI bypass works.
         self._direct_ok: dict[str, bool] = dict.fromkeys(_PROBE_URLS, True)
-        self._proxy_ok = False
-        self._goida_ok = False
+        # Per-pool health. Start optimistic so the first downloads before the
+        # first probe completes still have an exit to try.
+        self._pool_ok: dict[str, bool] = {"main": True, "goida": True, "bypass": True}
         self._task: asyncio.Task | None = None
         self._routing: dict = _DEFAULT_ROUTING
         self._routing_mtime: float | None = None
@@ -72,7 +93,14 @@ class ProxyRouter:
 
     @property
     def enabled(self) -> bool:
-        return self._proxy_url is not None
+        return any((self._proxy_url, self._goida_url, self._bypass_url))
+
+    def _pool_url(self, name: str) -> str | None:
+        return {
+            "main": self._proxy_url,
+            "goida": self._goida_url,
+            "bypass": self._bypass_url,
+        }.get(name)
 
     def _load_routing(self) -> None:
         """(Re)load routing.toml when it appears or changes — hot, no restart."""
@@ -100,46 +128,65 @@ class ProxyRouter:
             return str(services[platform])
         return str(self._routing.get("defaults", {}).get("policy", "adaptive"))
 
-    def _fallback(self) -> str:
-        return str(self._routing.get("defaults", {}).get("main_fallback", "goida"))
+    def _cascade(self, policy: str) -> str | None:
+        """First live pool in the policy's order; personal node is always last.
 
-    def _main_or_fallback(self) -> str | None:
-        if self._proxy_ok or not self._goida_url:
-            return self._proxy_url
-        if self._fallback() == "goida" and self._goida_ok:
-            return self._goida_url  # main node down → use the free pool
-        return self._proxy_url
+        If no pool probes healthy, fall back to the last configured pool in the
+        order (the personal node) as a last-ditch attempt rather than giving up.
+        """
+        order = _CASCADES.get(policy, _CASCADES["adaptive"])
+        configured = [(n, self._pool_url(n)) for n in order if self._pool_url(n)]
+        for name, url in configured:
+            if self._pool_ok.get(name):
+                return url
+        return configured[-1][1] if configured else None
 
     def proxy_for(self, platform: str) -> str | None:
         """Proxy URL to use for this platform, or None to go direct."""
         if not self.enabled:
             return None
         policy = self._policy_for(platform)
+        if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
+            # A dedicated external proxy pinned for this platform (e.g. WARP for
+            # DDoS-Guard sites that need one stable Cloudflare exit IP).
+            return policy
         if policy.startswith("vless://"):
-            policy = "main"  # node pinned in xray by domain-routing; go via main
+            # Node pinned in xray by domain-routing → must ride the main socks.
+            return self._proxy_url
         if policy == "direct":
             return None
-        if policy == "goida":
-            return self._goida_url or self._proxy_url
-        if policy == "bypass":
-            return self._bypass_url or self._goida_url or self._proxy_url
-        if policy == "main":
-            return self._main_or_fallback()
-        # adaptive: direct while it works, otherwise the main node (or fallback)
-        if self._direct_ok.get(platform, True):
-            return None
-        return self._main_or_fallback()
+        if policy == "adaptive":
+            if self._direct_ok.get(platform, True):
+                return None
+            return self._cascade("adaptive")
+        return self._cascade(policy)
 
     def forced_proxy(self, platform: str = "") -> str | None:
-        """Proxy for a content-level retry (a post that blocks this IP). Honours
-        the platform's pool so a goida-routed site retries via a new random exit."""
+        """Proxy for a content-level retry (a post that blocks this IP).
+
+        Prefer a *different* live pool than the platform's primary, so a retry
+        after a block (e.g. DDoS-Guard 504 on the bypass IPs) lands on a fresh
+        exit instead of hammering the same one. Falls back to the primary (whose
+        own exit rotates) when no other pool is live.
+        """
+        if not self.enabled:
+            return None
         if platform:
             policy = self._policy_for(platform)
-            if policy == "bypass":
-                return self._bypass_url or self._goida_url or self._proxy_url
-            if policy == "goida":
-                return self._goida_url or self._proxy_url
-        return self._proxy_url
+            if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
+                # Dedicated proxy (e.g. WARP) is primary; a retry after a block
+                # uses a rotating pool as an alternate exit.
+                return self._cascade("goida")
+            if policy.startswith("vless://"):
+                return self._proxy_url
+            if policy in _CASCADES:
+                primary = self._cascade(policy)
+                for name in _CASCADES[policy]:
+                    url = self._pool_url(name)
+                    if url and self._pool_ok.get(name) and url != primary:
+                        return url
+                return primary
+        return self._cascade("adaptive")
 
     async def start(self) -> None:
         if self.enabled:
@@ -159,18 +206,23 @@ class ProxyRouter:
                 logger.exception("Proxy health check failed")
 
     async def _check_all(self) -> None:
-        self._proxy_ok = await self._reachable(_PROXY_TEST_URL, self._proxy_url)
-        if self._goida_url:
-            self._goida_ok = await self._reachable(_PROXY_TEST_URL, self._goida_url)
+        for name in ("main", "goida", "bypass"):
+            url = self._pool_url(name)
+            self._pool_ok[name] = (
+                await self._reachable(_PROXY_TEST_URL, url) if url else False
+            )
         for platform, url in _PROBE_URLS.items():
             self._direct_ok[platform] = await self._reachable(url, None)
         blocked = [p for p, ok in self._direct_ok.items() if not ok]
-        if blocked or not self._proxy_ok:
+        dead_pools = [n for n in ("goida", "bypass", "main")
+                      if self._pool_url(n) and not self._pool_ok[n]]
+        if blocked or dead_pools:
             logger.info(
-                "Direct blocked for [%s]; main node %s, goida pool %s",
+                "Direct blocked for [%s]; pools main=%s goida=%s bypass=%s",
                 ", ".join(blocked) or "none",
-                "up" if self._proxy_ok else "DOWN",
-                "up" if self._goida_ok else "down/disabled",
+                "up" if self._pool_ok["main"] else "DOWN",
+                "up" if self._pool_ok["goida"] else "DOWN",
+                "up" if self._pool_ok["bypass"] else "DOWN",
             )
 
     @staticmethod

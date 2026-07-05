@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -56,6 +57,14 @@ PROBE_URL = os.getenv("XRAY_PROBE_URL", "https://www.google.com/generate_204")
 # pool of throwaway nodes is available for IP-banned sites / main-node fallback.
 GOIDA_SOCKS_PORT = int(os.getenv("GOIDA_SOCKS_PORT", "2079"))
 GOIDA_POOL_SIZE = int(os.getenv("GOIDA_POOL_SIZE", "50"))
+# Disk cache of the last good goida link set. The free aggregators redirect to
+# raw.githubusercontent.com, which is DPI-throttled from the target region and
+# intermittently returns nothing — a fresh fetch that yields (almost) no nodes
+# would otherwise empty the whole pool and break every goida-routed site until
+# the next lucky refresh. We persist the last healthy set and reuse it whenever a
+# fetch comes back short, so the pool never collapses to zero.
+GOIDA_CACHE = os.getenv("GOIDA_CACHE", "/app/data/goida_cache.txt")
+GOIDA_MIN = int(os.getenv("GOIDA_MIN", "5"))
 
 # Curated "bypass" pool: a few premium VLESS nodes (in BYPASS_CONFIGS) on their
 # own SOCKS port, leastPing with health failover — for sites that block by IP
@@ -83,6 +92,56 @@ def _fetch(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.0"})
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8", "ignore")
+
+
+def _mirror_urls(url: str) -> list[str]:
+    """Alternate URLs for a GitHub raw link. github.com/raw and
+    raw.githubusercontent.com both 302/route to Fastly, which is DPI-throttled
+    from the target region; jsdelivr's CDN is usually reachable, so try it too.
+    Returns the original plus any mirrors, de-duplicated, original first."""
+    urls = [url]
+    m = re.match(
+        r"https?://github\.com/([^/]+)/([^/]+)/raw/refs/heads/([^/]+)/(.+)", url
+    ) or re.match(
+        r"https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/refs/heads/([^/]+)/(.+)",
+        url,
+    )
+    if m:
+        owner, repo, branch, path = m.groups()
+        urls.append(f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}")
+    return list(dict.fromkeys(urls))
+
+
+def _fetch_first(url: str) -> str:
+    """Fetch a subscription trying its mirrors in turn; first non-empty wins."""
+    last_exc: Exception | None = None
+    for candidate in _mirror_urls(url):
+        try:
+            text = _b64_maybe(_fetch(candidate))
+            if text.strip():
+                return text
+        except Exception as exc:  # try the next mirror
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    return ""
+
+
+def _read_goida_cache() -> list[str]:
+    try:
+        with open(GOIDA_CACHE, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+    except OSError:
+        return []
+
+
+def _write_goida_cache(links: list[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(GOIDA_CACHE) or ".", exist_ok=True)
+        with open(GOIDA_CACHE, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(links))
+    except OSError as exc:
+        print(f"WARN: could not write goida cache {GOIDA_CACHE!r}: {exc}", file=sys.stderr)
 
 
 def collect_links() -> list[str]:
@@ -125,19 +184,48 @@ def collect_goida_links() -> list[str]:
     observatory stays light.
     """
     urls = [s.strip() for s in os.getenv("GOIDA_SUBSCRIPTIONS", "").split(",") if s.strip()]
-    seen: list[str] = []
+    per_source: list[list[str]] = []
     for url in urls:
         try:
-            text = _b64_maybe(_fetch(url))
+            text = _fetch_first(url)
         except Exception as exc:
             print(f"WARN: goida subscription {url!r} failed: {exc}", file=sys.stderr)
             continue
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("vless://") and line not in seen and not _is_russian(line):
-                seen.append(line)
-                if len(seen) >= GOIDA_POOL_SIZE:
-                    return seen
+        per_source.append([
+            ln.strip() for ln in text.splitlines()
+            if ln.strip().startswith("vless://") and not _is_russian(ln.strip())
+        ])
+    # Round-robin across sources so every subscription contributes (a plain
+    # in-order fill would take the whole cap from the first file); de-duplicate,
+    # capped so the observatory stays light.
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    index = 0
+    while per_source and len(seen) < GOIDA_POOL_SIZE:
+        progressed = False
+        for links in per_source:
+            if index < len(links):
+                progressed = True
+                link = links[index]
+                if link not in seen_set:
+                    seen_set.add(link)
+                    seen.append(link)
+                    if len(seen) >= GOIDA_POOL_SIZE:
+                        break
+        if not progressed:
+            break
+        index += 1
+    # A short/empty fetch (DPI throttled the CDN) must not empty the pool: reuse
+    # the last good set from disk. Only overwrite the cache when we got a healthy
+    # batch, so a bad fetch can never poison it.
+    if len(seen) >= GOIDA_MIN:
+        _write_goida_cache(seen)
+        return seen
+    cached = _read_goida_cache()
+    if cached:
+        print(f"WARN: goida fetch returned {len(seen)} node(s); reusing "
+              f"{len(cached)} cached node(s)", file=sys.stderr)
+        return cached
     return seen
 
 
@@ -157,7 +245,10 @@ def vless_to_outbound(link: str, tag: str) -> dict:
     body, _, _ = link[len("vless://"):].partition("#")
     userinfo, _, hostport = body.partition("@")
     hostpart, _, query = hostport.partition("?")
+    # Drop any /path so it can't taint the port (free links carry host:port/path).
+    hostpart = hostpart.split("/", 1)[0]
     host, _, port = hostpart.rpartition(":")
+    port = "".join(c for c in port if c.isdigit())  # strip stray non-digits
     params = dict(urllib.parse.parse_qsl(query))
 
     network = params.get("type", "tcp")
@@ -226,7 +317,10 @@ def vless_to_outbound(link: str, tag: str) -> dict:
                     "users": [
                         {
                             "id": userinfo,
-                            "encryption": params.get("encryption", "none"),
+                            # VLESS mandates encryption "none"; free links often
+                            # omit it or carry junk, which makes xray reject the
+                            # whole config, so it is forced here.
+                            "encryption": "none",
                             "flow": params.get("flow", ""),
                         }
                     ],
@@ -361,15 +455,23 @@ def build_config(
     return config
 
 
-def _xray_accepts(path: str) -> bool:
-    """True if xray can load the config. A single malformed free node would
-    otherwise make xray reject the whole config and never start."""
+def _xray_test(path: str) -> tuple[bool, str | None]:
+    """Validate the config with xray. Returns (ok, offending_tag).
+
+    When xray rejects the config it names the outbound at fault
+    ("...with tag gvless-9..."); that tag lets the caller drop just the bad node
+    instead of the whole pool. ok=True (with no tag) also when xray can't be run.
+    """
     try:
         r = subprocess.run(["xray", "run", "-test", "-c", path],
                            capture_output=True, timeout=40)
-        return r.returncode == 0
     except (OSError, subprocess.SubprocessError):
-        return True  # can't test (e.g. binary missing) → don't block startup
+        return True, None  # can't test (e.g. binary missing) → don't block startup
+    if r.returncode == 0:
+        return True, None
+    err = r.stderr.decode("utf-8", "ignore") + r.stdout.decode("utf-8", "ignore")
+    match = re.search(r"tag\s+(\S+)", err)
+    return False, (match.group(1) if match else None)
 
 
 def _write(path: str, config: dict) -> None:
@@ -383,13 +485,23 @@ def main() -> None:
     goida = collect_goida_links()
     config = build_config(links, goida, bypass)
     _write(output, config)
-    # The main + bypass pools are curated/valid; only the free goida pool can
-    # carry a node xray rejects. If the full config fails to load, drop goida so
-    # xray (and the whole bot, which tunnels through it) always comes up.
-    if goida and not _xray_accepts(output):
-        print("WARN: config rejected by xray — rebuilding without the goida pool",
-              file=sys.stderr)
-        config = build_config(links, [], bypass)
+    # A single malformed free node makes xray reject the whole config and never
+    # start (which also takes down the Telegram tunnel through it). Drop just the
+    # node xray names and re-test, so the pool survives bad nodes; only if that
+    # can't be resolved fall back to rebuilding without the goida pool entirely.
+    for _ in range(25):
+        ok, tag = _xray_test(output)
+        if ok:
+            break
+        dropped = [o for o in config["outbounds"] if o["tag"] != tag]
+        if not tag or len(dropped) == len(config["outbounds"]):
+            print("WARN: config rejected by xray — rebuilding without goida pool",
+                  file=sys.stderr)
+            config = build_config(links, [], bypass)
+            _write(output, config)
+            break
+        print(f"WARN: dropping node {tag} rejected by xray", file=sys.stderr)
+        config["outbounds"] = dropped
         _write(output, config)
     n = lambda p: sum(1 for o in config["outbounds"] if o["tag"].startswith(p))  # noqa: E731
     print(f"xray config: {output} — {n('vless-')} main, {n('gvless-')} goida, "

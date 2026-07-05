@@ -58,7 +58,30 @@ services:
       # Curated premium bypass pool (comma-sep vless://) on SOCKS :2078.
       BYPASS_CONFIGS: ${BYPASS_CONFIGS:-}
     volumes:
-      - ./data:/app/data:ro     # optional: data/vless.txt referenced by VLESS_CONFIGS_FILE
+      # read-write: routing.toml is read here and the goida pool cache
+      # (data/goida_cache.txt) is written here so the free pool survives a
+      # throttled subscription fetch instead of collapsing to zero nodes.
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # Cloudflare WARP as a SOCKS5 proxy (warp:1080). Gives a single stable
+  # Cloudflare egress IP for a whole session — needed by sites behind DDoS-Guard
+  # (e.g. rule34video), whose clearance is IP-bound, so the free pool's
+  # per-connection exit rotation can't hold it. Routed to by a routing.toml
+  # entry of the form  rule34video = "socks5h://warp:1080".
+  warp:
+    image: caomingjun/warp
+    container_name: warp
+    profiles: ["vless"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun"]
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      WARP_SLEEP: "5"
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
     restart: unless-stopped
 
   # Routes the Bot API server's traffic to Telegram through the VLESS proxy.
@@ -118,3 +141,4 @@ services:
 volumes:
   pgdata:
   bot-api-data:
+  warp-data:
