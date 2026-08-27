@@ -63,6 +63,7 @@ from bot.progress import (
 from bot.proxy import forced_proxy, proxy_for
 from bot.runtime import config
 from bot.urlcache import UrlCache
+from bot.urlguard import BlockedAddressError, ensure_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,17 @@ async def _run_link(
     is_admin = user_id == settings.admin_id
     await db.upsert_user(user_id, message.from_user.username)
 
+    # The bot sits in a network that reaches the router, the host's SSH port and
+    # the database. Fetching a link that points there would let any user read
+    # internal services through the bot and map the network from the errors.
+    try:
+        ensure_public_url(url)
+    except BlockedAddressError as exc:
+        logger.warning("Blocked internal-address link from %s: %s", user_id, exc)
+        await message.answer("⚠️ Эта ссылка ведёт не в интернет. Пришлите обычную ссылку.")
+        await _record(db, user_id, STATUS_FAILED, platform, "video", time.monotonic())
+        return
+
     # Music services (SoundCloud, Yandex Music, Spotify) and YouTube Music are
     # always audio-only — no video/audio prompt.
     if is_youtube_music(url) or is_audio_only_platform(platform):
@@ -355,6 +367,14 @@ async def _run_link(
     # The original page URL stays the cache/token key; download_url feeds yt-dlp.
     try:
         download_url = await resolve_download_url(url)
+        # The page decides this one (an HLS manifest, a redirect target), so it
+        # is as untrusted as the link the user sent.
+        ensure_public_url(download_url)
+    except BlockedAddressError:
+        logger.warning("Resolved URL for %s points at a private address", url)
+        await _safe_edit(status_message, "⚠️ Ссылка ведёт не в интернет.")
+        await _record(db, user_id, STATUS_FAILED, platform, "video", started)
+        return
     except DownloadFailedError as exc:
         await _safe_edit(status_message, f"⚠️ {exc}")
         await _record(db, user_id, STATUS_FAILED, platform, "video", started)

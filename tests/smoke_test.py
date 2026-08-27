@@ -79,4 +79,32 @@ names = [r.name for r in router.sub_routers]
 assert names == ["admin", "user", "download", "fallback"], names
 print("routers OK:", names)
 
+# --- internal-address guard ---
+from bot.urlguard import BlockedAddressError, _is_public, ensure_public_url
+
+for blocked in (
+    "http://127.0.0.1:30080/health",
+    "http://localhost/",
+    "http://192.168.1.1/",
+    "http://10.0.0.5/x",
+    "http://172.17.0.1/",
+    "http://169.254.169.254/latest/meta-data/",   # cloud metadata
+    "http://[::1]/",
+):
+    try:
+        ensure_public_url(blocked)
+    except BlockedAddressError:
+        pass
+    else:
+        raise AssertionError(f"must be refused: {blocked}")
+
+# An IPv4 address tunnelled inside IPv6 must be judged as the IPv4 it really is.
+assert not _is_public("::ffff:127.0.0.1"), "IPv4-mapped loopback must not pass"
+assert not _is_public("::ffff:192.168.0.1"), "IPv4-mapped private must not pass"
+assert _is_public("8.8.8.8") and _is_public("2001:4860:4860::8888")
+
+# Search expressions carry no host and must not be refused.
+ensure_public_url("ytsearch1:some track name")
+print("internal-address guard OK")
+
 print("\nALL SMOKE TESTS PASSED")
