@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -525,11 +526,29 @@ def _xray_test(path: str) -> tuple[bool, str | None]:
     ("...with tag gvless-9..."); that tag lets the caller drop just the bad node
     instead of the whole pool. ok=True (with no tag) also when xray can't be run.
     """
+    # xray picks the config parser from the file EXTENSION, so it refuses to
+    # read anything that is not .json/.yaml/.toml — including the "config.json.new"
+    # the refresh loop builds. That made every refresh fail validation whatever
+    # it contained, and the failure named no outbound, so the caller kept
+    # discarding good nodes. Test through a .json copy.
+    tested = path
+    if not path.endswith((".json", ".yaml", ".yml", ".toml")):
+        tested = f"{path}.astest.json"
+        try:
+            shutil.copyfile(path, tested)
+        except OSError:
+            return True, None
     try:
-        r = subprocess.run(["xray", "run", "-test", "-c", path],
+        r = subprocess.run(["xray", "run", "-test", "-c", tested],
                            capture_output=True, timeout=40)
     except (OSError, subprocess.SubprocessError):
         return True, None  # can't test (e.g. binary missing) → don't block startup
+    finally:
+        if tested != path:
+            try:
+                os.unlink(tested)
+            except OSError:
+                pass
     if r.returncode == 0:
         return True, None
     err = r.stderr.decode("utf-8", "ignore") + r.stdout.decode("utf-8", "ignore")
