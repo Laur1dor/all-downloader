@@ -229,14 +229,30 @@ class ProxyRouter:
     async def _reachable(url: str, proxy: str | None) -> bool:
         import aiohttp
 
+        # aiohttp's own `proxy=` speaks HTTP(S) only, so every pool (which is a
+        # SOCKS endpoint) used to fail the probe and report DOWN regardless of
+        # its real state. SOCKS needs a connector instead.
         try:
+            connector = None
+            http_proxy = proxy
+            if proxy and proxy.startswith(("socks4://", "socks5://", "socks5h://")):
+                from aiohttp_socks import ProxyConnector
+
+                # aiohttp_socks knows no "socks5h" scheme; the trailing h only
+                # means "resolve the hostname at the proxy", which is rdns.
+                connector = ProxyConnector.from_url(
+                    proxy.replace("socks5h://", "socks5://", 1), rdns=True
+                )
+                http_proxy = None
             timeout = aiohttp.ClientTimeout(total=_PROBE_TIMEOUT)
             async with (
-                aiohttp.ClientSession(timeout=timeout) as session,
-                session.get(url, proxy=proxy, allow_redirects=False) as response,
+                aiohttp.ClientSession(timeout=timeout, connector=connector) as session,
+                session.get(url, proxy=http_proxy, allow_redirects=False) as response,
             ):
                 return response.status < 500
-        except (aiohttp.ClientError, TimeoutError, OSError):
+        except Exception:
+            # Building the connector can raise too, and a health probe must never
+            # propagate: an unreachable pool is a DOWN, not a crashed bot.
             return False
 
 

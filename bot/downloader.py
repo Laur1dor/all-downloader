@@ -512,22 +512,30 @@ def _format_height(fmt: dict) -> int | None:
     return None
 
 
+def _verify_tls(url: str) -> bool:
+    """False only for the hosts known to serve a broken certificate."""
+    host = (urlparse(url).hostname or "").lower()
+    return not any(host == h or host.endswith("." + h) for h in _NOCHECKCERT_HOSTS)
+
+
 def _remote_size(url: str, referer: str | None = None, proxy: str | None = None) -> int | None:
     """Content-Length of a direct media URL via curl_cffi (HEAD, then ranged GET)."""
     from curl_cffi import requests as cffi_requests
 
     headers = {"Referer": referer} if referer else {}
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    verify = _verify_tls(url)
     try:
         head = cffi_requests.head(
-            url, impersonate="chrome", timeout=15, headers=headers, proxies=proxies
+            url, impersonate="chrome", timeout=15, headers=headers, proxies=proxies,
+            verify=verify,
         )
         length = head.headers.get("Content-Length")
         if length and str(length).isdigit():
             return int(length)
         ranged = cffi_requests.get(
             url, impersonate="chrome", timeout=15, stream=True, proxies=proxies,
-            headers={**headers, "Range": "bytes=0-0"},
+            headers={**headers, "Range": "bytes=0-0"}, verify=verify,
         )
         content_range = ranged.headers.get("Content-Range")
         ranged.close()
@@ -538,6 +546,87 @@ def _remote_size(url: str, referer: str | None = None, proxy: str | None = None)
     except Exception:
         return None
     return None
+
+
+# Up to this many segments are weighed individually, which makes the total exact
+# rather than extrapolated. A typical stream is a few dozen ~10 s segments, so
+# most sizes land on the byte; only long streams fall back to sampling.
+_HLS_EXACT_SEGMENTS = 60
+# Samples taken from a longer stream instead. More than a handful buys little:
+# the error is dominated by how unlike the body the sampled parts are.
+_HLS_SAMPLE_SEGMENTS = 8
+_HLS_HEAD_WORKERS = 10
+_EXTINF_RE = re.compile(r"#EXTINF:\s*([0-9.]+)")
+
+
+def _hls_size(
+    manifest_url: str, referer: str | None = None, proxy: str | None = None
+) -> int | None:
+    """True size of an HLS variant, measured from its own segments.
+
+    A master playlist's BANDWIDTH (which yt-dlp reports as ``tbr``) is a
+    declared peak, not the real average: the-joi-database overstates it by
+    16-19x, so a bitrate x duration estimate promised ~2 GB for a 120 MB file.
+    Instead take the playlist's own EXTINF total as the real duration, weigh a
+    few segments spread across the stream, and scale bytes-per-second up.
+    """
+    from curl_cffi import requests as cffi_requests
+
+    headers = {"Referer": referer} if referer else {}
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        playlist = cffi_requests.get(
+            manifest_url, impersonate="chrome", timeout=20,
+            headers=headers, proxies=proxies, verify=_verify_tls(manifest_url),
+        ).text
+    except Exception:
+        return None
+    # A master playlist lists variants, not media — nothing to weigh here.
+    if "#EXT-X-STREAM-INF" in playlist:
+        return None
+    # Byte-range segments share one file; Content-Length would be the whole file.
+    if "#EXT-X-BYTERANGE" in playlist:
+        return None
+
+    durations = [float(d) for d in _EXTINF_RE.findall(playlist)]
+    segments = [
+        urljoin(manifest_url, line.strip())
+        for line in playlist.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    total_duration = sum(durations)
+    if not segments or total_duration <= 0:
+        return None
+
+    if len(segments) <= _HLS_EXACT_SEGMENTS:
+        # Cheap enough to weigh every segment: the answer is then the real size,
+        # not an extrapolation, which is what the quality menu should show.
+        picks = list(range(len(segments)))
+    else:
+        # Spread the samples over the stream: the first segment is often an intro
+        # encoded at a different bitrate than the body.
+        count = min(_HLS_SAMPLE_SEGMENTS, len(segments))
+        picks = sorted({
+            min(round((i + 1) * len(segments) / (count + 1)), len(segments) - 1)
+            for i in range(count)
+        })
+
+    with ThreadPoolExecutor(max_workers=min(_HLS_HEAD_WORKERS, len(picks))) as pool:
+        sizes = list(pool.map(
+            lambda i: _remote_size(segments[i], referer=referer, proxy=proxy), picks
+        ))
+
+    # Every segment weighed and none missing → this is the exact size.
+    if len(picks) == len(segments) and all(sizes):
+        return sum(sizes)
+
+    sampled_bytes = sum(s for s in sizes if s)
+    sampled_seconds = sum(
+        durations[i] for i, s in zip(picks, sizes, strict=True) if s and i < len(durations)
+    )
+    if not sampled_bytes or sampled_seconds <= 0:
+        return None
+    return int(sampled_bytes / sampled_seconds * total_duration)
 
 
 def _probe_quality_options_sync(
@@ -582,10 +671,15 @@ def _probe_quality_options_sync(
     def size_of(height: int) -> int | None:
         fmt = best_per_height[height]
         size = _format_size(fmt, duration)
-        # HEAD a direct file when the size is unknown, but not an HLS manifest
-        # (.m3u8 HEAD returns the tiny playlist size, not the media size).
         is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
-        if size is None and fmt.get("url") and not is_hls:
+        if is_hls and fmt.get("url"):
+            # For HLS the bitrate-derived estimate above is not just imprecise,
+            # it is wrong by an order of magnitude on some sites — always prefer
+            # a measurement of the actual segments when one can be taken.
+            size = _hls_size(fmt["url"], referer=url, proxy=proxy) or size
+        elif size is None and fmt.get("url"):
+            # HEAD a direct file when the size is unknown. Never for a manifest:
+            # HEAD on .m3u8 returns the tiny playlist size, not the media size.
             size = _remote_size(fmt["url"], referer=url, proxy=proxy)
         if size is None:
             return None

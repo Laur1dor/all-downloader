@@ -10,4 +10,3 @@ logs/
 tests/
 README.md
 .ruff_cache/
-.claude/

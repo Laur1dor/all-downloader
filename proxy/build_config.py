@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -88,10 +89,25 @@ def _b64_maybe(text: str) -> str:
     return text
 
 
+# GitHub answers 403 to some client UAs; a browser UA is served normally. Kept as
+# a list so a source that dislikes one identity is still reachable with another.
+_FETCH_UAS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "v2rayN/6.0",
+)
+
+
 def _fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", "ignore")
+    last_exc: Exception | None = None
+    for ua in _FETCH_UAS:
+        request = urllib.request.Request(url, headers={"User-Agent": ua})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode("utf-8", "ignore")
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
 
 
 def _mirror_urls(url: str) -> list[str]:
@@ -176,6 +192,22 @@ def _is_russian(link: str) -> bool:
     return any(m in label or m in label.lower() for m in _RU_MARKERS)
 
 
+GOIDA_LIVE_FILE = os.getenv("GOIDA_LIVE_FILE", "/app/data/goida_live.txt")
+# Older than this the verified set is not trusted: free nodes die within hours.
+GOIDA_LIVE_MAX_AGE = int(os.getenv("GOIDA_LIVE_MAX_AGE", "10800"))
+
+
+def _read_probed_live() -> list[str]:
+    """Nodes the prober confirmed working, if the file is recent enough."""
+    try:
+        if time.time() - os.path.getmtime(GOIDA_LIVE_FILE) > GOIDA_LIVE_MAX_AGE:
+            return []
+        with open(GOIDA_LIVE_FILE, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+    except OSError:
+        return []
+
+
 def collect_goida_links() -> list[str]:
     """VLESS links from the free public subscriptions, taken in order, capped.
 
@@ -183,6 +215,15 @@ def collect_goida_links() -> list[str]:
     extra parsers are needed, drop Russian exits, and cap the count so the
     observatory stays light.
     """
+    # The prober (probe_goida.py) keeps a set of nodes that were verified to
+    # actually carry traffic. Roughly 2% of the free links do, so a pool filled
+    # straight from the subscriptions is almost all dead weight; prefer the
+    # verified set whenever it is fresh.
+    live = _read_probed_live()
+    if live:
+        print(f"goida: {len(live)} verified node(s) from the prober", file=sys.stderr)
+        return live
+
     urls = [s.strip() for s in os.getenv("GOIDA_SUBSCRIPTIONS", "").split(",") if s.strip()]
     per_source: list[list[str]] = []
     for url in urls:
@@ -337,8 +378,6 @@ def build_config(
     bypass_links: list[str] | None = None,
 ) -> dict:
     outbounds, proxy_tags = _links_to_outbounds(links, "vless-")
-    if not proxy_tags:
-        raise SystemExit("No usable VLESS configs found (check VLESS_SUBSCRIPTION/VLESS_CONFIGS).")
 
     goida_outbounds, goida_tags = _links_to_outbounds(goida_links or [], "gvless-")
     outbounds += goida_outbounds
@@ -366,8 +405,32 @@ def build_config(
         },
     ]
     # Main pool: lowest-ping live node. Routed from the socks/http inbounds.
-    balancers = [{"tag": "proxy", "selector": ["vless-"], "strategy": {"type": "leastPing"}}]
-    rules = [{"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"}]
+    # The personal subscription is optional: with no main nodes configured the
+    # main socks/http inbounds stay up and are served by whichever pool exists,
+    # so PROXY_URL keeps working instead of xray refusing to build a config.
+    balancers = []
+    rules = []
+    if proxy_tags:
+        balancers.append(
+            {"tag": "proxy", "selector": ["vless-"], "strategy": {"type": "leastPing"}}
+        )
+        rules.append({"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"})
+    elif goida_tags or bypass_tags:
+        # Borrow the pool's own strategy: gvless- is health-checked by the burst
+        # observatory (leastLoad), byp- by the plain observatory (leastPing).
+        if goida_tags:
+            fallback: list[str] = ["gvless-"]
+            strategy: dict = {"type": "leastLoad", "settings": {"expected": 8, "maxRTT": "4s"}}
+        else:
+            fallback, strategy = ["byp-"], {"type": "leastPing"}
+        balancers.append({"tag": "proxy", "selector": fallback, "strategy": strategy})
+        rules.append({"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"})
+        print("WARN: no main VLESS nodes — main socks/http served by the "
+              f"{'goida' if goida_tags else 'bypass'} pool", file=sys.stderr)
+    else:
+        rules.append({"type": "field", "inboundTag": ["socks", "http"], "outboundTag": "direct"})
+        print("WARN: no VLESS nodes at all — main socks/http goes out direct",
+              file=sys.stderr)
 
     # Per-service pinned nodes (routing.toml entries that are vless:// links):
     # a dedicated outbound + a domain rule that wins over the balancer.
@@ -471,12 +534,41 @@ def _xray_test(path: str) -> tuple[bool, str | None]:
         return True, None
     err = r.stderr.decode("utf-8", "ignore") + r.stdout.decode("utf-8", "ignore")
     match = re.search(r"tag\s+(\S+)", err)
-    return False, (match.group(1) if match else None)
+    # The tag is quoted/punctuated in some messages ("...with tag gvless-9:"),
+    # and a tag that still carries them matches no outbound.
+    tag = match.group(1).strip("\"'`,.:;()[]") if match else None
+    return False, (tag or None)
 
 
 def _write(path: str, config: dict) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2)
+
+
+_LINK_ENDPOINT_RE = re.compile(r"vless://[^@]+@([^:/?#]+):(\d+)")
+
+
+def _endpoint_of_outbound(config: dict, tag: str) -> str | None:
+    """host:port an outbound dials, so a rejected tag maps back to its link."""
+    for outbound in config["outbounds"]:
+        if outbound.get("tag") == tag:
+            servers = outbound.get("settings", {}).get("vnext") or []
+            if servers:
+                return f"{servers[0].get('address')}:{servers[0].get('port')}"
+    return None
+
+
+def _without_endpoint(links: list[str], endpoint: str | None) -> list[str]:
+    """The link list minus the node dialling `endpoint`."""
+    if not endpoint:
+        return links
+    kept = []
+    for link in links:
+        m = _LINK_ENDPOINT_RE.match(link)
+        if m and f"{m.group(1)}:{m.group(2)}" == endpoint:
+            continue
+        kept.append(link)
+    return kept
 
 
 def main() -> None:
@@ -489,19 +581,37 @@ def main() -> None:
     # start (which also takes down the Telegram tunnel through it). Drop just the
     # node xray names and re-test, so the pool survives bad nodes; only if that
     # can't be resolved fall back to rebuilding without the goida pool entirely.
-    for _ in range(25):
+    for _ in range(40):
         ok, tag = _xray_test(output)
         if ok:
             break
         dropped = [o for o in config["outbounds"] if o["tag"] != tag]
-        if not tag or len(dropped) == len(config["outbounds"]):
-            print("WARN: config rejected by xray — rebuilding without goida pool",
+        if tag and len(dropped) < len(config["outbounds"]):
+            print(f"WARN: dropping node {tag} rejected by xray", file=sys.stderr)
+            if tag.startswith("gvless-"):
+                # Rebuild from the shortened link list rather than deleting the
+                # outbound in place: the balancers and the observatory selector
+                # are derived from it and would otherwise point at a gap.
+                shorter = _without_endpoint(goida, _endpoint_of_outbound(config, tag))
+                goida = shorter if len(shorter) < len(goida) else goida[:-1]
+                config = build_config(links, goida, bypass)
+            else:
+                config["outbounds"] = dropped
+            _write(output, config)
+            continue
+        # xray refused without naming a usable outbound. Halving the free pool
+        # isolates the offender in a few rounds; dropping the pool outright (the
+        # old behaviour) cost every free node because of one bad config.
+        goida = goida[: len(goida) // 2]
+        if not goida:
+            print("WARN: config still rejected — rebuilding without goida pool",
                   file=sys.stderr)
             config = build_config(links, [], bypass)
             _write(output, config)
             break
-        print(f"WARN: dropping node {tag} rejected by xray", file=sys.stderr)
-        config["outbounds"] = dropped
+        print(f"WARN: config rejected without a usable tag — retrying with "
+              f"{len(goida)} goida node(s)", file=sys.stderr)
+        config = build_config(links, goida, bypass)
         _write(output, config)
     n = lambda p: sum(1 for o in config["outbounds"] if o["tag"].startswith(p))  # noqa: E731
     print(f"xray config: {output} — {n('vless-')} main, {n('gvless-')} goida, "

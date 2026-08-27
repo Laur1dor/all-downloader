@@ -1,38 +1,29 @@
-# Per-platform routing. Copy to data/routing.toml; edits apply live (hot-reload,
-# no restart needed). If the file is absent, sensible built-in defaults are used.
+# Маршрутизация по платформам. Файл читается на лету — правка применяется
+# без перезапуска бота.
+#
+# Политики:
+#   direct              всегда напрямую
+#   main                каскад goida → bypass → main (личная нода последней)
+#   goida               каскад goida → bypass → main
+#   bypass              каскад bypass → goida → main
+#   adaptive            напрямую пока платформа доступна, иначе каскад
+#   socks5h://host:port конкретный внешний прокси (например WARP)
+#   vless://...         нода, закреплённая за платформой через domain-routing
+#
+# Одного прокси на всё не бывает: одна площадка банит адреса дата-центров,
+# другой нужен стабильный выходной IP, третья считает ротирующийся пул ботом.
+# Поэтому политика задаётся отдельно для каждой платформы.
 
 [defaults]
-# Policy for platforms not listed in [services] below:
-#   "adaptive" — direct while it works, otherwise the pool cascade below
-#   "direct"   — always straight out
-#   "main"     — pool cascade, ending on the personal VLESS node (socks :2080)
-#   "goida"    — pool cascade, preferring the free public pool (socks :2079)
-#   "bypass"   — pool cascade, preferring the curated bypass pool (socks :2078)
-# Every cascade tries the healthy pools in order and puts the personal node
-# LAST, so day-to-day traffic never loads it — it only carries traffic once
-# every free/curated pool is down.
 policy = "adaptive"
-
-# If the main node is down, route everything that used it through the goida
-# pool instead, so one dead node never takes the whole bot down.
+# Если личная нода умерла — весь трафик уходит в бесплатный пул, чтобы один
+# сбой не ронял бота целиком.
 main_fallback = "goida"
 
 [services]
-# platform = "direct" | "main" | "goida" | "bypass" | "adaptive"
-#          | "vless://..."   (dedicated node, pinned via xray domain-routing)
-#          | "socks5h://..." (dedicated external proxy, e.g. a WARP container)
-tiktok      = "main"      # IP-banned for some regions — always via a pool
-rule34      = "goida"     # Cloudflare bans datacenter IPs — use throwaway exits
-# Some anti-bot systems (e.g. DDoS-Guard) bind their clearance to a single IP
-# for the whole session; a pool that picks a new random exit per connection
-# (goida/bypass) can't hold that clearance. A single stable egress — such as
-# Cloudflare WARP, exposed as a SOCKS proxy by its own container — fixes this.
-# rule34video = "socks5h://warp:1080"
-# instagram = "adaptive"
-# youtube   = "direct"
-# pornhub   = "adaptive"
-
-# Per-service dedicated node (off by default): paste a vless:// link and it is
-# pinned for this platform via xray domain-routing — top priority for it.
-# Uncomment and fill in to use:
-# pornhub   = "vless://uuid@host:443?security=reality&pbk=...&sid=...&sni=..."
+# Пример рабочей раскладки для сети, где VLESS режется DPI:
+#   tiktok  = "goida"                  # адреса Cloudflare у него в бане
+#   youtube = "socks5h://warp:1080"    # на ротирующемся пуле требует вход в аккаунт
+tiktok      = "main"
+rule34      = "goida"
+rule34video = "socks5h://warp:1080"
