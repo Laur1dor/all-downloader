@@ -571,6 +571,26 @@ def _without_endpoint(links: list[str], endpoint: str | None) -> list[str]:
     return kept
 
 
+def _tester_works() -> bool:
+    """Whether `xray run -test` can be trusted right now.
+
+    A trivial config that xray must accept. If even that is rejected, the
+    failure is the environment (the box is starved while the prober dials
+    nodes), not the config under test — and a healthy pool must not be thrown
+    away over it.
+    """
+    path = "/tmp/xray-test-canary.json"
+    _write(path, {"log": {"loglevel": "none"},
+                  "inbounds": [],
+                  "outbounds": [{"tag": "direct", "protocol": "freedom"}]})
+    ok, _ = _xray_test(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return ok
+
+
 def main() -> None:
     output = sys.argv[1] if len(sys.argv) > 1 else "/etc/xray/config.json"
     links, bypass = collect_links(), collect_bypass_links()
@@ -599,9 +619,16 @@ def main() -> None:
                 config["outbounds"] = dropped
             _write(output, config)
             continue
-        # xray refused without naming a usable outbound. Halving the free pool
-        # isolates the offender in a few rounds; dropping the pool outright (the
-        # old behaviour) cost every free node because of one bad config.
+        # xray refused without naming a usable outbound. Before blaming the
+        # nodes, check the tester itself: under load it has rejected configs
+        # that validate fine moments later, and bisecting on that signal walked
+        # a healthy 25-node pool down to nothing.
+        if not _tester_works():
+            print("WARN: xray -test is unreliable right now — keeping the config as built",
+                  file=sys.stderr)
+            break
+        # Halving the free pool isolates the offender in a few rounds; dropping
+        # the pool outright cost every free node because of one bad config.
         goida = goida[: len(goida) // 2]
         if not goida:
             print("WARN: config still rejected — rebuilding without goida pool",
