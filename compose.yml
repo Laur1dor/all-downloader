@@ -82,7 +82,9 @@ services:
   warp:
     image: caomingjun/warp
     container_name: warp
-    profiles: ["vless"]
+    # Своим профилем: WARP нужен не всем, кто включает vless, и наоборот —
+    # где VLESS не проходит, WARP может быть единственным рабочим выходом.
+    profiles: ["warp"]
     cap_add: [NET_ADMIN]
     devices: ["/dev/net/tun"]
     sysctls:
@@ -94,10 +96,11 @@ services:
       - warp-data:/var/lib/cloudflare-warp
     restart: unless-stopped
 
-  # Routes the Bot API server's traffic to Telegram through the VLESS proxy.
-  # Telegram's MTProto is often DPI-throttled even where HTTPS works, so the
-  # self-hosted Bot API needs the tunnel to reach Telegram. The bot reaches the
-  # Bot API via this container's "telegram-bot-api" network alias.
+  # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's
+  # MTProto is often DPI-throttled even where HTTPS works, so the self-hosted Bot
+  # API needs one to reach Telegram at all. Which tunnel is TUN2SOCKS_PROXY's
+  # choice — the xray pool or WARP. The bot reaches the Bot API via this
+  # container's "telegram-bot-api" network alias.
   tun2socks:
     image: xjasonlyu/tun2socks:latest
     container_name: tun2socks
@@ -113,20 +116,23 @@ services:
     networks:
       default:
         aliases: [telegram-bot-api]
-    depends_on: [xray]
+    # No depends_on: the tunnel it dials is chosen by TUN2SOCKS_PROXY and may
+    # live in either proxy profile, so naming one here would make the other
+    # combination an invalid project. tun2socks retries until the proxy is up.
     restart: unless-stopped
 
   # Self-hosted Bot API server: removes the 50 MB upload limit (up to 2 GB).
   # Needs TELEGRAM_API_ID/TELEGRAM_API_HASH in .env (https://my.telegram.org)
   # and TELEGRAM_API_URL=http://telegram-bot-api:8081 for the bot.
-  # Start with the "local-api" profile (requires the "vless" proxy too).
+  # Start with the "local-api" profile, plus whichever proxy profile provides
+  # the tunnel named in TUN2SOCKS_PROXY ("vless" or "warp").
   telegram-bot-api:
     build:
       context: .
       dockerfile: Dockerfile.botapi
     container_name: telegram-bot-api
     profiles: ["local-api"]
-    network_mode: "service:tun2socks"   # all Telegram traffic via the VLESS tunnel
+    network_mode: "service:tun2socks"   # all Telegram traffic via the tunnel
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}

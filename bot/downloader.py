@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
@@ -1019,13 +1019,52 @@ _RULE34_MEDIA_RE = re.compile(
 )
 
 
+_RULE34_API = "https://api.rule34.xxx/index.php"
+_RULE34_POST_ID_RE = re.compile(r"[?&]id=(\d+)")
+
+
+def _rule34_api_media(url: str, proxy: str | None) -> list[str]:
+    """Media URLs for a rule34.xxx post through the site's own API.
+
+    The HTML pages now answer with an interactive Cloudflare challenge that no
+    TLS fingerprint gets past, so scraping them is a dead end. The API is the
+    supported machine interface; it needs the account's `api_key` and `user_id`
+    (Account -> Options on the site) in RULE34_API_KEY / RULE34_USER_ID.
+    Returns [] when unconfigured so the caller can fall back and explain.
+    """
+    api_key = os.getenv("RULE34_API_KEY", "").strip()
+    user_id = os.getenv("RULE34_USER_ID", "").strip()
+    match = _RULE34_POST_ID_RE.search(url)
+    if not (api_key and user_id and match):
+        return []
+    query = urlencode({
+        "page": "dapi", "s": "post", "q": "index", "json": "1",
+        "id": match.group(1), "api_key": api_key, "user_id": user_id,
+    })
+    try:
+        response = _curl_get(
+            f"{_RULE34_API}?{query}", proxy=proxy, headers=_BROWSER_HEADERS,
+            impersonate="chrome", timeout=30,
+        )
+        posts = response.json()
+    except Exception as exc:
+        logger.info("rule34 API error: %s", exc)
+        return []
+    if not isinstance(posts, list) or not posts:
+        return []
+    post = posts[0]
+    # file_url is the original; the sample is a downscaled copy kept as a
+    # fallback for posts whose original is missing.
+    return [u for u in (post.get("file_url"), post.get("sample_url")) if u]
+
+
 def _scrape_rule34_sync(url: str, tmpdir: str, proxy: str | None = None) -> AlbumMedia:
     """Extract the direct media URL from a rule34.xxx post page and download it."""
     # rule34.xxx is behind Cloudflare: without a real browser TLS fingerprint the
     # request gets an anti-bot challenge page (no media). The challenge is served
     # intermittently even through the proxy, so retry, rotating the fingerprint.
-    seen: list[str] = []
-    for target in ("chrome", "safari", "chrome131", "chrome"):
+    seen: list[str] = _rule34_api_media(url, proxy)
+    for target in () if seen else ("chrome", "safari", "chrome131", "chrome"):
         try:
             html = _curl_get(
                 url, proxy=proxy, headers=_BROWSER_HEADERS,
@@ -1042,6 +1081,14 @@ def _scrape_rule34_sync(url: str, tmpdir: str, proxy: str | None = None) -> Albu
             break
         time.sleep(1.0)
     if not seen:
+        # Distinguish "the post has nothing" from "the site refused to talk to
+        # us": with the challenge in place the second is now the usual case, and
+        # a retry through another exit will not help.
+        if not (os.getenv("RULE34_API_KEY") and os.getenv("RULE34_USER_ID")):
+            raise DownloadFailedError(
+                "rule34.xxx закрыт проверкой Cloudflare — нужен ключ API "
+                "(RULE34_API_KEY и RULE34_USER_ID)."
+            )
         raise DownloadFailedError(
             "По этой ссылке не нашлось ни видео, ни фото.", retry_via_proxy=True
         )

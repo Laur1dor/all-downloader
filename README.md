@@ -103,8 +103,9 @@
                    видео/аудио)      карусели)           аудио)
                           │
                           ▼
-                 Адаптивный роутер ──► напрямую  (когда платформа доступна)
-                                   └─► VLESS-прокси (xray)  (когда заблокирована)
+                 Роутер по платформам ──► напрямую  (по умолчанию)
+                                      ├─► VLESS-пул (xray)   ┐ опционально,
+                                      └─► Cloudflare WARP    ┘ если нужен обход
 ```
 
 - **aiogram 3** — сторона Telegram.
@@ -112,11 +113,16 @@
 - **gallery-dl** — фото/карусели, которые yt-dlp не умеет.
 - **spotdl** — метаданные Spotify и подбор аудио.
 - **PostgreSQL** — статистика и кэш `file_id` по качеству.
-- **xray-core** — VLESS-прокси; опциональный стек **tun2socks + свой Bot API**
-  уводит трафик самого Telegram в туннель для загрузок до 2 ГБ.
+- **xray-core** — VLESS-пул (опционально); **Cloudflare WARP** — второй выход
+  на случай, когда VLESS в вашей сети не проходит.
+- **tun2socks + свой Bot API** (опционально) — уводят трафик самого Telegram
+  в туннель, чтобы поднять лимит загрузки до 2 ГБ.
+
+Прокси нужен не всем: если платформы у вас открываются напрямую, оставьте
+`PROXY_URL` пустым и не включайте лишние профили.
 
 Всё оркестрируется одним `docker compose` со включаемыми профилями (`vless`,
-`local-api`) — запускаете только то, что нужно.
+`warp`, `local-api`) — запускаете только то, что нужно.
 
 ### Решённые сложные проблемы (подводные камни)
 
@@ -135,10 +141,11 @@
    **tun2socks** (обычного SOCKS мало, т.к. Bot API сервер не умеет SOCKS).
 
 3. **Анти-бот челленджи Cloudflare.** Некоторые сайты отдают анти-бот страницу
-   IP дата-центров и не-браузерным TLS-отпечаткам. Бот использует **TLS с
-   имперсонацией браузера** (curl_cffi) и при необходимости уводит запрос через
-   прокси-ноду — с ретраями и ротацией отпечатков, т.к. челлендж прилетает с
-   перебоями.
+   IP дата-центров и не-браузерным TLS-отпечаткам. Против **пассивной** проверки
+   работает **TLS с имперсонацией браузера** (curl_cffi) плюс увод запроса через
+   прокси, с ретраями и ротацией отпечатков. Против **интерактивной** проверки
+   (CAPTCHA / Turnstile) отпечаток не помогает никак — там остаётся только
+   официальный API сайта, если он у сайта есть.
 
 4. **«Застывший кадр» на телефонах.** Телефоны декодируют VP9/AV1 в Telegram
    программно и показывают стоп-кадр со звуком. Сортировка форматов в пользу
@@ -189,10 +196,12 @@ docker compose logs -f bot
 Включение опциональных стеков — через `COMPOSE_PROFILES` в `.env`:
 
 ```ini
-# только прокси:
+# VLESS-пул:
 COMPOSE_PROFILES=vless
+# Cloudflare WARP вместо (или вместе с) VLESS:
+COMPOSE_PROFILES=warp
 # прокси + загрузки 2 ГБ:
-COMPOSE_PROFILES=vless,local-api
+COMPOSE_PROFILES=vless,warp,local-api
 ```
 
 ### Справочник по настройкам
@@ -575,9 +584,10 @@ Everything is one `docker compose` stack with optional profiles (`vless`,
    self-hosted Bot API can't reach Telegram directly — its traffic is routed
    through the VLESS tunnel at the network layer with **tun2socks** (plain SOCKS
    isn't enough; the Bot API server doesn't speak SOCKS).
-3. **Cloudflare anti-bot challenges.** Browser-impersonating TLS (curl_cffi) plus
-   proxy routing, retried with rotating fingerprints (the challenge is served
-   intermittently).
+3. **Cloudflare anti-bot challenges.** Browser-impersonating TLS (curl_cffi)
+   plus proxy routing and fingerprint-rotating retries carry a *passive* check.
+   An **interactive** one (CAPTCHA / Turnstile) no fingerprint gets past — there
+   the site's own API is the only way through, where one exists.
 4. **Mobile "frozen frame" videos.** Preferring **H.264** fixes inline playback.
 5. **Telegram photo limits.** Photos must be < 10 MB and sides sum to ≤ 10000 px
    with ratio ≤ 20:1 (`PHOTO_INVALID_DIMENSIONS`); over-limit images go as
