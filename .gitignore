@@ -23,11 +23,11 @@ PRIVATE-GUIDE.md
 # Private context/handoff artifact — never publish (contains infra/secrets refs)
 PROJECT-CONTEXT.md
 
+# Full feature inventory — infra details and the whole platform list; private only
+FEATURES.md
+
 # Python / tooling
 .venv/
 __pycache__/
 *.pyc
 .ruff_cache/
-
-# Claude Code local settings
-.claude/

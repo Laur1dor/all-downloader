@@ -25,6 +25,7 @@ RUN set -eux; \
 
 WORKDIR /app
 COPY proxy/build_config.py /app/build_config.py
+COPY proxy/probe_goida.py /app/probe_goida.py
 COPY proxy/entrypoint.sh /usr/local/bin/xray-entrypoint.sh
 COPY scripts/netshape.sh /usr/local/bin/netshape.sh
 RUN chmod +x /usr/local/bin/xray-entrypoint.sh /usr/local/bin/netshape.sh \

@@ -57,6 +57,16 @@ services:
       GOIDA_POOL_SIZE: ${GOIDA_POOL_SIZE:-50}
       # Curated premium bypass pool (comma-sep vless://) on SOCKS :2078.
       BYPASS_CONFIGS: ${BYPASS_CONFIGS:-}
+      # Prober: only ~2-5% of the free links survive DPI, so nodes are verified
+      # before they reach the pool. SAMPLE candidates are fetched per round, the
+      # TCP-reachable ones are then really dialled through a throwaway xray until
+      # TARGET live nodes are found or DEEP attempts are spent.
+      GOIDA_PROBE_SAMPLE: ${GOIDA_PROBE_SAMPLE:-900}
+      GOIDA_PROBE_DEEP: ${GOIDA_PROBE_DEEP:-400}
+      GOIDA_LIVE_TARGET: ${GOIDA_LIVE_TARGET:-25}
+      GOIDA_PROBE_INTERVAL: ${GOIDA_PROBE_INTERVAL:-1800}
+      # One CPU core on the box: more parallel probes just thrash.
+      GOIDA_PROBE_DEEP_WORKERS: ${GOIDA_PROBE_DEEP_WORKERS:-6}
     volumes:
       # read-write: routing.toml is read here and the goida pool cache
       # (data/goida_cache.txt) is written here so the free pool survives a
@@ -96,7 +106,10 @@ services:
     devices: ["/dev/net/tun"]
     environment:
       LOGLEVEL: info
-      PROXY: socks5://xray:2080
+      # Which tunnel carries Telegram traffic. Defaults to the VLESS pool; set
+      # TUN2SOCKS_PROXY=socks5://warp:1080 in .env to fail over to WARP when the
+      # VLESS provider is blocked (DPI cert substitution kills the whole pool).
+      PROXY: ${TUN2SOCKS_PROXY:-socks5://xray:2080}
     networks:
       default:
         aliases: [telegram-bot-api]

@@ -214,7 +214,13 @@ COMPOSE_PROFILES=vless,local-api
 | `VLESS_SUBSCRIPTION` | для прокси | URL подписки, прокси сам обновляет. |
 | `VLESS_CONFIGS` | для прокси | Или вставьте `vless://...` напрямую через запятую. |
 | `VLESS_CONFIGS_FILE` | — | Или укажите файл со строками `vless://...`. |
-| `VLESS_UPDATE_INTERVAL` | — | Интервал обновления подписки, сек (по умолч. 21600). |
+| `VLESS_UPDATE_INTERVAL` | — | Интервал пересборки конфига прокси, сек (по умолч. 21600). |
+| `TUN2SOCKS_PROXY` | — | Каким туннелем свой Bot API ходит в Telegram (по умолч. `socks5://xray:2080`; `socks5://warp:1080` — через WARP). |
+| `GOIDA_SUBSCRIPTIONS` | — | Ссылки на публичные агрегаторы для бесплатного пула, через запятую. |
+| `GOIDA_PROXY_URL` / `GOIDA_POOL_SIZE` | — | Адрес бесплатного пула и его размер. |
+| `GOIDA_PROBE_SAMPLE` / `GOIDA_PROBE_DEEP` | — | Сколько кандидатов пробер берёт за круг и сколько из них проверяет по-настоящему. |
+| `GOIDA_LIVE_TARGET` / `GOIDA_PROBE_INTERVAL` | — | Сколько живых нод набирать и как часто повторять круг (сек). |
+| `BYPASS_CONFIGS` / `BYPASS_PROXY_URL` | — | Отдельный пул курируемых нод для сайтов, блокирующих по репутации IP. |
 | `SPOTDL_HTTP_PROXY` | — | HTTP-прокси для метаданных Spotify при гео-блоке (`http://xray:2081`). |
 | `MAIN_MAX_MBIT` / `VPN_MAX_MBIT` | — | Верхние границы слайдеров скорости в админ-панели. |
 
@@ -363,11 +369,30 @@ docker compose up -d --build
 `main_fallback = "goida"` — если основная нода умерла, всё уходит в бесплатный
 пул, чтобы один сбой не ронял бота.
 
-**Бесплатный резервный пул.** Через `GOIDA_SUBSCRIPTIONS` (raw-ссылки на
-агрегаторы вроде AvenCores/goida-vpn-configs) поднимается второй пул на
-`socks :2079`: из подписок берутся VLESS-конфиги, xray непрерывно health-чекает
-их (`leastLoad` + `burstObservatory`) и крутит запросы по **живым** нодам, дохлые
-сами выпадают — без кэша. Используется для IP-забаненных сайтов и как fallback.
+**Бесплатный резервный пул с проверкой нод.** Через `GOIDA_SUBSCRIPTIONS`
+(raw-ссылки на агрегаторы вроде AvenCores/goida-vpn-configs) поднимается второй
+пул на `socks :2079`. Ссылок в таких подписках сотни тысяч, но живых среди них
+единицы процентов, поэтому набирать пул «первыми N подряд» бесполезно — этим
+занимается **пробер** `proxy/probe_goida.py`: он берёт случайную выборку из всех
+источников, отсеивает недоступные по TCP, а каждую выжившую реально прогоняет
+через одноразовый xray до `generate_204`. В пул попадают только подтверждённые
+ноды (`data/goida_live.txt`), дальше xray продолжает health-чекать их
+(`leastLoad` + `burstObservatory`). Параметры — переменные `GOIDA_PROBE_*`.
+
+**Cloudflare WARP.** Сервис `warp` даёт SOCKS5 на `warp:1080` — отдельный
+транспорт на случай, когда VLESS в вашей сети не проходит, и стабильный
+выходной IP для сайтов, которым нужна привязка к одному адресу. Указывается как
+политика прямо в `routing.toml`: `youtube = "socks5h://warp:1080"`.
+
+**Разные платформы требуют разных выходов.** Один прокси на всё не работает:
+площадка может банить адреса дата-центров, другая — наоборот требовать
+стабильный IP, третья — считать ротирующийся пул ботом. `routing.toml` для того
+и нужен: политика задаётся отдельно для каждой платформы и меняется на лету.
+
+**Чем ходит свой Bot API.** Переменная `TUN2SOCKS_PROXY` выбирает туннель для
+трафика к Telegram (по умолчанию `socks5://xray:2080`). Если VLESS в вашей сети
+не работает, поставьте `socks5://warp:1080` — иначе Bot API не достучится до
+Telegram, и бот уйдёт в цикл перезапусков.
 
 ### Загрузки до 2 ГБ (свой Bot API)
 
@@ -417,7 +442,7 @@ DPI-троттлинге MTProto. Требует включённого проф
 
 ```
 bot/                aiogram-бот: хендлеры, загрузчик, БД, прокси-роутер, runtime-конфиг
-proxy/              сборщик конфига xray + entrypoint (VLESS-подписка → конфиг)
+proxy/              сборщик конфига xray, пробер бесплатных нод, entrypoint
 scripts/            шейпер полосы (systemd service + timer)
 compose.yml         весь стек с опциональными профилями
 Dockerfile*         образы бота, xray-прокси и своего Bot API
@@ -607,7 +632,13 @@ COMPOSE_PROFILES=vless,local-api  # proxy + 2 GB uploads
 | `VLESS_SUBSCRIPTION` | for proxy | Subscription URL, auto-refreshed. |
 | `VLESS_CONFIGS` | for proxy | Or paste `vless://...`, comma-separated. |
 | `VLESS_CONFIGS_FILE` | — | Or a file of `vless://...` lines. |
-| `VLESS_UPDATE_INTERVAL` | — | Refresh interval, seconds (default 21600). |
+| `VLESS_UPDATE_INTERVAL` | — | How often the proxy config is rebuilt, seconds (default 21600). |
+| `TUN2SOCKS_PROXY` | — | Which tunnel the self-hosted Bot API uses for Telegram (default `socks5://xray:2080`; `socks5://warp:1080` for WARP). |
+| `GOIDA_SUBSCRIPTIONS` | — | Comma-separated public aggregator URLs for the free pool. |
+| `GOIDA_PROXY_URL` / `GOIDA_POOL_SIZE` | — | Address and size of the free pool. |
+| `GOIDA_PROBE_SAMPLE` / `GOIDA_PROBE_DEEP` | — | Candidates the prober takes per round, and how many it really dials. |
+| `GOIDA_LIVE_TARGET` / `GOIDA_PROBE_INTERVAL` | — | Live nodes to collect, and how often to repeat the round (seconds). |
+| `BYPASS_CONFIGS` / `BYPASS_PROXY_URL` | — | Separate curated pool for sites that block by IP reputation. |
 | `SPOTDL_HTTP_PROXY` | — | HTTP proxy for Spotify metadata (`http://xray:2081`). |
 | `MAIN_MAX_MBIT` / `VPN_MAX_MBIT` | — | Upper bounds for control-panel speed sliders. |
 
@@ -674,10 +705,32 @@ routes adaptively (direct → proxy on block) with a content-level retry-via-pro
 per-platform policy — `direct` / `main` / `goida` / `adaptive` / `vless://...` —
 and is hot-reloaded (no restart). `main_fallback = "goida"` routes everything
 through the free pool if the main node dies, so one failure never takes the bot
-down. **Free fallback pool:** set `GOIDA_SUBSCRIPTIONS` to public aggregator URLs
-and a second pool comes up on `socks :2079`, continuously health-checked
-(`leastLoad` + `burstObservatory`) so requests rotate over live nodes only — used
-for IP-banned sites and as the main-node fallback.
+down.
+
+**Free fallback pool, with nodes verified first.** Set `GOIDA_SUBSCRIPTIONS` to
+public aggregator URLs and a second pool comes up on `socks :2079`. Those
+subscriptions carry hundreds of thousands of links of which only a few percent
+actually work, so filling a pool with the first N is pointless — that is what
+the prober (`proxy/probe_goida.py`) is for: it samples every source at random,
+drops what is unreachable over TCP, and dials each survivor through a throwaway
+xray until `generate_204` answers. Only confirmed nodes reach the pool
+(`data/goida_live.txt`), where xray keeps health-checking them (`leastLoad` +
+`burstObservatory`). Tunable through the `GOIDA_PROBE_*` variables.
+
+**Cloudflare WARP.** The `warp` service exposes SOCKS5 on `warp:1080` — a second
+transport for networks where VLESS does not get through, and a stable exit IP for
+sites that tie their clearance to one address. Use it as a policy straight in
+`routing.toml`: `youtube = "socks5h://warp:1080"`.
+
+**Different platforms want different exits.** One proxy for everything does not
+hold: a site may ban datacentre ranges, another may require a stable IP, a third
+may read a rotating pool as a bot. That is what `routing.toml` is for — the
+policy is per platform and hot-reloaded.
+
+**What carries the Bot API.** `TUN2SOCKS_PROXY` picks the tunnel for traffic to
+Telegram (default `socks5://xray:2080`). Where VLESS is blocked, set
+`socks5://warp:1080` — otherwise the Bot API cannot reach Telegram and the bot
+ends up in a restart loop.
 
 ### 2 GB uploads (self-hosted Bot API)
 
@@ -710,7 +763,7 @@ removes the cap. Changeable live from `/control`. Scripts in `scripts/`.
 
 ```
 bot/                aiogram bot: handlers, downloader, db, proxy router, runtime config
-proxy/              xray config builder + entrypoint
+proxy/              xray config builder, free-node prober, entrypoint
 scripts/            bandwidth shaper (systemd service + timer)
 compose.yml         the whole stack with optional profiles
 Dockerfile*         images for the bot, xray proxy, self-hosted Bot API

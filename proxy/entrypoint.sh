@@ -13,11 +13,21 @@ python3 /app/build_config.py "$CONFIG"
 xray run -c "$CONFIG" &
 xray_pid=$!
 
+# Verify free nodes in the background: only ~2% of the subscription links get
+# through the DPI, so the pool has to be filled from tested nodes rather than
+# from the top of the list. The prober writes data/goida_live.txt; the refresh
+# loop below picks it up and reloads xray when the set changed.
+if [ -n "${GOIDA_SUBSCRIPTIONS:-}" ]; then
+    python3 /app/probe_goida.py &
+fi
+
 # If xray dies on its own (bad node, crash), let Docker restart the container.
 while kill -0 "$xray_pid" 2>/dev/null; do
     sleep "$INTERVAL" &
     wait "$!"
-    if python3 /app/build_config.py "${CONFIG}.new" 2>/dev/null && \
+    # stderr is kept: its WARNs (dropped nodes, a pool that failed to build) are
+    # the only trace of why a refresh produced a smaller pool than expected.
+    if python3 /app/build_config.py "${CONFIG}.new" && \
        ! cmp -s "$CONFIG" "${CONFIG}.new"; then
         mv "${CONFIG}.new" "$CONFIG"
         echo "Subscription changed — reloading xray"
