@@ -49,6 +49,7 @@ from bot.downloader import (
     probe_quality_options,
     quality_selector,
     resolve_download_url,
+    video_metadata,
 )
 from bot.progress import (
     EDIT_INTERVAL,
@@ -697,7 +698,16 @@ async def _deliver_album(
             documents = []  # photos above Telegram's 10 MB photo limit go as files
             for path in album.items:
                 if path.suffix.lower() in (".mp4", ".webm", ".mov"):
-                    group.append(InputMediaVideo(media=FSInputFile(path), supports_streaming=True))
+                    # Without explicit dimensions Telegram guesses from the
+                    # container and gets it wrong whenever the file carries a
+                    # rotation flag or non-square pixels — the video then plays
+                    # stretched. video_metadata reports what the player draws.
+                    width, height, duration = video_metadata(path)
+                    group.append(InputMediaVideo(
+                        media=FSInputFile(path),
+                        supports_streaming=True,
+                        width=width, height=height, duration=duration,
+                    ))
                 elif photo_needs_document(path, _PHOTO_MAX_BYTES):
                     documents.append(path)
                 else:

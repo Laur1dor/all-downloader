@@ -10,6 +10,7 @@ the Telegram Bot API upload limit at all.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -804,25 +805,81 @@ async def _download_capped(
     return path, info
 
 
-def _ffprobe_dimensions(path: Path) -> tuple[int | None, int | None]:
-    """Read real width/height from the file so Telegram shows it undistorted.
-
-    Some sites (HLS, Rule34Video) report no/wrong dimensions; without correct
-    width+height Telegram renders the video as a square placeholder.
-    """
+def _ffprobe_stream(path: Path) -> dict:
+    """First video stream as a dict, or {} when the file cannot be probed."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=s=x:p=0", str(path),
+                "-show_entries",
+                "stream=width,height,duration,sample_aspect_ratio:"
+                "stream_tags=rotate:stream_side_data=rotation:format=duration",
+                "-of", "json", str(path),
             ],
             capture_output=True, text=True, timeout=30,
         )
-        width, height = result.stdout.strip().split("x")
-        return int(width), int(height)
+        data = json.loads(result.stdout)
     except (ValueError, OSError, subprocess.SubprocessError):
+        return {}
+    streams = data.get("streams") or []
+    stream = dict(streams[0]) if streams else {}
+    if stream and not stream.get("duration"):
+        stream["duration"] = (data.get("format") or {}).get("duration")
+    return stream
+
+
+def _stream_rotation(stream: dict) -> int:
+    """Rotation in degrees the player will apply, 0 when there is none."""
+    for side_data in stream.get("side_data_list") or []:
+        if "rotation" in side_data:
+            try:
+                return int(float(side_data["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    try:
+        return int(float((stream.get("tags") or {}).get("rotate", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ffprobe_dimensions(path: Path) -> tuple[int | None, int | None]:
+    """Displayed width/height, so Telegram shows the file undistorted.
+
+    Coded dimensions alone are not what the viewer sees. Two things change them
+    and both arrive from these sites: a rotation flag (a phone clip is stored
+    landscape and flagged 90 degrees) and a non-square sample aspect ratio
+    (anamorphic video, where the stored pixels are not square). Handing Telegram
+    the coded numbers in either case stretches the picture, which is exactly how
+    a rule34 video came out. Report what the player will actually draw.
+    """
+    stream = _ffprobe_stream(path)
+    try:
+        width, height = int(stream["width"]), int(stream["height"])
+    except (KeyError, TypeError, ValueError):
         return None, None
+
+    sar = str(stream.get("sample_aspect_ratio") or "")
+    if ":" in sar:
+        try:
+            num, den = (int(x) for x in sar.split(":", 1))
+            if num > 0 and den > 0:
+                width = round(width * num / den)
+        except (TypeError, ValueError):
+            pass
+
+    if abs(_stream_rotation(stream)) % 180 == 90:
+        width, height = height, width
+    return width, height
+
+
+def video_metadata(path: Path) -> tuple[int | None, int | None, int | None]:
+    """Displayed width, height and duration — what Telegram needs to render."""
+    width, height = _ffprobe_dimensions(path)
+    try:
+        duration = int(float(_ffprobe_stream(path).get("duration") or 0)) or None
+    except (TypeError, ValueError):
+        duration = None
+    return width, height, duration
 
 
 def photo_needs_document(path: Path, max_bytes: int) -> bool:
@@ -958,8 +1015,6 @@ _DESCRIPTION_KEYS = ("description", "content", "caption", "title")
 
 def _album_description(tmpdir: str) -> str | None:
     """Pull the post caption from gallery-dl's per-file metadata JSON."""
-    import json
-
     for json_path in Path(tmpdir).rglob("*.json"):
         try:
             data = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
