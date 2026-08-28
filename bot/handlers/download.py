@@ -48,6 +48,7 @@ from bot.downloader import (
     photo_needs_document,
     probe_quality_options,
     quality_selector,
+    request_tiktok_reprobe,
     resolve_download_url,
     video_metadata,
 )
@@ -480,6 +481,12 @@ async def _run_link(
                     capped = True  # consent received — retry with the size-capped ladder
                 except DownloadFailedError as exc:
                     # A different exit IP often clears per-post IP/geo/rate blocks.
+                    if platform == "tiktok" and not isinstance(
+                        exc, DownloadCancelledError | FileTooLargeError
+                    ):
+                        # Its exit may have died a moment ago; tell the prober now
+                        # so the next user is not routed through the same node.
+                        request_tiktok_reprobe()
                     if (
                         not isinstance(exc, DownloadCancelledError | FileTooLargeError)
                         and getattr(exc, "retry_via_proxy", False)

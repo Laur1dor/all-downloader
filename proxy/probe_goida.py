@@ -38,6 +38,26 @@ SAMPLE = int(os.getenv("GOIDA_PROBE_SAMPLE", "700"))
 # Сколько кандидатов реально прогоняем через xray за круг (это дорогая часть).
 DEEP_BUDGET = int(os.getenv("GOIDA_PROBE_DEEP", "180"))
 INTERVAL = int(os.getenv("GOIDA_PROBE_INTERVAL", "1800"))
+# TikTok gets its own verified pool: a node that carries plain HTTPS often still
+# cannot fetch TikTok, and the free ones stop working minutes after they start.
+TIKTOK_POOL_FILE = os.getenv("TIKTOK_POOL_FILE", "/app/data/tiktok_pool.txt")
+TIKTOK_POOL_TARGET = int(os.getenv("TIKTOK_POOL_TARGET", "5"))
+TIKTOK_POOL_CANDIDATES = int(os.getenv("TIKTOK_POOL_CANDIDATES", "20"))
+# Re-verified far more often than the main round: the pool is only useful while
+# its nodes are alive, and they die fast.
+TIKTOK_RECHECK_INTERVAL = int(os.getenv("TIKTOK_RECHECK_INTERVAL", "240"))
+# The bot creates this when a TikTok download fails, to force a check right away
+# instead of waiting out the interval.
+TIKTOK_TRIGGER_FILE = os.getenv("TIKTOK_TRIGGER_FILE", "/app/data/reprobe_tiktok")
+TIKTOK_HOST = "www.tiktok.com"
+# A video page, not a profile: a node can serve the profile and still fail on
+# the video, which is what the bot actually asks for. The check has to be the
+# same shape as the real work or the pool fills with nodes that pass it and then
+# fail every download.
+TIKTOK_PATH = os.getenv("TIKTOK_PROBE_PATH", "/@tiktok/video/7106594312292453675")
+# The marker yt-dlp itself needs; a block page or a captcha carries neither.
+TIKTOK_MARKER = b"__UNIVERSAL_DATA_FOR_REHYDRATION__"
+_CRLF = chr(13) + chr(10)
 TCP_WORKERS = int(os.getenv("GOIDA_PROBE_TCP_WORKERS", "60"))
 # Параллельных xray немного: у сервера одно ядро.
 DEEP_WORKERS = int(os.getenv("GOIDA_PROBE_DEEP_WORKERS", "6"))
@@ -209,16 +229,165 @@ def probe_round() -> list[str]:
     return live or previous
 
 
+def _https_get_via_socks(port: int, host: str, path: str, timeout: int = 20) -> bytes:
+    """One HTTPS GET through a local SOCKS5 port. Empty bytes on any failure."""
+    request = (
+        f"GET {path} HTTP/1.1|Host: {host}|"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36|"
+        "Accept: text/html|Connection: close||"
+    ).replace("|", _CRLF).encode()
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError:
+        return b""
+    try:
+        sock.sendall(bytes([5, 1, 0]))
+        sock.recv(2)
+        target = host.encode()
+        sock.sendall(bytes([5, 1, 0, 3]) + bytes([len(target)]) + target + struct.pack("!H", 443))
+        reply = sock.recv(10)
+        if len(reply) < 2 or reply[1] != 0:
+            return b""
+        tls = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        tls.sendall(request)
+        chunks, total = [], 0
+        while total < 400_000:
+            part = tls.recv(65536)
+            if not part:
+                break
+            chunks.append(part)
+            total += len(part)
+        return b"".join(chunks)
+    except Exception:
+        return b""
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _serves_tiktok(args: tuple[int, str]) -> str | None:
+    """Whether this one node can fetch a real TikTok page, not a block page."""
+    port, link = args
+    try:
+        outbounds, _ = bc._links_to_outbounds([link], "ttprobe-")
+    except Exception:
+        return None
+    if not outbounds:
+        return None
+    config = {
+        "log": {"loglevel": "none"},
+        "inbounds": [{
+            "tag": "in", "protocol": "socks", "port": port, "listen": "127.0.0.1",
+            "settings": {"udp": False},
+        }],
+        "outbounds": outbounds,
+    }
+    path = f"/tmp/tt-{port}.json"
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(config, fh)
+    proc = subprocess.Popen(
+        ["xray", "run", "-c", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        time.sleep(2)
+        body = _https_get_via_socks(port, TIKTOK_HOST, TIKTOK_PATH)
+        # "blocked from accessing" comes back with a 200 and the marker present,
+        # so the marker alone is not enough to call the node good.
+        if TIKTOK_MARKER not in body or b"blocked from accessing" in body:
+            return None
+        return link
+    finally:
+        proc.kill()
+        proc.wait()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _read_tiktok_pool() -> list[str]:
+    try:
+        with open(TIKTOK_POOL_FILE, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+    except OSError:
+        return []
+
+
+def refresh_tiktok_pool(live: list[str]) -> list[str]:
+    """Re-verify the TikTok pool, topping it up from the freshest candidates.
+
+    Nodes already in the pool are checked first and kept while they answer, so
+    the exit does not change under a download that is in flight. Only the empty
+    slots are filled, and curated nodes get first refusal because they outlive
+    the free ones by a wide margin.
+    """
+    current = _read_tiktok_pool()
+    with cf.ThreadPoolExecutor(min(4, max(1, len(current)))) as pool:
+        survivors = [
+            link for link in pool.map(
+                _serves_tiktok, [(44000 + i, c) for i, c in enumerate(current)]
+            ) if link
+        ]
+    dropped = len(current) - len(survivors)
+
+    if len(survivors) < TIKTOK_POOL_TARGET:
+        seen = set(survivors)
+        candidates = [
+            c for c in bc.collect_bypass_links() + live if c not in seen
+        ][:TIKTOK_POOL_CANDIDATES]
+        with cf.ThreadPoolExecutor(4) as pool:
+            for link in pool.map(
+                _serves_tiktok, [(44100 + i, c) for i, c in enumerate(candidates)]
+            ):
+                if link:
+                    survivors.append(link)
+                    if len(survivors) >= TIKTOK_POOL_TARGET:
+                        break
+
+    if survivors:
+        os.makedirs(os.path.dirname(TIKTOK_POOL_FILE) or ".", exist_ok=True)
+        tmp = f"{TIKTOK_POOL_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(chr(10).join(survivors) + chr(10))
+        os.replace(tmp, TIKTOK_POOL_FILE)
+    print(f"probe: tiktok pool {len(survivors)} node(s), {dropped} dropped", flush=True)
+    return survivors
+
+
+def _wait_or_trigger(seconds: int) -> None:
+    """Sleep, but wake early when the bot asks for a re-check."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if os.path.exists(TIKTOK_TRIGGER_FILE):
+            try:
+                os.unlink(TIKTOK_TRIGGER_FILE)
+            except OSError:
+                pass
+            print("probe: re-check requested by the bot", flush=True)
+            return
+        time.sleep(5)
+
+
 def main() -> None:
     once = "--once" in sys.argv
+    live: list[str] = _read_live()
+    next_full_round = 0.0
     while True:
         try:
-            probe_round()
-        except Exception as exc:  # пробер не должен падать вместе с xray
-            print(f"probe: круг сорвался: {exc}", flush=True)
+            # The full sweep is expensive; the TikTok pool is cheap and has to be
+            # checked often, so they run on separate clocks.
+            if time.time() >= next_full_round:
+                live = probe_round() or live
+                next_full_round = time.time() + INTERVAL
+            refresh_tiktok_pool(live)
+        except Exception as exc:  # the prober must not die with xray
+            print(f"probe: round failed: {exc}", flush=True)
         if once:
             return
-        time.sleep(INTERVAL)
+        _wait_or_trigger(TIKTOK_RECHECK_INTERVAL)
 
 
 if __name__ == "__main__":

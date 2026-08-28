@@ -128,6 +128,20 @@ _NOCHECKCERT_HOSTS = ("the-joi-database.com",)
 PHOTO_CAPABLE_PLATFORMS = ("instagram", "tiktok", "rule34", "twitter")
 
 
+# The prober watches for this file and re-verifies the TikTok pool at once
+# instead of waiting out its interval. A node can die seconds after being
+# picked, and the download that hit the dead one is the earliest evidence.
+_REPROBE_TRIGGER = Path(os.getenv("TIKTOK_TRIGGER_FILE", "data/reprobe_tiktok"))
+
+
+def request_tiktok_reprobe() -> None:
+    try:
+        _REPROBE_TRIGGER.parent.mkdir(parents=True, exist_ok=True)
+        _REPROBE_TRIGGER.touch()
+    except OSError as exc:  # a missing signal only costs a slower recovery
+        logger.debug("Could not signal the prober: %s", exc)
+
+
 class DownloadFailedError(Exception):
     """Download failure with a user-facing (Russian) message.
 

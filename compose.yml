@@ -14,6 +14,12 @@ services:
       GOIDA_PROXY_URL: ${GOIDA_PROXY_URL:-}
       # Curated bypass pool for IP-reputation-blocked sites (DDoS-Guard etc.).
       BYPASS_PROXY_URL: ${BYPASS_PROXY_URL:-}
+    dns:
+      # The provider intercepts and rewrites plain DNS — 1.1.1.1 comes back
+      # empty for whole domains — so name resolution goes to a recursive
+      # resolver on the host that talks to the root servers itself and validates
+      # DNSSEC. DNS_SERVER is the docker bridge gateway.
+      - ${DNS_SERVER:-172.18.0.1}
     extra_hosts:
       # Telegram API resolved statically, bypassing DNS (provider DNS may be unreliable).
       - "api.telegram.org:149.154.167.220"
@@ -47,6 +53,8 @@ services:
       dockerfile: Dockerfile.xray
     container_name: xray
     profiles: ["vless"]
+    dns:
+      - ${DNS_SERVER:-172.18.0.1}
     environment:
       VLESS_SUBSCRIPTION: ${VLESS_SUBSCRIPTION:-}
       VLESS_CONFIGS: ${VLESS_CONFIGS:-}
@@ -67,6 +75,11 @@ services:
       GOIDA_PROBE_INTERVAL: ${GOIDA_PROBE_INTERVAL:-1800}
       # One CPU core on the box: more parallel probes just thrash.
       GOIDA_PROBE_DEEP_WORKERS: ${GOIDA_PROBE_DEEP_WORKERS:-6}
+      # TikTok pool: verified against TikTok itself, re-checked far more often
+      # than the main sweep because free nodes stop serving it within minutes.
+      TIKTOK_POOL_TARGET: ${TIKTOK_POOL_TARGET:-5}
+      TIKTOK_POOL_CANDIDATES: ${TIKTOK_POOL_CANDIDATES:-20}
+      TIKTOK_RECHECK_INTERVAL: ${TIKTOK_RECHECK_INTERVAL:-240}
     volumes:
       # read-write: routing.toml is read here and the goida pool cache
       # (data/goida_cache.txt) is written here so the free pool survives a
