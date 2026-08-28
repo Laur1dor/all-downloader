@@ -840,7 +840,7 @@ def _ffprobe_stream(path: Path) -> dict:
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0",
                 "-show_entries",
-                "stream=width,height,duration,sample_aspect_ratio:"
+                "stream=codec_name,width,height,duration,sample_aspect_ratio:"
                 "stream_tags=rotate:stream_side_data=rotation:format=duration",
                 "-of", "json", str(path),
             ],
@@ -925,11 +925,68 @@ def photo_needs_document(path: Path, max_bytes: int) -> bool:
     return (width + height) > 10000 or max(width, height) > 20 * min(width, height)
 
 
+# Codecs phones decode in software: playback stutters until the whole file is
+# cached, which is why a clip plays badly the first time and fine after leaving
+# and re-entering the chat.
+_SOFTWARE_DECODED = ("hevc", "h265", "vp9", "vp09", "av01", "av1")
+# Above this length the conversion costs more than the stutter it saves — the
+# box has one core, and it runs at roughly half of realtime.
+_TRANSCODE_MAX_SECONDS = int(os.getenv("TRANSCODE_MAX_SECONDS", "180"))
+
+
+def _to_h264_if_needed(path: Path) -> Path:
+    """Convert to h264 when the source codec is one phones cannot decode in HW.
+
+    TikTok publishes its highest resolution only as h265, so taking the sharper
+    file means taking a codec many phones fall back to software for. Converting
+    keeps the resolution and the audio (copied, never re-encoded) while giving
+    Telegram something every client plays smoothly. Short clips only.
+    """
+    stream = _ffprobe_stream(path)
+    codec = str(stream.get("codec_name") or "").lower()
+    if not any(codec.startswith(c) for c in _SOFTWARE_DECODED):
+        return path
+    try:
+        duration = float(stream.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration and duration > _TRANSCODE_MAX_SECONDS:
+        logger.info("Leaving %s as %s: %.0fs is too long to convert", path.name, codec, duration)
+        return path
+
+    converted = path.with_name(f"{path.stem}-h264.mp4")
+    command = [
+        "ffmpeg", "-y", "-v", "error", "-i", str(path),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "copy",
+        # Index at the front, so the player can start before the whole file
+        # has arrived instead of buffering to the end for it.
+        "-movflags", "+faststart",
+        str(converted),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not convert %s: %s", path.name, exc)
+        return path
+    if result.returncode != 0 or not converted.exists() or converted.stat().st_size == 0:
+        logger.warning("ffmpeg refused to convert %s: %s",
+                       path.name, result.stderr.decode("utf-8", "ignore")[:200])
+        return path
+    logger.info("Converted %s from %s to h264", path.name, codec)
+    path.unlink(missing_ok=True)
+    return converted
+
+
 def _build_media(path: Path, info: dict) -> Media:
     duration = info.get("duration")
-    width, height = info.get("width"), info.get("height")
+    # The file itself is the authority: yt-dlp reports the coded size, which is
+    # not what the player draws for rotated or anamorphic video, and conversion
+    # to h264 bakes both of those in. Fall back to the metadata only if ffprobe
+    # cannot read the file.
+    width, height = _ffprobe_dimensions(path)
     if not width or not height:
-        width, height = _ffprobe_dimensions(path)
+        width, height = info.get("width"), info.get("height")
     return Media(
         path=path,
         title=info.get("title") or "media",
@@ -979,6 +1036,7 @@ async def _temporary_download(
             raise DownloadFailedError(
                 _user_message(exc), retry_via_proxy=_is_block_error(exc)
             ) from exc
+        path = await asyncio.to_thread(_to_h264_if_needed, path)
         yield _build_media(path, info)
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)

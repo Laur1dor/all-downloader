@@ -129,4 +129,15 @@ assert 403 in _BLOCKED_STATUSES and 451 in _BLOCKED_STATUSES
 assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
 print("block detection OK")
 
+# --- codecs that need converting ---
+from bot.downloader import _SOFTWARE_DECODED
+
+# Phones fall back to software for these, and playback stutters until the whole
+# file is cached — the "lags the first time, fine after re-entering" symptom.
+for codec in ("hevc", "vp9", "av01"):
+    assert any(codec.startswith(c) for c in _SOFTWARE_DECODED), codec
+assert not any("h264".startswith(c) for c in _SOFTWARE_DECODED), "h264 must be left alone"
+assert not any("avc1".startswith(c) for c in _SOFTWARE_DECODED), "avc1 must be left alone"
+print("codec conversion rules OK")
+
 print("\nALL SMOKE TESTS PASSED")
