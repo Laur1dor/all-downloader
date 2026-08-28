@@ -76,6 +76,31 @@ GOIDA_MIN = int(os.getenv("GOIDA_MIN", "5"))
 # reputation (e.g. DDoS-Guard) where the free/main exits get blocked.
 BYPASS_SOCKS_PORT = int(os.getenv("BYPASS_SOCKS_PORT", "2078"))
 
+# Pool for sites that refuse to be load-balanced. TikTok tears down a session
+# whose requests arrive from different exits, so leastLoad (which spreads across
+# the pool) fails on it every time while single nodes serve it fine. leastPing
+# keeps picking the same lowest-latency node, which is the stickiness TikTok
+# wants, and the observatory drops a node the moment it stops answering — that
+# is what makes the rotation automatic rather than something the prober has to
+# notice half an hour later.
+TIKTOK_SOCKS_PORT = int(os.getenv("TIKTOK_SOCKS_PORT", "2077"))
+TIKTOK_POOL_FILE = os.getenv("TIKTOK_POOL_FILE", "/app/data/tiktok_pool.txt")
+# Free nodes die within minutes, so a stale list is worse than none.
+TIKTOK_POOL_MAX_AGE = int(os.getenv("TIKTOK_POOL_MAX_AGE", "5400"))
+# How fast a dead node leaves the pool.
+TIKTOK_PROBE_INTERVAL = os.getenv("TIKTOK_PROBE_INTERVAL", "45s")
+
+
+def collect_tiktok_links() -> list[str]:
+    """Nodes the prober confirmed can actually fetch TikTok, if still fresh."""
+    try:
+        if time.time() - os.path.getmtime(TIKTOK_POOL_FILE) > TIKTOK_POOL_MAX_AGE:
+            return []
+        with open(TIKTOK_POOL_FILE, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+    except OSError:
+        return []
+
 
 def collect_bypass_links() -> list[str]:
     inline = os.getenv("BYPASS_CONFIGS", "").replace(",", "\n")
@@ -387,6 +412,8 @@ def build_config(
     outbounds += goida_outbounds
     bypass_outbounds, bypass_tags = _links_to_outbounds(bypass_links or [], "byp-")
     outbounds += bypass_outbounds
+    tiktok_outbounds, tiktok_tags = _links_to_outbounds(collect_tiktok_links(), "tt-")
+    outbounds += tiktok_outbounds
 
     outbounds += [
         {"tag": "direct", "protocol": "freedom"},
@@ -493,8 +520,27 @@ def build_config(
             },
         }
 
+    # TikTok pool: leastPing so the same node keeps being chosen (the session
+    # stays on one exit), observatory so a node that dies leaves on its own.
+    if tiktok_tags:
+        inbounds.append({
+            "tag": "tiktok-socks",
+            "listen": "0.0.0.0",
+            "port": TIKTOK_SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        })
+        balancers.append(
+            {"tag": "tiktok", "selector": ["tt-"], "strategy": {"type": "leastPing"}}
+        )
+        rules.insert(
+            0, {"type": "field", "inboundTag": ["tiktok-socks"], "balancerTag": "tiktok"}
+        )
+
     # Curated bypass pool on its own inbound: leastPing with health failover.
     observatory_subjects = ["vless-"]
+    if tiktok_tags:
+        observatory_subjects.append("tt-")
     if bypass_tags:
         inbounds.append({
             "tag": "bypass-socks",
@@ -520,7 +566,7 @@ def build_config(
         "observatory": {
             "subjectSelector": observatory_subjects,
             "probeUrl": PROBE_URL,
-            "probeInterval": "60s",
+            "probeInterval": TIKTOK_PROBE_INTERVAL if tiktok_tags else "60s",
         },
         "routing": {
             "domainStrategy": "AsIs",
@@ -675,7 +721,7 @@ def main() -> None:
         _write(output, config)
     n = lambda p: sum(1 for o in config["outbounds"] if o["tag"].startswith(p))  # noqa: E731
     print(f"xray config: {output} — {n('vless-')} main, {n('gvless-')} goida, "
-          f"{n('byp-')} bypass node(s)")
+          f"{n('byp-')} bypass, {n('tt-')} tiktok node(s)")
 
 
 if __name__ == "__main__":
