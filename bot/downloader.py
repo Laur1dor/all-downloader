@@ -925,57 +925,65 @@ def photo_needs_document(path: Path, max_bytes: int) -> bool:
     return (width + height) > 10000 or max(width, height) > 20 * min(width, height)
 
 
-# Codecs phones decode in software: playback stutters until the whole file is
-# cached, which is why a clip plays badly the first time and fine after leaving
-# and re-entering the chat.
-_SOFTWARE_DECODED = ("hevc", "h265", "vp9", "vp09", "av01", "av1")
-# Above this length the conversion costs more than the stutter it saves — the
-# box has one core, and it runs at roughly half of realtime.
-_TRANSCODE_MAX_SECONDS = int(os.getenv("TRANSCODE_MAX_SECONDS", "180"))
+# Some sites publish the post's real soundtrack as a separate audio-only format
+# and mux a much weaker copy into the video files. TikTok does: the same clip
+# carries 64 kbps aac inside the video and offers 128 kbps mp3 on its own, which
+# is why the "download audio" button sounded right while the video sounded thin.
+# yt-dlp will not swap it in on its own — a muxed format already has audio, so
+# "bestvideo*+bestaudio" keeps the weak track — so it is done here.
+#
+# Only the audio is re-encoded, and only to AAC because Telegram plays that
+# everywhere; the video is copied untouched, which keeps this to about a second.
+_AUDIO_UPGRADE_MIN_GAIN = 1.5  # not worth a pass for a marginal difference
+# Audio at least this good is left alone: nothing to gain, and fetching the
+# standalone track to find that out would cost a request on every download.
+_AUDIO_GOOD_ENOUGH = int(os.getenv("AUDIO_GOOD_ENOUGH_BPS", "112000"))
 
 
-def _to_h264_if_needed(path: Path) -> Path:
-    """Convert to h264 when the source codec is one phones cannot decode in HW.
-
-    TikTok publishes its highest resolution only as h265, so taking the sharper
-    file means taking a codec many phones fall back to software for. Converting
-    keeps the resolution and the audio (copied, never re-encoded) while giving
-    Telegram something every client plays smoothly. Short clips only.
-    """
-    stream = _ffprobe_stream(path)
-    codec = str(stream.get("codec_name") or "").lower()
-    if not any(codec.startswith(c) for c in _SOFTWARE_DECODED):
-        return path
+def _audio_bitrate(path: Path) -> int | None:
     try:
-        duration = float(stream.get("duration") or 0)
-    except (TypeError, ValueError):
-        duration = 0.0
-    if duration and duration > _TRANSCODE_MAX_SECONDS:
-        logger.info("Leaving %s as %s: %.0fs is too long to convert", path.name, codec, duration)
-        return path
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=bit_rate", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return int(result.stdout.strip() or 0) or None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
 
-    converted = path.with_name(f"{path.stem}-h264.mp4")
+
+def _best_audio_only_format(info: dict) -> dict | None:
+    """The best audio-only format offered alongside the muxed video ones."""
+    candidates = [
+        f for f in info.get("formats") or []
+        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+        and f.get("format_id")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+
+
+def _mux_better_audio(path: Path, audio_path: Path) -> Path:
+    merged = path.with_name(f"{path.stem}-audio.mp4")
     command = [
-        "ffmpeg", "-y", "-v", "error", "-i", str(path),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "copy",
-        # Index at the front, so the player can start before the whole file
-        # has arrived instead of buffering to the end for it.
-        "-movflags", "+faststart",
-        str(converted),
+        "ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        # Index at the front so the player can start before the whole file lands.
+        "-movflags", "+faststart", str(merged),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=600)
+        result = subprocess.run(command, capture_output=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("Could not convert %s: %s", path.name, exc)
+        logger.warning("Could not attach the better audio to %s: %s", path.name, exc)
         return path
-    if result.returncode != 0 or not converted.exists() or converted.stat().st_size == 0:
-        logger.warning("ffmpeg refused to convert %s: %s",
+    if result.returncode != 0 or not merged.exists() or merged.stat().st_size == 0:
+        logger.warning("ffmpeg refused to attach audio to %s: %s",
                        path.name, result.stderr.decode("utf-8", "ignore")[:200])
         return path
-    logger.info("Converted %s from %s to h264", path.name, codec)
     path.unlink(missing_ok=True)
-    return converted
+    return merged
 
 
 def _build_media(path: Path, info: dict) -> Media:
@@ -996,6 +1004,49 @@ def _build_media(path: Path, info: dict) -> Media:
         height=height,
         description=info.get("description"),
     )
+
+
+async def _upgrade_audio(url: str, path: Path, info: dict, options: dict) -> Path:
+    """Replace the video's weak embedded audio with the site's standalone track.
+
+    The offered track's bitrate is usually not in the metadata — TikTok reports
+    neither abr nor tbr for it — so the decision cannot be made up front. What
+    can be decided up front is whether it is worth looking: a file that already
+    carries decent audio is left alone, and only a thin one is compared against
+    the standalone track, which is small and quick to fetch.
+    """
+    audio_format = _best_audio_only_format(info)
+    if audio_format is None:
+        return path
+
+    embedded = _audio_bitrate(path) or 0
+    if embedded >= _AUDIO_GOOD_ENOUGH:
+        return path
+
+    audio_options = dict(options)
+    audio_options["format"] = str(audio_format["format_id"])
+    # The progress bar and the size guard belong to the video download.
+    for key in ("progress_hooks", "format_sort", "merge_output_format", "postprocessors"):
+        audio_options.pop(key, None)
+    audio_options["outtmpl"] = str(path.with_name("betteraudio.%(ext)s"))
+    try:
+        audio_path, _ = await asyncio.to_thread(_download_sync, url, audio_options)
+    except Exception as exc:  # the video is already usable without this
+        logger.info("Could not fetch the standalone audio for %s: %s", url, exc)
+        return path
+
+    try:
+        offered = _audio_bitrate(audio_path) or 0
+        if not offered or (embedded and offered < embedded * _AUDIO_UPGRADE_MIN_GAIN):
+            return path
+        upgraded = await asyncio.to_thread(_mux_better_audio, path, audio_path)
+        if upgraded is not path:
+            logger.info("Replaced %d kbps audio with the site's %d kbps track",
+                        embedded // 1000, offered // 1000)
+        return upgraded
+    finally:
+        audio_path.unlink(missing_ok=True)
+
 
 
 @asynccontextmanager
@@ -1036,7 +1087,7 @@ async def _temporary_download(
             raise DownloadFailedError(
                 _user_message(exc), retry_via_proxy=_is_block_error(exc)
             ) from exc
-        path = await asyncio.to_thread(_to_h264_if_needed, path)
+        path = await _upgrade_audio(url, path, info, options)
         yield _build_media(path, info)
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)

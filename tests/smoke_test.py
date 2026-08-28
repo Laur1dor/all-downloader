@@ -129,15 +129,20 @@ assert 403 in _BLOCKED_STATUSES and 451 in _BLOCKED_STATUSES
 assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
 print("block detection OK")
 
-# --- codecs that need converting ---
-from bot.downloader import _SOFTWARE_DECODED
+# --- picking the better audio track ---
+from bot.downloader import _AUDIO_UPGRADE_MIN_GAIN, _best_audio_only_format
 
-# Phones fall back to software for these, and playback stutters until the whole
-# file is cached — the "lags the first time, fine after re-entering" symptom.
-for codec in ("hevc", "vp9", "av01"):
-    assert any(codec.startswith(c) for c in _SOFTWARE_DECODED), codec
-assert not any("h264".startswith(c) for c in _SOFTWARE_DECODED), "h264 must be left alone"
-assert not any("avc1".startswith(c) for c in _SOFTWARE_DECODED), "avc1 must be left alone"
-print("codec conversion rules OK")
+# TikTok mixes a weak copy into the video and offers the real soundtrack on its
+# own; only the audio-only entries may be considered for the swap.
+formats = {"formats": [
+    {"format_id": "video", "vcodec": "h264", "acodec": "aac", "abr": 64},
+    {"format_id": "audio", "vcodec": "none", "acodec": "mp3", "abr": 128},
+    {"format_id": "quieter", "vcodec": "none", "acodec": "mp3", "abr": 64},
+]}
+assert _best_audio_only_format(formats)["format_id"] == "audio"
+assert _best_audio_only_format({"formats": []}) is None
+# A file whose own audio is already as good must not be re-encoded for nothing.
+assert _AUDIO_UPGRADE_MIN_GAIN > 1
+print("audio upgrade rules OK")
 
 print("\nALL SMOKE TESTS PASSED")
