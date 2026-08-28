@@ -35,7 +35,10 @@ _SERVICE_DOMAINS = {
     "twitter": ["x.com", "twitter.com"],
     "joidb": ["the-joi-database.com"],
     "yandexmusic": ["music.yandex.ru", "music.yandex.com"],
-    "tiktok": ["tiktok.com"],
+    # The page, the API and the media CDN must all leave through the same exit:
+    # TikTok drops a session whose requests arrive from different addresses.
+    "tiktok": ["tiktok.com", "tiktokcdn.com", "tiktokv.com", "tiktokv.us",
+               "byteoversea.com", "ibytedtos.com", "ttwstatic.com"],
     "youtube": ["youtube.com", "youtu.be"],
     "instagram": ["instagram.com"],
 }
@@ -435,6 +438,17 @@ def build_config(
 
     # Per-service pinned nodes (routing.toml entries that are vless:// links):
     # a dedicated outbound + a domain rule that wins over the balancer.
+    # Kept apart from `rules` and prepended at the very end. xray takes the first
+    # rule that matches, and the per-inbound balancer rules added below would
+    # otherwise shadow these: a TikTok request entering the goida inbound matched
+    # "inbound == goida-socks" first and went to the rotating pool, so the pin
+    # silently did nothing.
+    # Kept apart from `rules` and prepended at the very end. xray takes the first
+    # rule that matches, and the per-inbound balancer rules added below would
+    # otherwise shadow these: a request entering the goida inbound matched
+    # "inbound == goida-socks" first, so a routing.toml vless:// pin silently
+    # did nothing.
+    pinned_rules: list[dict] = []
     for service, link in _pinned_services().items():
         tag = f"svc-{service}"
         try:
@@ -443,7 +457,7 @@ def build_config(
             print(f"WARN: pinned node for {service} unparsable: {exc}", file=sys.stderr)
             continue
         domains = _SERVICE_DOMAINS.get(service, [f"{service}.com"])
-        rules.insert(0, {
+        pinned_rules.append({
             "type": "field",
             "domain": [f"domain:{d}" for d in domains],
             "outboundTag": tag,
@@ -511,7 +525,7 @@ def build_config(
         "routing": {
             "domainStrategy": "AsIs",
             "balancers": balancers,
-            "rules": rules,
+            "rules": pinned_rules + rules,
         },
     }
     if burst is not None:

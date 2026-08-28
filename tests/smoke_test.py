@@ -107,4 +107,17 @@ assert _is_public("8.8.8.8") and _is_public("2001:4860:4860::8888")
 ensure_public_url("ytsearch1:some track name")
 print("internal-address guard OK")
 
+# --- per-platform format sort ---
+from bot.downloader import video_format_sort
+
+# YouTube hides 4K behind vp9/av1 only, and phones show those as a frozen frame,
+# so the codec has to outrank resolution there.
+assert video_format_sort("youtube")[0] == "vcodec:h264"
+assert video_format_sort("other")[0] == "vcodec:h264"
+# TikTok ships the same clip as a smaller h264 transcode beside its h265
+# original, so resolution has to come first or every download is downgraded.
+assert video_format_sort("tiktok")[0] == "res"
+assert "vcodec:h264" in video_format_sort("tiktok"), "h264 still breaks ties"
+print("format sort OK")
+
 print("\nALL SMOKE TESTS PASSED")
