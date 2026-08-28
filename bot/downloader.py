@@ -41,10 +41,24 @@ logger = logging.getLogger(__name__)
 TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # Bot API hard limit for uploads
 
 _VIDEO_FORMAT = "bestvideo*+bestaudio/best"
-# h264+aac first: phones play other codecs (vp9/av1) as a frozen frame with sound,
-# because mobile Telegram relies on hardware decoding. Among h264 formats the
-# highest resolution and FPS still win; vp9/av1 are used only if no h264 exists.
+# h264 first, because on YouTube the resolutions above 1080p exist ONLY in
+# vp9/av1, and phones decode those in software: the video arrives as a frozen
+# frame with sound. Ranking by size first really does pick 4K vp9 over 1080p
+# h264 there, so this order stays the default.
 _VIDEO_FORMAT_SORT = ["vcodec:h264", "res", "fps", "acodec:aac"]
+
+# TikTok is the exception. It offers the *same* clip as a 576x1024 h264
+# transcode next to its 720x1280 h265 original, so preferring the codec silently
+# downgraded every download — which is why clips looked worse here than in the
+# app. Its h265 is what the app itself plays, and there is no higher resolution
+# hiding behind another codec, so resolution leads and h264 only breaks ties.
+_VIDEO_FORMAT_SORT_BY_PLATFORM = {
+    "tiktok": ["res", "fps", "tbr", "vcodec:h264", "acodec:aac"],
+}
+
+
+def video_format_sort(platform: str) -> list[str]:
+    return _VIDEO_FORMAT_SORT_BY_PLATFORM.get(platform, _VIDEO_FORMAT_SORT)
 # m4a (AAC) first: Telegram's sendAudio officially supports MP3/M4A only, and
 # picking it directly avoids any re-encoding; otherwise take the best stream as is.
 _AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
@@ -978,7 +992,7 @@ def download_video(
     size_guard = {"limit": max_bytes, "tripped": None}
     options = _base_options(cookies_file, url, force_proxy) | {
         "format": _VIDEO_FORMAT,
-        "format_sort": _VIDEO_FORMAT_SORT,
+        "format_sort": video_format_sort(detect_platform(url)),
         # Remux (no re-encode) into mp4 when codecs allow it, otherwise mkv.
         "merge_output_format": "mp4/mkv",
         "progress_hooks": [_progress_hook(progress, cancel_event, size_guard)],
