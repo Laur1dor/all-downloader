@@ -130,7 +130,7 @@ assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
 print("block detection OK")
 
 # --- picking the better audio track ---
-from bot.downloader import _AUDIO_UPGRADE_MIN_GAIN, _best_audio_only_format
+from bot.downloader import _AUDIO_GOOD_ENOUGH, _best_audio_only_format
 
 # TikTok mixes a weak copy into the video and offers the real soundtrack on its
 # own; only the audio-only entries may be considered for the swap.
@@ -141,8 +141,9 @@ formats = {"formats": [
 ]}
 assert _best_audio_only_format(formats)["format_id"] == "audio"
 assert _best_audio_only_format({"formats": []}) is None
-# A file whose own audio is already as good must not be re-encoded for nothing.
-assert _AUDIO_UPGRADE_MIN_GAIN > 1
+# The skip threshold must not sit below what the separate track actually
+# carries, or a file at 96 kbps would never be compared against a 128 kbps one.
+assert _AUDIO_GOOD_ENOUGH >= 128000
 print("audio upgrade rules OK")
 
 print("\nALL SMOKE TESTS PASSED")
