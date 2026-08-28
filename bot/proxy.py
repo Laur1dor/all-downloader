@@ -52,6 +52,11 @@ _PROBE_URLS = {
 _PROXY_TEST_URL = "https://www.google.com/generate_204"
 _CHECK_INTERVAL = 120.0
 _PROBE_TIMEOUT = 8.0
+# A block answers as confidently as a working site. rule34 hands the server's
+# address a 403 challenge page while the same request through a proxy returns
+# 200, and "status < 500" read that 403 as "direct works", so the platform was
+# routed direct and every download failed. These mean blocked, not reachable.
+_BLOCKED_STATUSES = frozenset({401, 403, 451})
 
 # Preferred pool order per policy. "main" (the personal node) is ALWAYS last so
 # day-to-day traffic never loads the operator's personal subscription while a
@@ -249,7 +254,7 @@ class ProxyRouter:
                 aiohttp.ClientSession(timeout=timeout, connector=connector) as session,
                 session.get(url, proxy=http_proxy, allow_redirects=False) as response,
             ):
-                return response.status < 500
+                return response.status < 500 and response.status not in _BLOCKED_STATUSES
         except Exception:
             # Building the connector can raise too, and a health probe must never
             # propagate: an unreachable pool is a DOWN, not a crashed bot.
