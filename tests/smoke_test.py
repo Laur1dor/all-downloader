@@ -120,4 +120,13 @@ assert video_format_sort("tiktok")[0] == "res"
 assert "vcodec:h264" in video_format_sort("tiktok"), "h264 still breaks ties"
 print("format sort OK")
 
+# --- a block is not reachability ---
+from bot.proxy import _BLOCKED_STATUSES
+
+# Cloudflare hands the server a 403 challenge while a proxy gets 200; counting
+# that 403 as reachable routed the platform direct and broke every download.
+assert 403 in _BLOCKED_STATUSES and 451 in _BLOCKED_STATUSES
+assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
+print("block detection OK")
+
 print("\nALL SMOKE TESTS PASSED")
