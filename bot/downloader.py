@@ -934,10 +934,13 @@ def photo_needs_document(path: Path, max_bytes: int) -> bool:
 #
 # Only the audio is re-encoded, and only to AAC because Telegram plays that
 # everywhere; the video is copied untouched, which keeps this to about a second.
-_AUDIO_UPGRADE_MIN_GAIN = 1.5  # not worth a pass for a marginal difference
-# Audio at least this good is left alone: nothing to gain, and fetching the
-# standalone track to find that out would cost a request on every download.
-_AUDIO_GOOD_ENOUGH = int(os.getenv("AUDIO_GOOD_ENOUGH_BPS", "112000"))
+# Skip the whole thing when the file's own audio is already at least this good.
+# This is the one guess in the process, and it only exists to avoid fetching the
+# standalone track on every download just to learn it is not better. 128k is what
+# TikTok's separate track measured at on every sampled clip without exception, so
+# a file already at that rate has nothing to gain. Raise it for a site that
+# publishes more.
+_AUDIO_GOOD_ENOUGH = int(os.getenv("AUDIO_GOOD_ENOUGH_BPS", "128000"))
 
 
 def _audio_bitrate(path: Path) -> int | None:
@@ -1009,11 +1012,11 @@ def _build_media(path: Path, info: dict) -> Media:
 async def _upgrade_audio(url: str, path: Path, info: dict, options: dict) -> Path:
     """Replace the video's weak embedded audio with the site's standalone track.
 
-    The offered track's bitrate is usually not in the metadata — TikTok reports
-    neither abr nor tbr for it — so the decision cannot be made up front. What
-    can be decided up front is whether it is worth looking: a file that already
-    carries decent audio is left alone, and only a thin one is compared against
-    the standalone track, which is small and quick to fetch.
+    The offered track's bitrate is not in the metadata — TikTok reports neither
+    abr nor tbr for it — so the comparison can only be made after fetching it,
+    and it is fetched whenever the file's own audio leaves room for improvement.
+    Measured over a sample of clips: the embedded track ran 32-96 kbps while the
+    separate one was 128 kbps every time.
     """
     audio_format = _best_audio_only_format(info)
     if audio_format is None:
@@ -1037,7 +1040,12 @@ async def _upgrade_audio(url: str, path: Path, info: dict, options: dict) -> Pat
 
     try:
         offered = _audio_bitrate(audio_path) or 0
-        if not offered or (embedded and offered < embedded * _AUDIO_UPGRADE_MIN_GAIN):
+        # Any real improvement is taken. Demanding a large margin threw away
+        # genuine ones: a clip carrying 96 kbps against a 128 kbps track is only
+        # a 1.3x difference, and it is still the difference between the video
+        # sounding thin and sounding like the post does on the site. The track is
+        # already downloaded by this point, so the remaining cost is one copy.
+        if offered <= embedded:
             return path
         upgraded = await asyncio.to_thread(_mux_better_audio, path, audio_path)
         if upgraded is not path:
