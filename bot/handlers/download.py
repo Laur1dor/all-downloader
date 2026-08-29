@@ -37,6 +37,7 @@ from bot.downloader import (
     QualityOption,
     detect_platform,
     download_album,
+    expand_short_link,
     download_audio,
     download_video,
     fetch_description,
@@ -298,6 +299,11 @@ async def _run_link(
     # The bot sits in a network that reaches the router, the host's SSH port and
     # the database. Fetching a link that points there would let any user read
     # internal services through the bot and map the network from the errors.
+    # A per-share short link hides the post's identity behind a redirect, and the
+    # cache cannot recognise the video until it is expanded.
+    url = await expand_short_link(url)
+    platform = detect_platform(url)
+
     try:
         ensure_public_url(url)
     except BlockedAddressError as exc:

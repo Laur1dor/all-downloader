@@ -34,6 +34,7 @@ from yt_dlp.utils import DownloadError as YtdlpDownloadError
 from yt_dlp.utils import YoutubeDLError
 
 from bot.progress import ProgressState
+from bot.urlkey import is_short_link
 from bot.proxy import forced_proxy, proxy_for
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,35 @@ def _yandex_to_ytsearch_sync(url: str) -> str:
     if not query:
         raise DownloadFailedError("Не удалось определить трек Yandex Music.")
     return f"ytsearch1:{query}"
+
+
+
+async def expand_short_link(url: str) -> str:
+    """Follow a per-share short link to the address that names the post.
+
+    TikTok's vt./vm. links carry no id at all, so two links to one video look
+    like two different posts to the cache. Following the redirect once is much
+    cheaper than the download it saves. The original link is returned unchanged
+    when the host does not hand out short links or the redirect cannot be read.
+    """
+    if not is_short_link(url):
+        return url
+    proxy = proxy_for(detect_platform(url))
+
+    def _resolve() -> str:
+        from curl_cffi import requests as cffi_requests
+
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        response = cffi_requests.head(
+            url, impersonate="chrome", timeout=20, proxies=proxies, allow_redirects=True
+        )
+        return str(response.url or url)
+
+    try:
+        return await asyncio.to_thread(_resolve)
+    except Exception as exc:
+        logger.info("Could not expand the short link %s: %s", url, exc)
+        return url
 
 
 async def resolve_download_url(url: str) -> str:
