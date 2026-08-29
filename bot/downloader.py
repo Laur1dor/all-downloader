@@ -967,12 +967,47 @@ def _best_audio_only_format(info: dict) -> dict | None:
     return max(candidates, key=lambda f: f.get("abr") or f.get("tbr") or 0)
 
 
+def _media_duration(path: Path) -> float | None:
+    """Length of a media file in seconds, as ffprobe reads it."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return float((result.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+# The clip and the track may differ by this much and still be considered a pair.
+_DURATION_SLACK_SECONDS = 1.0
+
+
 def _mux_better_audio(path: Path, audio_path: Path) -> Path:
+    video_seconds = _media_duration(path)
+    audio_seconds = _media_duration(audio_path)
+    # The standalone track is the whole song, not the cut used in the post, so it
+    # is normally the longer of the two and -shortest trims it back to the clip.
+    # When it is *shorter* -shortest would cut the video instead, which is how a
+    # 24-second clip could come back as a minute of frozen frame the other way
+    # round; there is nothing safe to do with such a pair, so leave the file be.
+    if video_seconds and audio_seconds and audio_seconds < video_seconds - _DURATION_SLACK_SECONDS:
+        logger.info("Standalone track is shorter than the clip (%.0fs vs %.0fs) — keeping "
+                    "the original audio", audio_seconds, video_seconds)
+        return path
+
     merged = path.with_name(f"{path.stem}-audio.mp4")
     command = [
         "ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(audio_path),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        # End with the video. Without this the output runs as long as the longest
+        # input, and the track outlives the clip.
+        "-shortest",
         # Index at the front so the player can start before the whole file lands.
         "-movflags", "+faststart", str(merged),
     ]
@@ -985,6 +1020,16 @@ def _mux_better_audio(path: Path, audio_path: Path) -> Path:
         logger.warning("ffmpeg refused to attach audio to %s: %s",
                        path.name, result.stderr.decode("utf-8", "ignore")[:200])
         return path
+
+    # Last line of defence: a result that no longer matches the clip's length is
+    # not an upgrade whatever its bitrate says.
+    merged_seconds = _media_duration(merged)
+    if video_seconds and merged_seconds and abs(merged_seconds - video_seconds) > _DURATION_SLACK_SECONDS:
+        logger.warning("Audio swap changed the length (%.0fs -> %.0fs) — discarding it",
+                       video_seconds, merged_seconds)
+        merged.unlink(missing_ok=True)
+        return path
+
     path.unlink(missing_ok=True)
     return merged
 
