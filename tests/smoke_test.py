@@ -129,6 +129,44 @@ assert 403 in _BLOCKED_STATUSES and 451 in _BLOCKED_STATUSES
 assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
 print("block detection OK")
 
+# --- one post, one cache key ---
+from bot.db import hash_url
+from bot.urlkey import canonical_key, is_short_link
+
+# TikTok issues a new short link per share and appends a per-copy parameter to
+# the address it expands to; every one of these is the same video.
+same_video = [
+    "https://www.tiktok.com/@tiktok/video/7106594312292453675",
+    "https://www.tiktok.com/@tiktok/video/7106594312292453675/",
+    "https://www.tiktok.com/@tiktok/video/7106594312292453675?is_from_webapp=1",
+    "https://m.tiktok.com/@tiktok/video/7106594312292453675",
+    "http://www.tiktok.com/@tiktok/video/7106594312292453675",
+    # the username in a shared link is whoever reposted it — the id is what counts
+    "https://www.tiktok.com/@someoneelse/video/7106594312292453675?_r=1&_t=ZS-9xYz",
+]
+assert len({hash_url(u) for u in same_video}) == 1, "one video must have one key"
+assert canonical_key(same_video[0]) == "tiktok:7106594312292453675"
+
+# Different posts must stay apart.
+assert hash_url(same_video[0]) != hash_url(
+    "https://www.tiktok.com/@tiktok/video/7106594312292453676")
+
+for url, expected in [
+    ("https://www.youtube.com/watch?v=jNQXAC9IVRw&t=42s", "youtube:jNQXAC9IVRw"),
+    ("https://www.youtube.com/shorts/abc123XYZ", "youtube:abc123XYZ"),
+    ("https://www.instagram.com/reel/C1Ux1JYr7qF/", "instagram:C1Ux1JYr7qF"),
+    ("https://x.com/nasa/status/1770458215432855942", "twitter:1770458215432855942"),
+    ("https://rule34.xxx/index.php?page=post&s=view&id=7000000", "rule34:7000000"),
+]:
+    assert canonical_key(url) == expected, f"{url} -> {canonical_key(url)}"
+
+# Unknown sites keep working: the address is normalised, not identified.
+assert canonical_key("https://Example.COM/Watch/") == "example.com/Watch"
+
+assert is_short_link("https://vt.tiktok.com/ZSVpTAqS7/")
+assert not is_short_link("https://www.tiktok.com/@tiktok/video/7106594312292453675")
+print("cache keys OK")
+
 
 
 print("\nALL SMOKE TESTS PASSED")

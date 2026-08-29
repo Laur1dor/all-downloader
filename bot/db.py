@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import html
 import logging
+from bot.urlkey import canonical_key
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,8 +22,14 @@ STATUS_CANCELLED = "cancelled"
 
 
 def hash_url(url: str) -> str:
-    """Stable key for the Telegram file_id cache."""
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+    """Stable key for the Telegram file_id cache.
+
+    Hashing the raw address made the cache nearly useless: TikTok issues a new
+    short link on every share and appends a per-copy parameter to the address it
+    expands to, so the same video kept arriving under a new key and was fetched
+    again every time. The key is built from the post's identity instead.
+    """
+    return hashlib.sha256(canonical_key(url).encode("utf-8")).hexdigest()[:32]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
