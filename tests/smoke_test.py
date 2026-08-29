@@ -129,59 +129,6 @@ assert 403 in _BLOCKED_STATUSES and 451 in _BLOCKED_STATUSES
 assert 200 not in _BLOCKED_STATUSES and 404 not in _BLOCKED_STATUSES
 print("block detection OK")
 
-# --- picking the better audio track ---
-from bot.downloader import _AUDIO_GOOD_ENOUGH, _best_audio_only_format
 
-# TikTok mixes a weak copy into the video and offers the real soundtrack on its
-# own; only the audio-only entries may be considered for the swap.
-formats = {"formats": [
-    {"format_id": "video", "vcodec": "h264", "acodec": "aac", "abr": 64},
-    {"format_id": "audio", "vcodec": "none", "acodec": "mp3", "abr": 128},
-    {"format_id": "quieter", "vcodec": "none", "acodec": "mp3", "abr": 64},
-]}
-assert _best_audio_only_format(formats)["format_id"] == "audio"
-assert _best_audio_only_format({"formats": []}) is None
-# The skip threshold must not sit below what the separate track actually
-# carries, or a file at 96 kbps would never be compared against a 128 kbps one.
-assert _AUDIO_GOOD_ENOUGH >= 128000
-print("audio upgrade rules OK")
-
-# --- the audio swap must not change how long the video is ---
-# A 24-second clip once came back as a minute of frozen frame: the standalone
-# track is the whole song, and without -shortest the output runs as long as the
-# longest input. Both directions are checked with files made on the spot.
-import pathlib as _pl
-import shutil as _shutil
-import subprocess as _sp
-import tempfile as _tf
-
-if _shutil.which("ffmpeg") and _shutil.which("ffprobe"):
-    from bot.downloader import _media_duration, _mux_better_audio
-
-    def _make(path, seconds, kind):
-        source = (["-f", "lavfi", "-i", f"testsrc=duration={seconds}:size=64x64:rate=10",
-                   "-f", "lavfi", "-i", f"sine=duration={seconds}", "-c:v", "libx264",
-                   "-c:a", "aac", "-shortest"] if kind == "video"
-                  else ["-f", "lavfi", "-i", f"sine=duration={seconds}", "-c:a", "aac"])
-        _sp.run(["ffmpeg", "-y", "-v", "error", *source, str(path)], check=True, timeout=120)
-
-    with _tf.TemporaryDirectory() as _d:
-        _dir = _pl.Path(_d)
-        _video, _long, _short = _dir / "v.mp4", _dir / "long.m4a", _dir / "short.m4a"
-        _make(_video, 3, "video")
-        _make(_long, 10, "audio")
-        _make(_short, 1, "audio")
-
-        _merged = _mux_better_audio(_video, _long)
-        assert _merged != _video, "a longer track should still be attached"
-        _got = _media_duration(_merged)
-        assert _got is not None and abs(_got - 3) <= 1, f"clip stretched to {_got}s"
-
-        # A track shorter than the clip would truncate the video — leave it alone.
-        _make(_video, 3, "video")
-        assert _mux_better_audio(_video, _short) == _video, "short track must be refused"
-    print("audio swap keeps the clip length OK")
-else:
-    print("audio swap length check skipped (no ffmpeg)")
 
 print("\nALL SMOKE TESTS PASSED")

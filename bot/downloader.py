@@ -925,115 +925,6 @@ def photo_needs_document(path: Path, max_bytes: int) -> bool:
     return (width + height) > 10000 or max(width, height) > 20 * min(width, height)
 
 
-# Some sites publish the post's real soundtrack as a separate audio-only format
-# and mux a much weaker copy into the video files. TikTok does: the same clip
-# carries 64 kbps aac inside the video and offers 128 kbps mp3 on its own, which
-# is why the "download audio" button sounded right while the video sounded thin.
-# yt-dlp will not swap it in on its own — a muxed format already has audio, so
-# "bestvideo*+bestaudio" keeps the weak track — so it is done here.
-#
-# Only the audio is re-encoded, and only to AAC because Telegram plays that
-# everywhere; the video is copied untouched, which keeps this to about a second.
-# Skip the whole thing when the file's own audio is already at least this good.
-# This is the one guess in the process, and it only exists to avoid fetching the
-# standalone track on every download just to learn it is not better. 128k is what
-# TikTok's separate track measured at on every sampled clip without exception, so
-# a file already at that rate has nothing to gain. Raise it for a site that
-# publishes more.
-_AUDIO_GOOD_ENOUGH = int(os.getenv("AUDIO_GOOD_ENOUGH_BPS", "128000"))
-
-
-def _audio_bitrate(path: Path) -> int | None:
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=bit_rate", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        return int(result.stdout.strip() or 0) or None
-    except (ValueError, OSError, subprocess.SubprocessError):
-        return None
-
-
-def _best_audio_only_format(info: dict) -> dict | None:
-    """The best audio-only format offered alongside the muxed video ones."""
-    candidates = [
-        f for f in info.get("formats") or []
-        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
-        and f.get("format_id")
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-
-
-def _media_duration(path: Path) -> float | None:
-    """Length of a media file in seconds, as ffprobe reads it."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    try:
-        return float((result.stdout or "").strip())
-    except ValueError:
-        return None
-
-
-# The clip and the track may differ by this much and still be considered a pair.
-_DURATION_SLACK_SECONDS = 1.0
-
-
-def _mux_better_audio(path: Path, audio_path: Path) -> Path:
-    video_seconds = _media_duration(path)
-    audio_seconds = _media_duration(audio_path)
-    # The standalone track is the whole song, not the cut used in the post, so it
-    # is normally the longer of the two and -shortest trims it back to the clip.
-    # When it is *shorter* -shortest would cut the video instead, which is how a
-    # 24-second clip could come back as a minute of frozen frame the other way
-    # round; there is nothing safe to do with such a pair, so leave the file be.
-    if video_seconds and audio_seconds and audio_seconds < video_seconds - _DURATION_SLACK_SECONDS:
-        logger.info("Standalone track is shorter than the clip (%.0fs vs %.0fs) — keeping "
-                    "the original audio", audio_seconds, video_seconds)
-        return path
-
-    merged = path.with_name(f"{path.stem}-audio.mp4")
-    command = [
-        "ffmpeg", "-y", "-v", "error", "-i", str(path), "-i", str(audio_path),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        # End with the video. Without this the output runs as long as the longest
-        # input, and the track outlives the clip.
-        "-shortest",
-        # Index at the front so the player can start before the whole file lands.
-        "-movflags", "+faststart", str(merged),
-    ]
-    try:
-        result = subprocess.run(command, capture_output=True, timeout=300)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("Could not attach the better audio to %s: %s", path.name, exc)
-        return path
-    if result.returncode != 0 or not merged.exists() or merged.stat().st_size == 0:
-        logger.warning("ffmpeg refused to attach audio to %s: %s",
-                       path.name, result.stderr.decode("utf-8", "ignore")[:200])
-        return path
-
-    # Last line of defence: a result that no longer matches the clip's length is
-    # not an upgrade whatever its bitrate says.
-    merged_seconds = _media_duration(merged)
-    if video_seconds and merged_seconds and abs(merged_seconds - video_seconds) > _DURATION_SLACK_SECONDS:
-        logger.warning("Audio swap changed the length (%.0fs -> %.0fs) — discarding it",
-                       video_seconds, merged_seconds)
-        merged.unlink(missing_ok=True)
-        return path
-
-    path.unlink(missing_ok=True)
-    return merged
-
-
 def _build_media(path: Path, info: dict) -> Media:
     duration = info.get("duration")
     # The file itself is the authority: yt-dlp reports the coded size, which is
@@ -1052,54 +943,6 @@ def _build_media(path: Path, info: dict) -> Media:
         height=height,
         description=info.get("description"),
     )
-
-
-async def _upgrade_audio(url: str, path: Path, info: dict, options: dict) -> Path:
-    """Replace the video's weak embedded audio with the site's standalone track.
-
-    The offered track's bitrate is not in the metadata — TikTok reports neither
-    abr nor tbr for it — so the comparison can only be made after fetching it,
-    and it is fetched whenever the file's own audio leaves room for improvement.
-    Measured over a sample of clips: the embedded track ran 32-96 kbps while the
-    separate one was 128 kbps every time.
-    """
-    audio_format = _best_audio_only_format(info)
-    if audio_format is None:
-        return path
-
-    embedded = _audio_bitrate(path) or 0
-    if embedded >= _AUDIO_GOOD_ENOUGH:
-        return path
-
-    audio_options = dict(options)
-    audio_options["format"] = str(audio_format["format_id"])
-    # The progress bar and the size guard belong to the video download.
-    for key in ("progress_hooks", "format_sort", "merge_output_format", "postprocessors"):
-        audio_options.pop(key, None)
-    audio_options["outtmpl"] = str(path.with_name("betteraudio.%(ext)s"))
-    try:
-        audio_path, _ = await asyncio.to_thread(_download_sync, url, audio_options)
-    except Exception as exc:  # the video is already usable without this
-        logger.info("Could not fetch the standalone audio for %s: %s", url, exc)
-        return path
-
-    try:
-        offered = _audio_bitrate(audio_path) or 0
-        # Any real improvement is taken. Demanding a large margin threw away
-        # genuine ones: a clip carrying 96 kbps against a 128 kbps track is only
-        # a 1.3x difference, and it is still the difference between the video
-        # sounding thin and sounding like the post does on the site. The track is
-        # already downloaded by this point, so the remaining cost is one copy.
-        if offered <= embedded:
-            return path
-        upgraded = await asyncio.to_thread(_mux_better_audio, path, audio_path)
-        if upgraded is not path:
-            logger.info("Replaced %d kbps audio with the site's %d kbps track",
-                        embedded // 1000, offered // 1000)
-        return upgraded
-    finally:
-        audio_path.unlink(missing_ok=True)
-
 
 
 @asynccontextmanager
@@ -1140,7 +983,6 @@ async def _temporary_download(
             raise DownloadFailedError(
                 _user_message(exc), retry_via_proxy=_is_block_error(exc)
             ) from exc
-        path = await _upgrade_audio(url, path, info, options)
         yield _build_media(path, info)
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
