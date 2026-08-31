@@ -38,6 +38,24 @@ SAMPLE = int(os.getenv("GOIDA_PROBE_SAMPLE", "700"))
 # Сколько кандидатов реально прогоняем через xray за круг (это дорогая часть).
 DEEP_BUDGET = int(os.getenv("GOIDA_PROBE_DEEP", "180"))
 INTERVAL = int(os.getenv("GOIDA_PROBE_INTERVAL", "1800"))
+# Nodes that worked at some point, kept as first-choice candidates for a while.
+# A node is never blacklisted: failing a check means it was unreachable at that
+# moment, which on a one-core box can simply mean the check itself was starved.
+# Without this list a node that blinked once could only return by being drawn
+# again out of half a million subscription links — about a 0.2% chance a round,
+# so in practice never.
+RECENT_FILE = os.getenv("GOIDA_RECENT_FILE", "/app/data/goida_recent.txt")
+RECENT_TTL = int(os.getenv("GOIDA_RECENT_TTL", "21600"))
+RECENT_MAX = int(os.getenv("GOIDA_RECENT_MAX", "300"))
+TAB_CHAR = chr(9)
+
+
+def stamp_line(stamp: float, link: str) -> str:
+    """One line of the recent-nodes file: when it last passed, and which."""
+    return f"{stamp}{TAB_CHAR}{link}" + chr(10)
+# Touched when the pool changes enough to be worth reloading xray for, so the
+# refresh loop can act at once instead of sitting out its whole interval.
+REBUILD_FILE = os.getenv("XRAY_REBUILD_FILE", "/app/data/rebuild_xray")
 # TikTok gets its own verified pool: a node that carries plain HTTPS often still
 # cannot fetch TikTok, and the free ones stop working minutes after they start.
 TIKTOK_POOL_FILE = os.getenv("TIKTOK_POOL_FILE", "/app/data/tiktok_pool.txt")
@@ -168,6 +186,59 @@ def _really_works(args: tuple[int, str]) -> str | None:
     return link if ok else None
 
 
+
+def _read_recent() -> list[str]:
+    """Links that passed a check recently, newest first, expired ones dropped."""
+    now = time.time()
+    out: list[tuple[float, str]] = []
+    try:
+        with open(RECENT_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                stamp, _, link = line.strip().partition(TAB_CHAR)
+                if not link.startswith("vless://"):
+                    continue
+                try:
+                    seen = float(stamp)
+                except ValueError:
+                    continue
+                if now - seen <= RECENT_TTL:
+                    out.append((seen, link))
+    except OSError:
+        return []
+    out.sort(reverse=True)
+    return [link for _, link in out]
+
+
+def _remember_recent(live: list[str]) -> None:
+    """Refresh the timestamps of nodes that just passed, keep the rest."""
+    now = time.time()
+    seen_now = set(live)
+    entries = [(now, link) for link in live]
+    for link in _read_recent():
+        if link not in seen_now:
+            entries.append((now - RECENT_TTL / 2, link))
+    entries = entries[:RECENT_MAX]
+    try:
+        os.makedirs(os.path.dirname(RECENT_FILE) or ".", exist_ok=True)
+        tmp = f"{RECENT_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for stamp, link in entries:
+                fh.write(stamp_line(stamp, link))
+        os.replace(tmp, RECENT_FILE)
+    except OSError as exc:
+        print(f"probe: could not write {RECENT_FILE}: {exc}", flush=True)
+
+
+def _request_rebuild() -> None:
+    """Ask the refresh loop to rebuild the xray config now."""
+    try:
+        os.makedirs(os.path.dirname(REBUILD_FILE) or ".", exist_ok=True)
+        with open(REBUILD_FILE, "w", encoding="utf-8") as fh:
+            fh.write("")
+    except OSError:
+        pass
+
+
 def _read_live() -> list[str]:
     try:
         with open(LIVE_FILE, encoding="utf-8") as fh:
@@ -189,7 +260,10 @@ def probe_round() -> list[str]:
     # Ноды, найденные в прошлый раз, проверяем первыми: они уже доказали, что
     # проходят DPI, и чаще всего живы до сих пор — так набор не скачет каждый круг.
     previous = _read_live()
-    candidates = previous + [c for c in _candidates() if c not in set(previous)]
+    # Order matters: the deep check has a budget, and nodes that worked before
+    # are far likelier to work again than a fresh draw from the subscriptions.
+    known = previous + [c for c in _read_recent() if c not in set(previous)]
+    candidates = known + [c for c in _candidates() if c not in set(known)]
     if not candidates:
         print("probe: кандидатов нет — подписки недоступны", flush=True)
         return previous
@@ -215,6 +289,9 @@ def probe_round() -> list[str]:
 
     if live:
         _write_live(live)
+        _remember_recent(live)
+        if len(live) != len(previous):
+            _request_rebuild()
         print(
             f"probe: живых {len(live)}/{len(batch)} → {LIVE_FILE} "
             f"(круг занял {time.time() - started:.0f}с)",
@@ -336,7 +413,8 @@ def refresh_tiktok_pool(live: list[str]) -> list[str]:
     if len(survivors) < TIKTOK_POOL_TARGET:
         seen = set(survivors)
         candidates = [
-            c for c in bc.collect_bypass_links() + live if c not in seen
+            c for c in bc.collect_bypass_links() + live + _read_recent()
+            if c not in seen
         ][:TIKTOK_POOL_CANDIDATES]
         with cf.ThreadPoolExecutor(4) as pool:
             for link in pool.map(
@@ -362,6 +440,9 @@ def refresh_tiktok_pool(live: list[str]) -> list[str]:
         print(f"probe: tiktok pool had {len(survivors) - len(unique)} duplicate "
               "endpoint(s)", flush=True)
     survivors = unique
+
+    if set(survivors) != set(current):
+        _request_rebuild()
 
     if survivors:
         os.makedirs(os.path.dirname(TIKTOK_POOL_FILE) or ".", exist_ok=True)
