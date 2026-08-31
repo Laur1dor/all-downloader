@@ -347,6 +347,22 @@ def refresh_tiktok_pool(live: list[str]) -> list[str]:
                     if len(survivors) >= TIKTOK_POOL_TARGET:
                         break
 
+    # One endpoint reached by several subscription links is still one exit. The
+    # pool read five nodes deep while three of them were the same address, which
+    # is far less spread than it looked.
+    seen_endpoints: set[tuple[str, int] | None] = set()
+    unique = []
+    for link in survivors:
+        endpoint = _endpoint(link)
+        if endpoint in seen_endpoints:
+            continue
+        seen_endpoints.add(endpoint)
+        unique.append(link)
+    if len(unique) < len(survivors):
+        print(f"probe: tiktok pool had {len(survivors) - len(unique)} duplicate "
+              "endpoint(s)", flush=True)
+    survivors = unique
+
     if survivors:
         os.makedirs(os.path.dirname(TIKTOK_POOL_FILE) or ".", exist_ok=True)
         tmp = f"{TIKTOK_POOL_FILE}.tmp"
@@ -377,12 +393,19 @@ def main() -> None:
     next_full_round = 0.0
     while True:
         try:
-            # The full sweep is expensive; the TikTok pool is cheap and has to be
-            # checked often, so they run on separate clocks.
+            # TikTok first, always. The full sweep takes minutes — it was timed at
+            # 391 s — and running it first left the TikTok pool empty for that
+            # whole stretch after a restart, which is exactly when downloads fail.
+            # The pool tops up from the live list already read from disk, so it
+            # does not need the sweep to have run.
+            refresh_tiktok_pool(live)
+            # The sweep is expensive and its results change slowly, so it keeps
+            # its own, much longer clock.
             if time.time() >= next_full_round:
                 live = probe_round() or live
                 next_full_round = time.time() + INTERVAL
-            refresh_tiktok_pool(live)
+                # Fresh candidates just arrived; give TikTok first pick of them.
+                refresh_tiktok_pool(live)
         except Exception as exc:  # the prober must not die with xray
             print(f"probe: round failed: {exc}", flush=True)
         if once:

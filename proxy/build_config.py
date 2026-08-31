@@ -92,14 +92,28 @@ TIKTOK_PROBE_INTERVAL = os.getenv("TIKTOK_PROBE_INTERVAL", "45s")
 
 
 def collect_tiktok_links() -> list[str]:
-    """Nodes the prober confirmed can actually fetch TikTok, if still fresh."""
+    """Nodes the prober confirmed can actually fetch TikTok.
+
+    Falls back to the curated nodes rather than to nothing. An empty list leaves
+    the TikTok inbound with no balancer at all, so every download fails outright
+    until the prober finishes — measured at ten minutes of dead TikTok after one
+    restart. The curated nodes are not verified against TikTok, but they outlive
+    the free ones by a wide margin and a node that might work beats none.
+    """
     try:
-        if time.time() - os.path.getmtime(TIKTOK_POOL_FILE) > TIKTOK_POOL_MAX_AGE:
-            return []
-        with open(TIKTOK_POOL_FILE, encoding="utf-8") as fh:
-            return [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+        fresh = time.time() - os.path.getmtime(TIKTOK_POOL_FILE) <= TIKTOK_POOL_MAX_AGE
+        if fresh:
+            with open(TIKTOK_POOL_FILE, encoding="utf-8") as fh:
+                links = [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+            if links:
+                return links
     except OSError:
-        return []
+        pass
+    fallback = collect_bypass_links()
+    if fallback:
+        print(f"WARN: no verified TikTok pool — falling back to {len(fallback)} "
+              "curated node(s)", file=sys.stderr)
+    return fallback
 
 
 def collect_bypass_links() -> list[str]:

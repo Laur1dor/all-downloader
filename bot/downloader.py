@@ -424,6 +424,14 @@ def _progress_hook(
 _TRANSIENT_MARKERS = (
     "tls", "curl", "timed out", "timeout", "connection", "reset",
     "temporarily", "http error 5", "http error 429", "too many requests",
+    # TikTok answers a request that arrived through a momentarily unhappy exit
+    # with a page that carries no data block, or with a truncated body. Both
+    # read like a broken extractor but clear on the next try, and without them
+    # here roughly one download in five failed for the user while every node in
+    # the pool tested healthy.
+    "unable to extract universal data",
+    "unexpected response from webpage",
+    "error reading response",
 )
 
 
@@ -437,7 +445,17 @@ def _extract_info(options: dict, url: str, *, download: bool, attempts: int = 3)
     for attempt in range(attempts):
         try:
             with YoutubeDL(options) as ydl:
-                return ydl.extract_info(url, download=download)
+                info = ydl.extract_info(url, download=download)
+            # A soft failure returns None instead of raising, and that path used
+            # to give up at once while the raising one retried three times. Same
+            # cause, same cure: through a pool exit it is usually one bad
+            # response, and the next attempt succeeds.
+            if info is None and attempt + 1 < attempts:
+                logger.info("Extractor returned nothing (retry %d) for %s",
+                            attempt + 1, url)
+                time.sleep(1.5)
+                continue
+            return info
         except YtdlpDownloadError as exc:
             last_exc = exc
             transient = any(m in str(exc).lower() for m in _TRANSIENT_MARKERS)
