@@ -151,6 +151,9 @@ class ProxyRouter:
         if not self.enabled:
             return None
         policy = self._policy_for(platform)
+        if platform == "tiktok" and _tiktok_own_vpn() and self._proxy_url:
+            # /control says TikTok goes through the operator's own subscription.
+            return self._proxy_url
         if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
             # A dedicated external proxy pinned for this platform (e.g. WARP for
             # DDoS-Guard sites that need one stable Cloudflare exit IP).
@@ -282,6 +285,16 @@ def proxy_for(platform: str) -> str | None:
 _TIKTOK_LADDER_PORTS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
 
 
+def _tiktok_own_vpn() -> bool:
+    """Admin's choice from /control, read late so a switch takes effect at once."""
+    try:
+        from bot.runtime import config
+
+        return config.tiktok_via_own_vpn
+    except Exception:
+        return False
+
+
 def proxy_ladder(platform: str) -> list[str]:
     """Exits to try in turn for this platform, first one first.
 
@@ -293,6 +306,10 @@ def proxy_ladder(platform: str) -> list[str]:
     first = _router.proxy_for(platform)
     if platform != "tiktok" or not first:
         return [first] if first else []
+    if _tiktok_own_vpn():
+        # One node, one rung: there is nothing to rotate through, and falling
+        # back to the free pool would quietly undo the admin's choice.
+        return [_router._proxy_url] if _router._proxy_url else [first]
     base = first.rsplit(":", 1)
     try:
         port = int(base[1])

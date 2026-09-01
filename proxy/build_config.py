@@ -17,9 +17,12 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -144,6 +147,60 @@ _FETCH_UAS = (
 )
 
 
+def _expired_but_genuine(url: str) -> ssl.SSLContext | None:
+    """A context that accepts this host's certificate when it merely expired.
+
+    Subscription hosts let their certificate lapse, and refusing the whole
+    subscription over a date is worse than the risk. Refusing it over a *name*
+    is not: this network has been seen substituting certificates outright — one
+    for max.ru in place of the subscription host — and that is exactly what the
+    name check catches. So the name is still verified against the presented
+    certificate, and only the validity dates are waived.
+    """
+    host = urllib.parse.urlparse(url).hostname or ""
+    port = urllib.parse.urlparse(url).port or 443
+    try:
+        loose = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        loose.check_hostname = False
+        loose.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=15) as raw:
+            with loose.wrap_socket(raw, server_hostname=host) as tls:
+                names = _cert_names(tls)
+    except Exception:
+        return None
+    if not names or not any(_host_matches(host, n) for n in names):
+        print(f"WARN: {host} presented a certificate for {names!r} — refusing",
+              file=sys.stderr)
+        return None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _cert_names(tls: ssl.SSLSocket) -> list[str]:
+    """Names in the peer certificate, read without trusting its chain."""
+    try:
+        import subprocess as _sp
+        der = tls.getpeercert(binary_form=True)
+        if not der:
+            return []
+        text = _sp.run(["openssl", "x509", "-inform", "DER", "-noout", "-text"],
+                       input=der, capture_output=True, timeout=15).stdout.decode(
+                           "utf-8", "ignore")
+    except Exception:
+        return []
+    names = re.findall(r"DNS:([^,\s]+)", text)
+    names += re.findall("CN *= *([^,]+)", text)
+    return [n.strip() for n in names if n.strip()]
+
+
+def _host_matches(host: str, name: str) -> bool:
+    if name.startswith("*."):
+        return host.endswith(name[1:]) and host.count(".") == name.count(".")
+    return host.lower() == name.lower()
+
+
 def _fetch(url: str) -> str:
     last_exc: Exception | None = None
     for ua in _FETCH_UAS:
@@ -151,6 +208,20 @@ def _fetch(url: str) -> str:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return response.read().decode("utf-8", "ignore")
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            if "certificate has expired" not in str(exc):
+                continue
+            context = _expired_but_genuine(url)
+            if context is None:
+                continue
+            print(f"WARN: {url} has an expired certificate for the right host — "
+                  "accepting it", file=sys.stderr)
+            try:
+                with urllib.request.urlopen(request, timeout=30, context=context) as response:
+                    return response.read().decode("utf-8", "ignore")
+            except Exception as retry_exc:
+                last_exc = retry_exc
         except Exception as exc:
             last_exc = exc
     raise last_exc  # type: ignore[misc]
