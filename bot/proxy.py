@@ -277,6 +277,30 @@ def proxy_for(platform: str) -> str | None:
     return _router.proxy_for(platform)
 
 
+# Ports the TikTok nodes sit on, highest first — see build_config for why each
+# node gets its own inbound rather than sharing one behind a balancer.
+_TIKTOK_LADDER_PORTS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
+
+
+def proxy_ladder(platform: str) -> list[str]:
+    """Exits to try in turn for this platform, first one first.
+
+    TikTok answers an address it has tired of with a stub page, so repeating a
+    request through the same exit cannot succeed however many times it is tried.
+    Each retry therefore moves to the next node. Everywhere else the single
+    proxy is the whole ladder.
+    """
+    first = _router.proxy_for(platform)
+    if platform != "tiktok" or not first:
+        return [first] if first else []
+    base = first.rsplit(":", 1)
+    try:
+        port = int(base[1])
+    except (IndexError, ValueError):
+        return [first]
+    return [f"{base[0]}:{port - i}" for i in range(_TIKTOK_LADDER_PORTS)]
+
+
 def forced_proxy(platform: str = "") -> str | None:
     """The proxy URL for a content-level retry, honouring the platform's pool."""
     return _router.forced_proxy(platform)

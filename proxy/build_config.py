@@ -89,6 +89,9 @@ TIKTOK_POOL_FILE = os.getenv("TIKTOK_POOL_FILE", "/app/data/tiktok_pool.txt")
 TIKTOK_POOL_MAX_AGE = int(os.getenv("TIKTOK_POOL_MAX_AGE", "5400"))
 # How fast a dead node leaves the pool.
 TIKTOK_PROBE_INTERVAL = os.getenv("TIKTOK_PROBE_INTERVAL", "45s")
+# How many rungs the retry ladder gets: ports TIKTOK_SOCKS_PORT down to
+# TIKTOK_SOCKS_PORT - N + 1, one node each.
+TIKTOK_MAX_INBOUNDS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
 
 
 def collect_tiktok_links() -> list[str]:
@@ -534,22 +537,27 @@ def build_config(
             },
         }
 
-    # TikTok goes to ONE node, with no balancer in front of it. A balancer picks
-    # per connection, and leastPing re-picks as observatory readings move, so the
-    # several requests yt-dlp makes for one video left through different exits —
-    # which TikTok answers by tearing the session down. The rest of the pool sits
-    # in the config unused, as the spares the prober promotes from: it puts the
-    # node it wants first in the file and asks for a rebuild.
-    if tiktok_tags:
+    # One inbound per TikTok node, each wired straight to its own outbound.
+    #
+    # A balancer is wrong here twice over. It picks per connection, so the
+    # several requests yt-dlp makes for one video left through different exits
+    # and TikTok tore the session down. But pinning a single node was no better:
+    # TikTok answers an address it has had enough of with a 536-byte "Site
+    # Maintenance" page, and retrying the same address — which is all the bot
+    # could do behind one port — cannot get past that no matter how many times
+    # it tries. Ports 2077, 2076, 2075 ... are therefore separate ladders rungs:
+    # sticky within one attempt, a different exit on the next.
+    for index, tag in enumerate(tiktok_tags[:TIKTOK_MAX_INBOUNDS]):
         inbounds.append({
-            "tag": "tiktok-socks",
+            "tag": f"tiktok-socks-{index}",
             "listen": "0.0.0.0",
-            "port": TIKTOK_SOCKS_PORT,
+            "port": TIKTOK_SOCKS_PORT - index,
             "protocol": "socks",
             "settings": {"udp": True, "auth": "noauth"},
         })
         rules.insert(
-            0, {"type": "field", "inboundTag": ["tiktok-socks"], "outboundTag": tiktok_tags[0]}
+            0,
+            {"type": "field", "inboundTag": [f"tiktok-socks-{index}"], "outboundTag": tag},
         )
 
     # Curated bypass pool on its own inbound: leastPing with health failover.

@@ -35,7 +35,7 @@ from yt_dlp.utils import YoutubeDLError
 
 from bot.progress import ProgressState
 from bot.urlkey import is_short_link
-from bot.proxy import forced_proxy, proxy_for
+from bot.proxy import forced_proxy, proxy_for, proxy_ladder
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +466,11 @@ def _extract_info(options: dict, url: str, *, download: bool, attempts: int = 3)
             # cause, same cure: through a pool exit it is usually one bad
             # response, and the next attempt succeeds.
             if info is None and attempt + 1 < attempts:
+                ladder = proxy_ladder(detect_platform(url))
+                if len(ladder) > 1:
+                    nxt = ladder[(attempt + 1) % len(ladder)]
+                    if nxt:
+                        options = dict(options, proxy=nxt)
                 logger.info("Extractor returned nothing (retry %d) for %s",
                             attempt + 1, url)
                 time.sleep(1.5)
@@ -475,7 +480,20 @@ def _extract_info(options: dict, url: str, *, download: bool, attempts: int = 3)
             last_exc = exc
             transient = any(m in str(exc).lower() for m in _TRANSIENT_MARKERS)
             if attempt + 1 < attempts and transient:
-                logger.info("Transient extract error (retry %d): %s", attempt + 1, exc)
+                # Move to the next exit before trying again. Most of these
+                # failures are the site refusing one address, and repeating the
+                # request through that same address is guaranteed to fail again.
+                ladder = proxy_ladder(detect_platform(url))
+                if len(ladder) > 1:
+                    nxt = ladder[(attempt + 1) % len(ladder)]
+                    if nxt and options.get("proxy") != nxt:
+                        options = dict(options, proxy=nxt)
+                        logger.info("Transient extract error (retry %d, next exit %s): %s",
+                                    attempt + 1, nxt, exc)
+                    else:
+                        logger.info("Transient extract error (retry %d): %s", attempt + 1, exc)
+                else:
+                    logger.info("Transient extract error (retry %d): %s", attempt + 1, exc)
                 time.sleep(1.5)
                 continue
             raise
