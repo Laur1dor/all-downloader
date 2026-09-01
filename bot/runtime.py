@@ -36,11 +36,17 @@ _DEFAULTS: dict[str, int] = {
     "vpn_user_speed_mbit": 0,
     "vpn_admin_speed_mbit": 0,
     "solo_mode": 0,
+    # Which exit TikTok uses: 0 = the free pool ladder, 1 = the operator's own
+    # subscription. Kept switchable because neither is dependable on its own —
+    # the free exits get stubbed by TikTok, and the personal node depends on the
+    # provider surviving the local filtering.
+    "tiktok_route": 0,
     "bandwidth_mbit": 100,
 }
 
 # Validation range per key (min, max). solo_mode is a 0/1 toggle.
 RANGES: dict[str, tuple[int, int]] = {
+    "tiktok_route": (0, 1),
     "user_upload_mb": (SIZE_MIN_MB, SIZE_MAX_MB),
     "admin_upload_mb": (SIZE_MIN_MB, SIZE_MAX_MB),
     "user_speed_mbit": (0, MAIN_MAX_MBIT),
@@ -108,6 +114,11 @@ class RuntimeConfig:
     @property
     def solo_mode(self) -> bool:
         return bool(self._values["solo_mode"])
+
+    @property
+    def tiktok_via_own_vpn(self) -> bool:
+        """True when TikTok should leave through the operator's own node."""
+        return bool(self._values["tiktok_route"])
 
     def _write_bandwidth_file(self) -> None:
         try:

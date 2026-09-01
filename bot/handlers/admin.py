@@ -38,6 +38,7 @@ _CONTROL_PREFIX = "ctl:"
 _awaiting: dict[int, str] = {}
 # Human labels for the custom-input prompt.
 _SETTING_LABELS = {
+    "tiktok_route": "маршрут TikTok",
     "user_upload_mb": "лимит загрузки юзеров (МБ)",
     "admin_upload_mb": "лимит загрузки админа (МБ)",
     "user_speed_mbit": "скорость юзеров (Мбит/с, 0 = безлимит)",
@@ -121,6 +122,18 @@ def _control_keyboard() -> InlineKeyboardMarkup:
         _header("— 📶 Канал всего (Мбит/с) —"),
         _option_row("bandwidth_mbit", BANDWIDTH_OPTIONS_MBIT, config.get("bandwidth_mbit"),
                     _speed_label),
+        _header("— 🎬 TikTok через —"),
+        [
+            InlineKeyboardButton(
+                text=("• Гойда (пул) •" if not config.tiktok_via_own_vpn
+                      else "Гойда (пул)"),
+                callback_data=f"{_CONTROL_PREFIX}tiktok_route:0",
+            ),
+            InlineKeyboardButton(
+                text=("• Свой VPN •" if config.tiktok_via_own_vpn else "Свой VPN"),
+                callback_data=f"{_CONTROL_PREFIX}tiktok_route:1",
+            ),
+        ],
         [
             InlineKeyboardButton(
                 text="🔒 Solo: ВЫКЛЮЧИТЬ" if config.solo_mode else "🔓 Solo: ВКЛЮЧИТЬ",
