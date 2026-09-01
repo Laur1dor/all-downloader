@@ -283,6 +283,7 @@ def proxy_for(platform: str) -> str | None:
 # Ports the TikTok nodes sit on, highest first — see build_config for why each
 # node gets its own inbound rather than sharing one behind a balancer.
 _TIKTOK_LADDER_PORTS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
+_TIKTOK_BASE_PORT = int(os.getenv("TIKTOK_SOCKS_PORT", "2077"))
 
 
 def _tiktok_own_vpn() -> bool:
@@ -310,12 +311,17 @@ def proxy_ladder(platform: str) -> list[str]:
         # One node, one rung: there is nothing to rotate through, and falling
         # back to the free pool would quietly undo the admin's choice.
         return [_router._proxy_url] if _router._proxy_url else [first]
-    base = first.rsplit(":", 1)
+    base, _, port_text = first.rpartition(":")
     try:
-        port = int(base[1])
-    except (IndexError, ValueError):
+        port = int(port_text)
+    except ValueError:
         return [first]
-    return [f"{base[0]}:{port - i}" for i in range(_TIKTOK_LADDER_PORTS)]
+    # The rungs exist only in front of the xray pool, where each node was given
+    # its own inbound. Any other exit — WARP, an AmneziaWG tunnel — is a single
+    # proxy, and counting ports down from it would dial ports nothing listens on.
+    if port != _TIKTOK_BASE_PORT:
+        return [first]
+    return [f"{base}:{port - i}" for i in range(_TIKTOK_LADDER_PORTS)]
 
 
 def forced_proxy(platform: str = "") -> str | None:

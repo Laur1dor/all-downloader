@@ -327,11 +327,28 @@ async def expand_short_link(url: str) -> str:
     def _resolve() -> str:
         from curl_cffi import requests as cffi_requests
 
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        response = cffi_requests.head(
-            url, impersonate="chrome", timeout=20, proxies=proxies, allow_redirects=True
-        )
-        return str(response.url or url)
+        # The newest-Chrome fingerprint is refused outright by TikTok's CDN, and
+        # this used to use it: the link stayed short, and the failure surfaced
+        # later as an SSL error against vt.tiktok.com. Exits are walked too,
+        # because one of them may be the thing that is refusing.
+        last_exc: Exception | None = None
+        for candidate in proxy_ladder(detect_platform(url)) or [proxy]:
+            proxies = {"http": candidate, "https": candidate} if candidate else None
+            for target in _TIKTOK_IMPERSONATE:
+                try:
+                    response = cffi_requests.head(
+                        url, impersonate=target, timeout=20,
+                        proxies=proxies, allow_redirects=True,
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+                resolved = str(response.url or url)
+                if resolved != url:
+                    return resolved
+        if last_exc is not None:
+            raise last_exc
+        return url
 
     try:
         return await asyncio.to_thread(_resolve)
@@ -1101,10 +1118,259 @@ def download_video(
     }
     if ratelimit:
         options["ratelimit"] = ratelimit
+    if platform == "tiktok":
+        # yt-dlp cannot fetch a TikTok page at all here; see _tiktok_item.
+        return _tiktok_download(
+            url, cookies_file, max_bytes, progress, cancel_event, force_proxy, size_guard,
+        )
     return _temporary_download(
         url, options, format_override or _VIDEO_FORMAT_CAPPED, "tg-video-", max_bytes,
         cancel_event, size_guard, capped or format_override is not None,
     )
+
+
+
+# TikTok is fronted by Akamai, which answers the newest Chrome fingerprint with
+# a 537-byte "Site Maintenance" page - and that is the one yt-dlp's extractor
+# insists on: it asks for the best impersonation target available and ignores
+# --impersonate entirely, so every TikTok download failed whichever exit it went
+# through. Every other fingerprint is served the real page, so the page is
+# fetched here and read directly.
+_TIKTOK_IMPERSONATE = ("chrome131", "chrome124", "firefox133", "safari17_0", "chrome116")
+_TIKTOK_DATA_RE = re.compile(
+    r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
+)
+_TIKTOK_REFERER = "https://www.tiktok.com/"
+
+
+def _tiktok_cookies(cookies_file: Path | None) -> dict[str, str]:
+    """TikTok cookies from the Netscape jar, if there are any.
+
+    A signed-in request is answered with the full data block where an anonymous
+    one gets a hollow copy, so the jar the rest of the bot already uses is worth
+    carrying here too.
+    """
+    jar: dict[str, str] = {}
+    if cookies_file is None:
+        return jar
+    try:
+        for line in cookies_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.strip().split("	")
+            if len(parts) >= 7 and "tiktok.com" in parts[0]:
+                jar[parts[5]] = parts[6]
+    except OSError:
+        return {}
+    return jar
+
+
+def _tiktok_has_media(item: dict) -> bool:
+    """Whether the post's data block actually carries something to download."""
+    video = item.get("video") or {}
+    if video.get("playAddr") or video.get("downloadAddr") or video.get("bitrateInfo"):
+        return True
+    images = (item.get("imagePost") or {}).get("images") or []
+    return bool(images)
+
+
+def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = None):
+    """The post's data block, plus the session that fetched it.
+
+    The session is handed back because the media host expects the same client: a
+    fresh connection with a different fingerprint is refused just as the page
+    would be.
+    """
+    from curl_cffi import requests as cffi_requests
+
+    # Both axes matter and they fail differently: a refused fingerprint returns a
+    # page with no data block, while a refused exit does not complete the TLS
+    # handshake at all. Walking one without the other leaves half the failures
+    # unrecoverable.
+    exits = [proxy] if proxy in (None, "") else (proxy_ladder("tiktok") or [proxy])
+    last_reason = "no response"
+    for exit_proxy, target in ((e, t) for e in exits for t in _TIKTOK_IMPERSONATE):
+        proxies = {"http": exit_proxy, "https": exit_proxy} if exit_proxy else None
+        session = cffi_requests.Session(impersonate=target, proxies=proxies, timeout=40)
+        if cookies:
+            session.cookies.update(cookies)
+        try:
+            page = session.get(url, headers={"Referer": _TIKTOK_REFERER}).text
+        except Exception as exc:
+            last_reason = f"{type(exc).__name__}: {exc}"
+            session.close()
+            continue
+        found = _TIKTOK_DATA_RE.search(page)
+        if not found:
+            # The refusal page carries no data block, and another fingerprint may
+            # be let through, so this is worth retrying rather than reporting.
+            last_reason = f"no data block ({len(page)} bytes)"
+            session.close()
+            continue
+        try:
+            scope = json.loads(found.group(1))["__DEFAULT_SCOPE__"]
+            item = scope["webapp.video-detail"]["itemInfo"]["itemStruct"]
+        except (KeyError, ValueError) as exc:
+            last_reason = f"unexpected data block: {exc}"
+            session.close()
+            continue
+        # The block can come back present but hollow — no media, no caption —
+        # when TikTok decides the caller is not a browser. That is a refusal
+        # wearing the shape of an answer, and reading it as "this post has no
+        # video" told the user something false. Another fingerprint or exit
+        # usually gets the real payload.
+        if not _tiktok_has_media(item):
+            last_reason = "data block carried no media"
+            session.close()
+            continue
+        return item, session
+    raise DownloadFailedError(
+        f"TikTok не отдал страницу поста ({last_reason}).", retry_via_proxy=True
+    )
+
+
+def _tiktok_variants(item: dict) -> list[dict]:
+    """Playable files for the post, best first.
+
+    h264 leads: TikTok offers the same clip as h264 beside a larger h265, and
+    Telegram's players stumble on the latter. Within a codec the higher bitrate
+    wins. Every entry is a complete file - the separate audio track is the song
+    the post uses, not its own sound.
+    """
+    video = item.get("video") or {}
+    variants: list[dict] = []
+    for entry in video.get("bitrateInfo") or []:
+        play = entry.get("PlayAddr") or {}
+        urls = play.get("UrlList") or []
+        if not urls:
+            continue
+        variants.append({
+            "urls": list(urls),
+            "codec": str(entry.get("CodecType") or ""),
+            "bitrate": int(entry.get("Bitrate") or 0),
+            "width": int(play.get("Width") or 0) or None,
+            "height": int(play.get("Height") or 0) or None,
+            "size": int(play.get("DataSize") or 0) or None,
+        })
+    fallback = video.get("playAddr") or video.get("downloadAddr")
+    if not variants and fallback:
+        variants.append({
+            "urls": [fallback], "codec": "", "bitrate": 0,
+            "width": video.get("width"), "height": video.get("height"), "size": None,
+        })
+    variants.sort(key=lambda v: (not v["codec"].startswith("h264"), -v["bitrate"]))
+    return variants
+
+
+def _stream_to_file(
+    session,
+    media_url: str,
+    destination: Path,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    size_guard: dict,
+    declared_size: int | None,
+) -> bool:
+    """Stream one URL to disk, honouring the size limit and the cancel button."""
+    if declared_size and declared_size > max_bytes:
+        size_guard["tripped"] = declared_size
+        raise OversizedError(declared_size, max_bytes)
+
+    response = session.get(media_url, headers={"Referer": _TIKTOK_REFERER}, stream=True)
+    try:
+        if response.status_code != 200:
+            return False
+        total = int(response.headers.get("Content-Length") or 0) or declared_size
+        if total and total > max_bytes:
+            size_guard["tripped"] = total
+            raise OversizedError(total, max_bytes)
+        if progress is not None:
+            progress.total = total or None
+        written = 0
+        with open(destination, "wb") as handle:
+            for chunk in response.iter_content(262144):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError
+                handle.write(chunk)
+                written += len(chunk)
+                if written > max_bytes:
+                    size_guard["tripped"] = written
+                    raise OversizedError(written, max_bytes)
+                if progress is not None:
+                    progress.downloaded = written
+        return written > 0
+    finally:
+        response.close()
+
+
+def _download_tiktok_sync(
+    url: str,
+    tmpdir: str,
+    proxy: str | None,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    size_guard: dict,
+    cookies: dict[str, str] | None = None,
+) -> tuple[Path, dict]:
+    """Fetch a TikTok post without yt-dlp; returns the file and its metadata."""
+    item, session = _tiktok_item(url, proxy, cookies)
+    try:
+        variants = _tiktok_variants(item)
+        if not variants:
+            raise DownloadFailedError("В этом посте TikTok нет видео.")
+
+        destination = Path(tmpdir) / f"{item.get('id') or 'tiktok'}.mp4"
+        last_reason = "no response"
+        for variant in variants:
+            for media_url in variant["urls"]:
+                try:
+                    written = _stream_to_file(
+                        session, media_url, destination, max_bytes,
+                        progress, cancel_event, size_guard, variant.get("size"),
+                    )
+                except (DownloadCancelledError, OversizedError):
+                    raise
+                except Exception as exc:
+                    last_reason = f"{type(exc).__name__}: {exc}"
+                    continue
+                if written:
+                    video = item.get("video") or {}
+                    return destination, {
+                        "id": item.get("id"),
+                        "title": (item.get("desc") or "").strip() or "TikTok",
+                        "description": (item.get("desc") or "").strip() or None,
+                        "duration": video.get("duration"),
+                        "width": variant.get("width") or video.get("width"),
+                        "height": variant.get("height") or video.get("height"),
+                    }
+        raise DownloadFailedError(
+            f"Не удалось скачать видео TikTok ({last_reason}).", retry_via_proxy=True
+        )
+    finally:
+        session.close()
+
+
+@asynccontextmanager
+async def _tiktok_download(
+    url: str,
+    cookies_file: Path | None,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    force_proxy: bool,
+    size_guard: dict,
+) -> AsyncIterator[Media]:
+    tmpdir = tempfile.mkdtemp(prefix="tg-tiktok-")
+    proxy = forced_proxy("tiktok") if force_proxy else proxy_for("tiktok")
+    cookies = _tiktok_cookies(cookies_file)
+    try:
+        path, info = await asyncio.to_thread(
+            _download_tiktok_sync, url, tmpdir, proxy, max_bytes,
+            progress, cancel_event, size_guard, cookies,
+        )
+        yield _build_media(path, info)
+    finally:
+        await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
 
 
 _PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
