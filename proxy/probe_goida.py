@@ -75,6 +75,13 @@ TIKTOK_HOST = "www.tiktok.com"
 TIKTOK_PATH = os.getenv("TIKTOK_PROBE_PATH", "/@tiktok/video/7106594312292453675")
 # The marker yt-dlp itself needs; a block page or a captcha carries neither.
 TIKTOK_MARKER = b"__UNIVERSAL_DATA_FOR_REHYDRATION__"
+# A node has to finish a real extraction within this to be worth keeping. The
+# pool used to be filled by nodes that could serve one page and then stalled on
+# the session yt-dlp runs, so downloads timed out while the pool reported itself
+# healthy. Slowness is the failure here, so the deadline is part of the test.
+TIKTOK_EXTRACT_DEADLINE = int(os.getenv("TIKTOK_EXTRACT_DEADLINE", "35"))
+TIKTOK_PROBE_URL = os.getenv(
+    "TIKTOK_PROBE_URL", "https://www.tiktok.com/@tiktok/video/7106594312292453675")
 _CRLF = chr(13) + chr(10)
 TCP_WORKERS = int(os.getenv("GOIDA_PROBE_TCP_WORKERS", "60"))
 # Параллельных xray немного: у сервера одно ядро.
@@ -346,10 +353,17 @@ def _https_get_via_socks(port: int, host: str, path: str, timeout: int = 20) -> 
 
 
 def _serves_tiktok(args: tuple[int, str]) -> str | None:
-    """Whether this one node can fetch a real TikTok page, not a block page."""
+    """Whether this node can actually pull a TikTok video's metadata in time.
+
+    Fetching one page was not enough: nodes passed that check and then stalled
+    partway through the session yt-dlp runs, so the pool looked healthy while
+    every download timed out. The probe therefore runs the same extraction the
+    bot will run, and a node that cannot finish it inside the deadline is no
+    more use than one that fails outright.
+    """
     port, link = args
     try:
-        outbounds, _ = bc._links_to_outbounds([link], "ttprobe-")
+        outbounds, _ = bc._links_to_outbounds([link], "sticky-")
     except Exception:
         return None
     if not outbounds:
@@ -362,7 +376,7 @@ def _serves_tiktok(args: tuple[int, str]) -> str | None:
         }],
         "outbounds": outbounds,
     }
-    path = f"/tmp/tt-{port}.json"
+    path = f"/tmp/sticky-{port}.json"
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(config, fh)
     proc = subprocess.Popen(
@@ -370,12 +384,15 @@ def _serves_tiktok(args: tuple[int, str]) -> str | None:
     )
     try:
         time.sleep(2)
-        body = _https_get_via_socks(port, TIKTOK_HOST, TIKTOK_PATH)
-        # "blocked from accessing" comes back with a 200 and the marker present,
-        # so the marker alone is not enough to call the node good.
-        if TIKTOK_MARKER not in body or b"blocked from accessing" in body:
-            return None
-        return link
+        result = subprocess.run(
+            ["yt-dlp", "--proxy", f"socks5://127.0.0.1:{port}",
+             "--socket-timeout", "12", "--no-warnings", "-q", "--simulate",
+             "--print", "%(id)s", TIKTOK_PROBE_URL],
+            capture_output=True, text=True, timeout=TIKTOK_EXTRACT_DEADLINE,
+        )
+        return link if result.returncode == 0 and (result.stdout or "").strip() else None
+    except Exception:
+        return None
     finally:
         proc.kill()
         proc.wait()

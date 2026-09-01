@@ -42,6 +42,18 @@ logger = logging.getLogger(__name__)
 TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # Bot API hard limit for uploads
 
 _VIDEO_FORMAT = "bestvideo*+bestaudio/best"
+# TikTok publishes the post's real sound only inside its ready-made files. Its
+# separate audio format is the track the post is attached to, so "best video +
+# best audio" quietly built a different clip: a video-only HEVC stream with the
+# music laid over it, in Matroska because HEVC and mp3 do not share an MP4.
+# Telegram then played it without sound. Taking one already-muxed file gives the
+# post's own audio, an MP4, and no merge step at all.
+_VIDEO_FORMAT_MUXED = "b*[vcodec!=none][acodec!=none]/b/best"
+_VIDEO_FORMAT_BY_PLATFORM = {"tiktok": _VIDEO_FORMAT_MUXED}
+
+
+def video_format(platform: str) -> str:
+    return _VIDEO_FORMAT_BY_PLATFORM.get(platform, _VIDEO_FORMAT)
 # h264 first, because on YouTube the resolutions above 1080p exist ONLY in
 # vp9/av1, and phones decode those in software: the video arrives as a frozen
 # frame with sound. Ranking by size first really does pick 4K vp9 over 1080p
@@ -53,8 +65,11 @@ _VIDEO_FORMAT_SORT = ["vcodec:h264", "res", "fps", "acodec:aac"]
 # downgraded every download — which is why clips looked worse here than in the
 # app. Its h265 is what the app itself plays, and there is no higher resolution
 # hiding behind another codec, so resolution leads and h264 only breaks ties.
+# Among the muxed files h264 comes first. The 1080p HEVC one is sharper on
+# paper, but Telegram's players stumble on it, and the file that arrives is the
+# one the person actually watches.
 _VIDEO_FORMAT_SORT_BY_PLATFORM = {
-    "tiktok": ["res", "fps", "tbr", "vcodec:h264", "acodec:aac"],
+    "tiktok": ["vcodec:h264", "res", "fps", "tbr"],
 }
 
 
@@ -1055,12 +1070,15 @@ def download_video(
     force_proxy routes through the VLESS proxy even if direct looks reachable.
     ratelimit caps the download speed in bytes/s (None = unlimited).
     """
+    platform = detect_platform(url)
     size_guard = {"limit": max_bytes, "tripped": None}
     options = _base_options(cookies_file, url, force_proxy) | {
-        "format": _VIDEO_FORMAT,
-        "format_sort": video_format_sort(detect_platform(url)),
+        "format": video_format(platform),
+        "format_sort": video_format_sort(platform),
         # Remux (no re-encode) into mp4 when codecs allow it, otherwise mkv.
-        "merge_output_format": "mp4/mkv",
+        # mp4 only for the platforms whose formats are already muxed: falling
+        # back to Matroska there produced a file Telegram would not play.
+        "merge_output_format": "mp4" if platform == "tiktok" else "mp4/mkv",
         "progress_hooks": [_progress_hook(progress, cancel_event, size_guard)],
     }
     if ratelimit:

@@ -23,6 +23,11 @@ RUN set -eux; \
     rm /tmp/xray.zip; \
     mkdir -p /etc/xray
 
+# The prober checks candidate nodes by doing the real work — a TikTok
+# extraction — because a plain page fetch says nothing about whether a node can
+# sustain the multi-request session yt-dlp actually runs.
+RUN pip install --no-cache-dir yt-dlp==2026.8.19
+
 WORKDIR /app
 COPY proxy/build_config.py /app/build_config.py
 COPY proxy/probe_goida.py /app/probe_goida.py
