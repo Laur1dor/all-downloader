@@ -109,6 +109,27 @@ services:
       - warp-data:/var/lib/cloudflare-warp
     restart: unless-stopped
 
+  # AmneziaWG as a SOCKS5 proxy (awg:1080). The provider's VLESS endpoint on the
+  # same address is torn down by the local filtering, while its obfuscated
+  # WireGuard runs over UDP and gets through. Config lives in data/awg/<name>.conf
+  # (gitignored: it holds a private key). Enable with the "awg" profile.
+  awg:
+    build:
+      context: .
+      dockerfile: Dockerfile.awg
+    container_name: awg
+    profiles: ["awg"]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun"]
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      AWG_CONFIG: ${AWG_CONFIG:-awg0}
+      AWG_SOCKS_PORT: ${AWG_SOCKS_PORT:-1080}
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+
   # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's
   # MTProto is often DPI-throttled even where HTTPS works, so the self-hosted Bot
   # API needs one to reach Telegram at all. Which tunnel is TUN2SOCKS_PROXY's

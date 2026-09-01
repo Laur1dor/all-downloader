@@ -1,0 +1,35 @@
+# AmneziaWG as a SOCKS5 proxy.
+#
+# The provider's VLESS endpoint on this same address is torn down by the local
+# filtering (the TLS handshake never completes), while its obfuscated WireGuard
+# runs over UDP and is not recognised the same way. This container brings the
+# tunnel up and puts a SOCKS proxy in front of it, so the bot and xray can use
+# it like any other exit.
+FROM golang:1.25-alpine AS build
+RUN apk add --no-cache git make bash build-base linux-headers
+
+WORKDIR /src
+RUN git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-go.git \
+    && cd amneziawg-go \
+    && go build -o /out/amneziawg-go .
+
+RUN git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git \
+    && cd amneziawg-tools/src \
+    && make \
+    && install -m755 wg /out/awg
+
+# microsocks is not packaged for Alpine stable, and it is one small C file.
+RUN git clone --depth 1 https://github.com/rofl0r/microsocks.git \
+    && cd microsocks \
+    && make \
+    && install -m755 microsocks /out/microsocks
+
+FROM alpine:3.20
+RUN apk add --no-cache iproute2 bash
+COPY --from=build /out/amneziawg-go /usr/bin/amneziawg-go
+COPY --from=build /out/awg /usr/bin/awg
+COPY --from=build /out/microsocks /usr/bin/microsocks
+COPY proxy/awg-entrypoint.sh /usr/local/bin/awg-entrypoint.sh
+RUN chmod +x /usr/local/bin/awg-entrypoint.sh \
+    && sed -i 's/\r$//' /usr/local/bin/awg-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/awg-entrypoint.sh"]
