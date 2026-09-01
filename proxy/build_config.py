@@ -534,8 +534,12 @@ def build_config(
             },
         }
 
-    # TikTok pool: leastPing so the same node keeps being chosen (the session
-    # stays on one exit), observatory so a node that dies leaves on its own.
+    # TikTok goes to ONE node, with no balancer in front of it. A balancer picks
+    # per connection, and leastPing re-picks as observatory readings move, so the
+    # several requests yt-dlp makes for one video left through different exits —
+    # which TikTok answers by tearing the session down. The rest of the pool sits
+    # in the config unused, as the spares the prober promotes from: it puts the
+    # node it wants first in the file and asks for a rebuild.
     if tiktok_tags:
         inbounds.append({
             "tag": "tiktok-socks",
@@ -544,17 +548,12 @@ def build_config(
             "protocol": "socks",
             "settings": {"udp": True, "auth": "noauth"},
         })
-        balancers.append(
-            {"tag": "tiktok", "selector": ["tt-"], "strategy": {"type": "leastPing"}}
-        )
         rules.insert(
-            0, {"type": "field", "inboundTag": ["tiktok-socks"], "balancerTag": "tiktok"}
+            0, {"type": "field", "inboundTag": ["tiktok-socks"], "outboundTag": tiktok_tags[0]}
         )
 
     # Curated bypass pool on its own inbound: leastPing with health failover.
     observatory_subjects = ["vless-"]
-    if tiktok_tags:
-        observatory_subjects.append("tt-")
     if bypass_tags:
         inbounds.append({
             "tag": "bypass-socks",

@@ -709,6 +709,51 @@ async def _offer_compressed(
         _pending_choices.pop(token, None)
 
 
+async def _deliver_single_video(
+    message: Message,
+    db: Database,
+    status_message: Message,
+    url: str,
+    album,
+    platform: str,
+    user_id: int,
+    started: float,
+    url_cache: UrlCache,
+) -> bool:
+    """Send one video from the fallback path the same way the video path does."""
+    path = album.items[0]
+    width, height, duration = video_metadata(path)
+    token = url_cache.store(url)
+    description = (album.description or "").strip()
+    with_description = _description_capable(url, platform) and bool(description)
+    if with_description:
+        _remember_description(token, description)
+    try:
+        async with _upload_slots:
+            sent = await _send_with_retries(
+                lambda: message.answer_video(
+                    FSInputFile(path),
+                    caption=_CAPTION,
+                    width=width, height=height, duration=duration,
+                    supports_streaming=True,
+                    reply_markup=_video_keyboard(token, with_description),
+                )
+            )
+    except TelegramNetworkError:
+        logger.exception("Network error while sending the fallback video for %s", url)
+        return False
+    sent_media = sent.video or sent.document
+    if sent_media is not None:
+        await db.store_cached_file(
+            hash_url(url), "video", sent_media.file_id,
+            path.stat().st_size, description=description or None,
+        )
+    await _record(db, user_id, STATUS_DONE, platform, "video", started,
+                  file_size=path.stat().st_size)
+    await _delete_silently(status_message)
+    return True
+
+
 async def _deliver_album(
     message: Message,
     db: Database,
@@ -727,6 +772,21 @@ async def _deliver_album(
     """
     try:
         async with download_album(url, settings.cookies_file, force_proxy) as album:
+            # A single video here means this was never a carousel — the video
+            # path failed and this is the fallback. Sending it as a media group
+            # would silently strip the audio and description buttons and push the
+            # caption into a message of its own, so it goes out the normal way.
+            single_video = (
+                len(album.items) == 1
+                and album.items[0].suffix.lower() in (".mp4", ".webm", ".mov")
+                and album.music is None
+            )
+            if single_video:
+                return await _deliver_single_video(
+                    message, db, status_message, url, album, platform,
+                    user_id, started, url_cache,
+                )
+
             group = []
             documents = []  # photos above Telegram's 10 MB photo limit go as files
             for path in album.items:

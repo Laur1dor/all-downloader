@@ -114,11 +114,27 @@ from bot.downloader import video_format_sort
 # so the codec has to outrank resolution there.
 assert video_format_sort("youtube")[0] == "vcodec:h264"
 assert video_format_sort("other")[0] == "vcodec:h264"
-# TikTok ships the same clip as a smaller h264 transcode beside its h265
-# original, so resolution has to come first or every download is downgraded.
-assert video_format_sort("tiktok")[0] == "res"
-assert "vcodec:h264" in video_format_sort("tiktok"), "h264 still breaks ties"
+# TikTok was ranked by resolution first, to reach its h265 original instead of
+# the smaller h264 transcode. Comparing what the bot delivered against a working
+# downloader settled it the other way: the h265 file arrived as 1080p Matroska
+# that Telegram played without sound, while h264 in mp4 simply plays. Sharper on
+# paper loses to what the person can actually watch.
+assert video_format_sort("tiktok")[0] == "vcodec:h264"
 print("format sort OK")
+
+# --- TikTok must take a ready-made file, never a merge ---
+from bot.downloader import video_format
+
+# Merging picked a video-only HEVC stream and laid the post's *music track* over
+# it — a different clip, in Matroska, which Telegram played without sound.
+tiktok_fmt = video_format("tiktok")
+assert "vcodec!=none" in tiktok_fmt and "acodec!=none" in tiktok_fmt, tiktok_fmt
+assert "+" not in tiktok_fmt, "a '+' means yt-dlp would merge two streams"
+# Everywhere else merging is still how the best quality is assembled.
+assert "+" in video_format("youtube")
+# Among the muxed files h264 wins: Telegram's players stumble on HEVC.
+assert video_format_sort("tiktok")[0] == "vcodec:h264"
+print("tiktok format policy OK")
 
 # --- a block is not reachability ---
 from bot.proxy import _BLOCKED_STATUSES
