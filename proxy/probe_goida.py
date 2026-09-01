@@ -59,11 +59,12 @@ REBUILD_FILE = os.getenv("XRAY_REBUILD_FILE", "/app/data/rebuild_xray")
 # TikTok gets its own verified pool: a node that carries plain HTTPS often still
 # cannot fetch TikTok, and the free ones stop working minutes after they start.
 TIKTOK_POOL_FILE = os.getenv("TIKTOK_POOL_FILE", "/app/data/tiktok_pool.txt")
-TIKTOK_POOL_TARGET = int(os.getenv("TIKTOK_POOL_TARGET", "5"))
-TIKTOK_POOL_CANDIDATES = int(os.getenv("TIKTOK_POOL_CANDIDATES", "20"))
+TIKTOK_POOL_TARGET = int(os.getenv("TIKTOK_POOL_TARGET", "8"))
 # Re-verified far more often than the main round: the pool is only useful while
 # its nodes are alive, and they die fast.
-TIKTOK_RECHECK_INTERVAL = int(os.getenv("TIKTOK_RECHECK_INTERVAL", "240"))
+# The ladder is rebuilt with the live list; nothing here talks to TikTok,
+# so there is no reason to run it on a tighter timer of its own.
+TIKTOK_RECHECK_INTERVAL = int(os.getenv("TIKTOK_RECHECK_INTERVAL", "600"))
 # The bot creates this when a TikTok download fails, to force a check right away
 # instead of waiting out the interval.
 TIKTOK_TRIGGER_FILE = os.getenv("TIKTOK_TRIGGER_FILE", "/app/data/reprobe_tiktok")
@@ -73,15 +74,6 @@ TIKTOK_HOST = "www.tiktok.com"
 # same shape as the real work or the pool fills with nodes that pass it and then
 # fail every download.
 TIKTOK_PATH = os.getenv("TIKTOK_PROBE_PATH", "/@tiktok/video/7106594312292453675")
-# The marker yt-dlp itself needs; a block page or a captcha carries neither.
-TIKTOK_MARKER = b"__UNIVERSAL_DATA_FOR_REHYDRATION__"
-# A node has to finish a real extraction within this to be worth keeping. The
-# pool used to be filled by nodes that could serve one page and then stalled on
-# the session yt-dlp runs, so downloads timed out while the pool reported itself
-# healthy. Slowness is the failure here, so the deadline is part of the test.
-TIKTOK_EXTRACT_DEADLINE = int(os.getenv("TIKTOK_EXTRACT_DEADLINE", "35"))
-TIKTOK_PROBE_URL = os.getenv(
-    "TIKTOK_PROBE_URL", "https://www.tiktok.com/@tiktok/video/7106594312292453675")
 _CRLF = chr(13) + chr(10)
 TCP_WORKERS = int(os.getenv("GOIDA_PROBE_TCP_WORKERS", "60"))
 # Параллельных xray немного: у сервера одно ядро.
@@ -352,56 +344,6 @@ def _https_get_via_socks(port: int, host: str, path: str, timeout: int = 20) -> 
             pass
 
 
-def _serves_tiktok(args: tuple[int, str]) -> str | None:
-    """Whether this node can actually pull a TikTok video's metadata in time.
-
-    Fetching one page was not enough: nodes passed that check and then stalled
-    partway through the session yt-dlp runs, so the pool looked healthy while
-    every download timed out. The probe therefore runs the same extraction the
-    bot will run, and a node that cannot finish it inside the deadline is no
-    more use than one that fails outright.
-    """
-    port, link = args
-    try:
-        outbounds, _ = bc._links_to_outbounds([link], "sticky-")
-    except Exception:
-        return None
-    if not outbounds:
-        return None
-    config = {
-        "log": {"loglevel": "none"},
-        "inbounds": [{
-            "tag": "in", "protocol": "socks", "port": port, "listen": "127.0.0.1",
-            "settings": {"udp": False},
-        }],
-        "outbounds": outbounds,
-    }
-    path = f"/tmp/sticky-{port}.json"
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(config, fh)
-    proc = subprocess.Popen(
-        ["xray", "run", "-c", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    try:
-        time.sleep(2)
-        result = subprocess.run(
-            ["yt-dlp", "--proxy", f"socks5://127.0.0.1:{port}",
-             "--socket-timeout", "12", "--no-warnings", "-q", "--simulate",
-             "--print", "%(id)s", TIKTOK_PROBE_URL],
-            capture_output=True, text=True, timeout=TIKTOK_EXTRACT_DEADLINE,
-        )
-        return link if result.returncode == 0 and (result.stdout or "").strip() else None
-    except Exception:
-        return None
-    finally:
-        proc.kill()
-        proc.wait()
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
 def _read_tiktok_pool() -> list[str]:
     try:
         with open(TIKTOK_POOL_FILE, encoding="utf-8") as fh:
@@ -410,65 +352,43 @@ def _read_tiktok_pool() -> list[str]:
         return []
 
 
-def refresh_tiktok_pool(live: list[str]) -> list[str]:
-    """Re-verify the TikTok pool, topping it up from the freshest candidates.
+def refresh_tiktok_pool(live: list[str]) -> None:
+    """Fill the TikTok ladder from nodes already known to be alive.
 
-    Nodes already in the pool are checked first and kept while they answer, so
-    the exit does not change under a download that is in flight. Only the empty
-    slots are filled, and curated nodes get first refusal because they outlive
-    the free ones by a wide margin.
+    There used to be a TikTok-specific check here, and it was doing harm. TikTok
+    allows an address only a handful of requests before it starts answering with
+    a 536-byte "Site Maintenance" page, and the check spent that allowance every
+    few minutes: nodes passed, were written to the pool, and were already
+    exhausted by the time a real download used them. Measured afterwards, all
+    five pool nodes served stubs while an untouched node still returned the real
+    page.
+
+    So nothing is spent on qualifying a node for TikTok. The ladder is simply the
+    live nodes, and the download itself moves to the next rung when one refuses —
+    the retry is the test, and it is the only test that costs nothing extra.
     """
-    current = _read_tiktok_pool()
-    with cf.ThreadPoolExecutor(min(4, max(1, len(current)))) as pool:
-        survivors = [
-            link for link in pool.map(
-                _serves_tiktok, [(44000 + i, c) for i, c in enumerate(current)]
-            ) if link
-        ]
-    dropped = len(current) - len(survivors)
-
-    if len(survivors) < TIKTOK_POOL_TARGET:
-        seen = set(survivors)
-        candidates = [
-            c for c in bc.collect_bypass_links() + live + _read_recent()
-            if c not in seen
-        ][:TIKTOK_POOL_CANDIDATES]
-        with cf.ThreadPoolExecutor(4) as pool:
-            for link in pool.map(
-                _serves_tiktok, [(44100 + i, c) for i, c in enumerate(candidates)]
-            ):
-                if link:
-                    survivors.append(link)
-                    if len(survivors) >= TIKTOK_POOL_TARGET:
-                        break
-
-    # One endpoint reached by several subscription links is still one exit. The
-    # pool read five nodes deep while three of them were the same address, which
-    # is far less spread than it looked.
-    seen_endpoints: set[tuple[str, int] | None] = set()
-    unique = []
-    for link in survivors:
+    seen: set[str] = set()
+    chosen: list[str] = []
+    for link in bc.collect_bypass_links() + live:
         endpoint = _endpoint(link)
-        if endpoint in seen_endpoints:
+        if not endpoint or endpoint in seen:
             continue
-        seen_endpoints.add(endpoint)
-        unique.append(link)
-    if len(unique) < len(survivors):
-        print(f"probe: tiktok pool had {len(survivors) - len(unique)} duplicate "
-              "endpoint(s)", flush=True)
-    survivors = unique
-
-    if set(survivors) != set(current):
+        seen.add(endpoint)
+        chosen.append(link)
+        if len(chosen) >= TIKTOK_POOL_TARGET:
+            break
+    if not chosen:
+        print("probe: no live nodes for the TikTok ladder", flush=True)
+        return
+    previous = _read_tiktok_pool()
+    os.makedirs(os.path.dirname(TIKTOK_POOL_FILE) or ".", exist_ok=True)
+    tmp = f"{TIKTOK_POOL_FILE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(chr(10).join(chosen) + chr(10))
+    os.replace(tmp, TIKTOK_POOL_FILE)
+    if set(chosen) != set(previous):
         _request_rebuild()
-
-    if survivors:
-        os.makedirs(os.path.dirname(TIKTOK_POOL_FILE) or ".", exist_ok=True)
-        tmp = f"{TIKTOK_POOL_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(chr(10).join(survivors) + chr(10))
-        os.replace(tmp, TIKTOK_POOL_FILE)
-    print(f"probe: tiktok pool {len(survivors)} node(s), {dropped} dropped", flush=True)
-    return survivors
+    print(f"probe: tiktok ladder {len(chosen)} node(s)", flush=True)
 
 
 def _wait_or_trigger(seconds: int) -> None:
