@@ -68,6 +68,18 @@ _CASCADES: dict[str, tuple[str, ...]] = {
     "adaptive": ("goida", "bypass", "main"),
 }
 
+# The personal exit can be carried by any of three engines: xray speaks
+# vless/vmess/trojan/ss, the AmneziaWG container carries an obfuscated
+# WireGuard tunnel, and sing-box carries hysteria2/tuic, which xray does not
+# speak at all. Which one is live is the admin's choice in /control, made after
+# sending the config to /vpn — so the address is resolved per call rather than
+# fixed at startup.
+_ENGINE_PROXIES = {
+    "xray": None,  # filled from PROXY_URL at configure time
+    "awg": os.getenv("AWG_PROXY_URL", "socks5h://awg:1080"),
+    "singbox": os.getenv("SINGBOX_PROXY_URL", "socks5h://singbox:2081"),
+}
+
 _ROUTING_FILE = Path(os.getenv("ROUTING_FILE", "data/routing.toml"))
 # Used when routing.toml is missing/unreadable — matches the old hardcoded policy.
 _DEFAULT_ROUTING: dict = {
@@ -100,9 +112,16 @@ class ProxyRouter:
     def enabled(self) -> bool:
         return any((self._proxy_url, self._goida_url, self._bypass_url))
 
+    def _main_url(self) -> str | None:
+        """The personal exit, through the engine the admin selected."""
+        engine = _main_engine()
+        if engine == "xray":
+            return self._proxy_url
+        return _ENGINE_PROXIES.get(engine) or self._proxy_url
+
     def _pool_url(self, name: str) -> str | None:
         return {
-            "main": self._proxy_url,
+            "main": self._main_url(),
             "goida": self._goida_url,
             "bypass": self._bypass_url,
         }.get(name)
@@ -151,9 +170,9 @@ class ProxyRouter:
         if not self.enabled:
             return None
         policy = self._policy_for(platform)
-        if platform == "tiktok" and _tiktok_own_vpn() and self._proxy_url:
+        if platform == "tiktok" and _tiktok_own_vpn() and self._main_url():
             # /control says TikTok goes through the operator's own subscription.
-            return self._proxy_url
+            return self._main_url()
         if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
             # A dedicated external proxy pinned for this platform (e.g. WARP for
             # DDoS-Guard sites that need one stable Cloudflare exit IP).
@@ -186,7 +205,7 @@ class ProxyRouter:
                 # uses a rotating pool as an alternate exit.
                 return self._cascade("goida")
             if policy.startswith("vless://"):
-                return self._proxy_url
+                return self._main_url()
             if policy in _CASCADES:
                 primary = self._cascade(policy)
                 for name in _CASCADES[policy]:
@@ -272,6 +291,7 @@ def configure_router(
     proxy_url: str | None, goida_url: str | None = None, bypass_url: str | None = None
 ) -> ProxyRouter:
     global _router
+    _ENGINE_PROXIES["xray"] = proxy_url or None
     _router = ProxyRouter(proxy_url, goida_url, bypass_url)
     return _router
 
@@ -284,6 +304,16 @@ def proxy_for(platform: str) -> str | None:
 # node gets its own inbound rather than sharing one behind a balancer.
 _TIKTOK_LADDER_PORTS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
 _TIKTOK_BASE_PORT = int(os.getenv("TIKTOK_SOCKS_PORT", "2077"))
+
+
+def _main_engine() -> str:
+    """Engine name from /control; read late so a switch takes effect at once."""
+    try:
+        from bot.runtime import config
+
+        return config.main_exit
+    except Exception:
+        return "xray"
 
 
 def _tiktok_own_vpn() -> bool:
@@ -310,7 +340,8 @@ def proxy_ladder(platform: str) -> list[str]:
     if _tiktok_own_vpn():
         # One node, one rung: there is nothing to rotate through, and falling
         # back to the free pool would quietly undo the admin's choice.
-        return [_router._proxy_url] if _router._proxy_url else [first]
+        own = _router._main_url()
+        return [own] if own else [first]
     base, _, port_text = first.rpartition(":")
     try:
         port = int(port_text)

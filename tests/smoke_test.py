@@ -184,5 +184,87 @@ assert not is_short_link("https://www.tiktok.com/@tiktok/video/71065943122924536
 print("cache keys OK")
 
 
+# --- VPN configs sent from the admin chat ---
+import base64
+import shutil
+import sys
+import tempfile
+
+_vpn_root = Path(tempfile.mkdtemp(prefix="vpn-test-"))
+os.environ["VPN_DIR"] = str(_vpn_root / "vpn")
+os.environ["AWG_CONFIG_DIR"] = str(_vpn_root / "awg")
+os.environ["XRAY_REBUILD_FILE"] = str(_vpn_root / "rebuild_xray")
+
+import importlib
+
+from bot import vpnstore
+
+importlib.reload(vpnstore)
+
+mixed = vpnstore.classify(
+    "vless://u@a.com:443?type=ws" + chr(10)
+    + "hy2://pw@b.com:443" + chr(10)
+    + "https://sub.example/list" + chr(10)
+    + "nonsense"
+)
+assert mixed.xray == ["vless://u@a.com:443?type=ws"], mixed.xray
+assert mixed.singbox == ["hy2://pw@b.com:443"], mixed.singbox
+assert mixed.subscriptions == ["https://sub.example/list"], mixed.subscriptions
+assert mixed.unknown == 1
+
+# A pasted subscription body is base64 of the link list, not links.
+blob = base64.b64encode(
+    ("vless://u@c.com:443" + chr(10) + "vless://u@d.com:443").encode()
+).decode()
+assert len(vpnstore.classify(blob).xray) == 2
+
+awg_text = ("[Interface]" + chr(13) + chr(10) + "PrivateKey = k" + chr(13) + chr(10)
+            + "Address = 10.8.1.6/32" + chr(13) + chr(10)
+            + "[Peer]" + chr(13) + chr(10) + "Endpoint = 1.2.3.4:51820" + chr(13) + chr(10))
+awg = vpnstore.classify(awg_text, "Fin-AWG.conf")
+assert awg.awg and awg.awg_name == "Fin-AWG", awg.awg_name
+# A filename is attacker-shaped input even from the admin: it must not escape.
+assert vpnstore.safe_name("../../etc/passwd") == "etc-passwd"
+
+vpnstore.apply_payload(mixed)
+vpnstore.apply_payload(awg)
+assert (_vpn_root / "rebuild_xray").exists(), "xray was not asked to rebuild"
+assert (_vpn_root / "vpn" / "reload_singbox").exists()
+assert (_vpn_root / "vpn" / "reload_awg").exists()
+# The tunnel setup reads these fields with plain text tools; a carriage return
+# turns an address into one ip(8) refuses.
+assert chr(13) not in (_vpn_root / "awg" / "Fin-AWG.conf").read_text(encoding="utf-8")
+shutil.rmtree(_vpn_root, ignore_errors=True)
+print("vpn config intake OK")
+
+# --- share links of every protocol the exits speak ---
+sys.path.insert(0, str(Path("proxy").resolve()))
+import build_config as _xray_build
+import singbox_config as _singbox_build
+
+vmess_link = "vmess://" + base64.b64encode(
+    b'{"add":"1.2.3.4","port":443,"id":"u","net":"ws","tls":"tls","host":"h.com","path":"/p"}'
+).decode()
+for link, protocol in [
+    ("vless://u@a.com:443?type=ws&security=tls", "vless"),
+    (vmess_link, "vmess"),
+    ("trojan://pass@1.2.3.4:443?sni=a.com", "trojan"),
+    ("ss://" + base64.b64encode(b"aes-256-gcm:pw").decode() + "@1.2.3.4:8388", "shadowsocks"),
+    ("ss://chacha20-ietf-poly1305:pw@1.2.3.4:8388", "shadowsocks"),
+]:
+    outbound = _xray_build.link_to_outbound(link, "t")
+    assert outbound["protocol"] == protocol, (link, outbound["protocol"])
+
+# Trojan is TLS by definition even when the link does not spell it out.
+assert _xray_build.link_to_outbound(
+    "trojan://p@a.com:443", "t")["streamSettings"]["security"] == "tls"
+
+built = _singbox_build.build(["hy2://pw@a.com:443?sni=x.com", "tuic://uu:pp@b.com:8443"])
+kinds = [o["type"] for o in built["outbounds"]]
+assert kinds == ["urltest", "hysteria2", "tuic", "direct"], kinds
+assert built["route"]["final"] == "auto"
+print("proxy link parsers OK")
+
+
 
 print("\nALL SMOKE TESTS PASSED")

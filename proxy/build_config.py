@@ -277,19 +277,40 @@ def _write_goida_cache(links: list[str]) -> None:
         print(f"WARN: could not write goida cache {GOIDA_CACHE!r}: {exc}", file=sys.stderr)
 
 
+# Written by the bot when the admin sends a config to /vpn. Kept separate from
+# the .env values so a swap made from the phone never silently loses the
+# configuration the machine was deployed with.
+VPN_DIR = os.getenv("VPN_DIR", "/app/data/vpn")
+_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+
+def _read_lines(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        return []
+
+
 def collect_links() -> list[str]:
     links: list[str] = []
-    for sub in filter(None, (s.strip() for s in os.getenv("VLESS_SUBSCRIPTION", "").split(","))):
+    subscriptions = list(
+        filter(None, (s.strip() for s in os.getenv("VLESS_SUBSCRIPTION", "").split(",")))
+    )
+    subscriptions += _read_lines(os.path.join(VPN_DIR, "subs.txt"))
+    for sub in subscriptions:
         try:
             links += [ln.strip() for ln in _b64_maybe(_fetch(sub)).splitlines() if "://" in ln]
         except Exception as exc:
             print(f"WARN: subscription {sub!r} failed: {exc}", file=sys.stderr)
-    inline = os.getenv("VLESS_CONFIGS", "").replace(",", "\n")
-    links += [ln.strip() for ln in inline.splitlines() if ln.strip().startswith("vless://")]
+    inline = os.getenv("VLESS_CONFIGS", "").replace(",", chr(10))
+    links += [ln.strip() for ln in inline.splitlines()
+              if ln.strip().lower().startswith(_SCHEMES)]
     path = os.getenv("VLESS_CONFIGS_FILE", "")
-    if path and os.path.isfile(path):
-        with open(path, encoding="utf-8") as fh:
-            links += [ln.strip() for ln in fh if ln.strip().startswith("vless://")]
+    if path:
+        links += [ln for ln in _read_lines(path) if ln.lower().startswith(_SCHEMES)]
+    links += [ln for ln in _read_lines(os.path.join(VPN_DIR, "xray.txt"))
+              if ln.lower().startswith(_SCHEMES)]
     # de-duplicate, keep order
     seen: list[str] = []
     for link in links:
@@ -392,11 +413,112 @@ def _links_to_outbounds(links: list[str], prefix: str) -> tuple[list[dict], list
     for index, link in enumerate(links):
         tag = f"{prefix}{index}"
         try:
-            outbounds.append(vless_to_outbound(link, tag))
+            outbounds.append(link_to_outbound(link, tag))
             tags.append(tag)
         except Exception as exc:
             print(f"WARN: cannot parse a config: {exc}", file=sys.stderr)
     return outbounds, tags
+
+
+def link_to_outbound(link: str, tag: str) -> dict:
+    """One share link of any protocol xray speaks, as an outbound.
+
+    The pool used to be vless-only, which was fine while it was fed by one
+    subscription. Now that configs arrive from the admin chat, whatever the
+    provider handed them has to work — and providers hand out vmess, trojan and
+    shadowsocks just as readily.
+    """
+    lowered = link.lower()
+    if lowered.startswith("vless://"):
+        return vless_to_outbound(link, tag)
+    if lowered.startswith("vmess://"):
+        return vmess_to_outbound(link, tag)
+    if lowered.startswith("trojan://"):
+        return trojan_to_outbound(link, tag)
+    if lowered.startswith("ss://"):
+        return ss_to_outbound(link, tag)
+    raise ValueError(f"unsupported scheme in {link[:12]!r}")
+
+
+def _stream_from_params(params: dict, host: str, default_security: str = "none") -> dict:
+    """streamSettings shared by every protocol; only the payload differs."""
+    fake = f"vless://x@{host}:443?" + urllib.parse.urlencode(params)
+    return vless_to_outbound(fake, "tmp")["streamSettings"]
+
+
+def vmess_to_outbound(link: str, tag: str) -> dict:
+    """vmess:// carries its whole config as base64 JSON rather than a URL."""
+    body = link[len("vmess://"):].partition("#")[0].strip()
+    padded = body + "=" * (-len(body) % 4)
+    conf = json.loads(base64.b64decode(padded).decode("utf-8", "replace"))
+    params = {
+        "type": conf.get("net", "tcp"),
+        "security": "tls" if str(conf.get("tls", "")).startswith("tls") else "none",
+        "sni": conf.get("sni") or conf.get("host") or "",
+        "host": conf.get("host", ""),
+        "path": conf.get("path", "/"),
+        "serviceName": conf.get("path", "").lstrip("/"),
+    }
+    host = str(conf.get("add", ""))
+    return {
+        "tag": tag,
+        "protocol": "vmess",
+        "settings": {"vnext": [{
+            "address": host,
+            "port": int(conf.get("port") or 443),
+            "users": [{
+                "id": conf.get("id", ""),
+                "alterId": int(conf.get("aid") or 0),
+                "security": conf.get("scy") or "auto",
+            }],
+        }]},
+        "streamSettings": _stream_from_params(params, host),
+    }
+
+
+def trojan_to_outbound(link: str, tag: str) -> dict:
+    body = link[len("trojan://"):].partition("#")[0]
+    password, _, hostport = body.partition("@")
+    hostpart, _, query = hostport.partition("?")
+    hostpart = hostpart.split("/", 1)[0]
+    host, _, port = hostpart.rpartition(":")
+    params = dict(urllib.parse.parse_qsl(query))
+    # Trojan is TLS by definition; a link that omits security still means TLS.
+    params.setdefault("security", "tls")
+    return {
+        "tag": tag,
+        "protocol": "trojan",
+        "settings": {"servers": [{
+            "address": host,
+            "port": int("".join(c for c in port if c.isdigit()) or 443),
+            "password": urllib.parse.unquote(password),
+        }]},
+        "streamSettings": _stream_from_params(params, host),
+    }
+
+
+def ss_to_outbound(link: str, tag: str) -> dict:
+    """ss:// comes in two spellings: base64 userinfo, or plain method:password."""
+    body = link[len("ss://"):].partition("#")[0]
+    userinfo, _, hostport = body.rpartition("@")
+    if not userinfo:
+        raise ValueError("shadowsocks link without credentials")
+    if ":" not in userinfo:
+        padded = userinfo + "=" * (-len(userinfo) % 4)
+        userinfo = base64.b64decode(padded).decode("utf-8", "replace")
+    method, _, password = userinfo.partition(":")
+    hostpart = hostport.partition("?")[0].split("/", 1)[0]
+    host, _, port = hostpart.rpartition(":")
+    return {
+        "tag": tag,
+        "protocol": "shadowsocks",
+        "settings": {"servers": [{
+            "address": host,
+            "port": int("".join(c for c in port if c.isdigit()) or 443),
+            "method": method,
+            "password": password,
+        }]},
+    }
 
 
 def vless_to_outbound(link: str, tag: str) -> dict:

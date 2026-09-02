@@ -222,6 +222,25 @@ class Database:
             media_type,
         )
 
+    async def forget_url(self, url_hash: str) -> int:
+        """Drop every cached upload for one post; returns how many rows went.
+
+        A cached file_id is returned instantly and forever, which is exactly
+        wrong while a download path is being fixed: the broken copy keeps coming
+        back and the fix cannot be seen. This is the admin's way to make one
+        post download again without clearing the cache for everything.
+        """
+        status = await self.pool.execute(
+            "DELETE FROM file_cache WHERE url_hash = $1", url_hash
+        )
+        return int(status.rsplit(" ", 1)[-1] or 0)
+
+    async def cached_types(self, url_hash: str) -> list[str]:
+        rows = await self.pool.fetch(
+            "SELECT media_type FROM file_cache WHERE url_hash = $1", url_hash
+        )
+        return [row["media_type"] for row in rows]
+
     async def fetch_summary(self) -> SummaryStats:
         row = await self.pool.fetchrow(
             """

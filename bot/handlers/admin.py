@@ -7,6 +7,7 @@ they did not exist, so they cannot be discovered or bypassed via callbacks.
 
 from __future__ import annotations
 
+import html
 import logging
 import signal
 from contextlib import suppress
@@ -22,7 +23,9 @@ from aiogram.types import (
     Message,
 )
 
-from bot.db import Database
+from bot import vpnstore
+from bot.db import Database, hash_url
+from bot.urlkey import canonical_key, is_short_link
 from bot.runtime import (
     BANDWIDTH_OPTIONS_MBIT,
     RANGES,
@@ -34,11 +37,19 @@ from bot.runtime import (
 logger = logging.getLogger(__name__)
 
 _CONTROL_PREFIX = "ctl:"
+# An escaped newline inside a string is one of the easier things to mangle
+# while editing; a named character sidesteps the question.
+NEWLINE = chr(10)
+
 # admin_id -> setting key awaiting a typed custom value.
 _awaiting: dict[int, str] = {}
+# Admins whose next message is a VPN config rather than a link to download.
+# Armed by a button so an ordinary message is never mistaken for one.
+_awaiting_vpn: dict[int, bool] = {}
 # Human labels for the custom-input prompt.
 _SETTING_LABELS = {
     "tiktok_route": "маршрут TikTok",
+    "main_exit": "движок своего VPN",
     "user_upload_mb": "лимит загрузки юзеров (МБ)",
     "admin_upload_mb": "лимит загрузки админа (МБ)",
     "user_speed_mbit": "скорость юзеров (Мбит/с, 0 = безлимит)",
@@ -122,6 +133,21 @@ def _control_keyboard() -> InlineKeyboardMarkup:
         _header("— 📶 Канал всего (Мбит/с) —"),
         _option_row("bandwidth_mbit", BANDWIDTH_OPTIONS_MBIT, config.get("bandwidth_mbit"),
                     _speed_label),
+        _header("— 🛡 Свой VPN идёт через —"),
+        [
+            InlineKeyboardButton(
+                text=("• xray •" if config.get("main_exit") == 0 else "xray"),
+                callback_data=f"{_CONTROL_PREFIX}main_exit:0",
+            ),
+            InlineKeyboardButton(
+                text=("• AmneziaWG •" if config.get("main_exit") == 1 else "AmneziaWG"),
+                callback_data=f"{_CONTROL_PREFIX}main_exit:1",
+            ),
+            InlineKeyboardButton(
+                text=("• sing-box •" if config.get("main_exit") == 2 else "sing-box"),
+                callback_data=f"{_CONTROL_PREFIX}main_exit:2",
+            ),
+        ],
         _header("— 🎬 TikTok через —"),
         [
             InlineKeyboardButton(
@@ -188,6 +214,14 @@ def create_router(admin_id: int) -> Router:
             await callback.answer()
             return
         key, _, raw = payload.partition(":")
+        if key == "vpn":
+            _awaiting_vpn[admin_id] = raw == "replace"
+            await callback.answer()
+            await callback.message.answer(
+                "Пришлите конфиг следующим сообщением "
+                + ("(заменю текущий)." if raw == "replace" else "(добавлю к текущим).")
+            )
+            return
         if key == "custom":
             if raw not in RANGES:
                 await callback.answer()
@@ -220,6 +254,104 @@ def create_router(admin_id: int) -> Router:
         _awaiting.pop(admin_id, None)
         await config.set(key, value)
         await message.answer("Сохранено ✅", reply_markup=_control_keyboard())
+
+    @router.message(Command("forget"))
+    async def handle_forget(message: Message, db: Database) -> None:
+        """Drop one post from the file_id cache: /forget <ссылка>.
+
+        A post that was delivered once is served from the cache for good, which
+        is precisely wrong while its download path is being fixed: the broken
+        copy keeps coming back and the fix cannot be seen on the very link that
+        showed the problem.
+        """
+        _, _, argument = (message.text or "").partition(" ")
+        url = argument.strip()
+        if not url.startswith("http"):
+            await message.answer(
+                "Пришлите ссылку: <code>/forget https://…</code>" + NEWLINE
+                + "Пост скачается заново при следующей отправке."
+            )
+            return
+        if is_short_link(url):
+            # The id lives behind the redirect, so a short link hashes to
+            # something that cannot be in the cache under any circumstances.
+            from bot.downloader import expand_short_link
+
+            url = await expand_short_link(url)
+        key = html.escape(canonical_key(url))
+        removed = await db.forget_url(hash_url(url))
+        if removed:
+            await message.answer(
+                f"\U0001f5d1 Забыто: <code>{key}</code> — {removed} шт." + NEWLINE
+                + "Следующая отправка скачает заново."
+            )
+        else:
+            await message.answer(f"В кэше ничего нет для <code>{key}</code>.")
+
+    def _vpn_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="\u2795 Заменить конфиг",
+                                  callback_data=f"{_CONTROL_PREFIX}vpn:replace")],
+            [InlineKeyboardButton(text="\u2795 Добавить к текущим",
+                                  callback_data=f"{_CONTROL_PREFIX}vpn:append")],
+        ])
+
+    def _vpn_text() -> str:
+        return (
+            "\U0001f6e1 <b>VPN</b>" + NEWLINE + NEWLINE
+            + vpnstore.describe() + NEWLINE + NEWLINE
+            + "<i>Принимаю: vless/vmess/trojan/ss, hysteria2/tuic, ссылку на "
+              "подписку, файл .conf AmneziaWG и готовый config.json xray. "
+              "Можно несколько строк сразу.</i>"
+        )
+
+    @router.message(Command("vpn"))
+    async def handle_vpn(message: Message) -> None:
+        await message.answer(_vpn_text(), reply_markup=_vpn_keyboard())
+
+    async def _consume_vpn(message: Message, body: str, filename: str) -> bool:
+        """Store a config the admin just sent; True when it was one."""
+        payload = vpnstore.classify(body, filename)
+        if not payload:
+            await message.answer(
+                "\u26a0 Не понял, что это за конфиг. Нужны ссылки вида "
+                "<code>vless://</code>, <code>hy2://</code>, адрес подписки, "
+                "файл AmneziaWG или config.json xray."
+            )
+            return False
+        replace = _awaiting_vpn.get(message.from_user.id, True)
+        report = vpnstore.apply_payload(payload, replace=replace)
+        _awaiting_vpn.pop(message.from_user.id, None)
+        tail = ("" if not payload.unknown
+                else NEWLINE + f"<i>Пропущено непонятных строк: {payload.unknown}</i>")
+        await message.answer(
+            NEWLINE.join(report)
+            + NEWLINE + NEWLINE
+            + "Применится само в течение минуты — перезапускать ничего не нужно."
+            + tail,
+            reply_markup=_vpn_keyboard(),
+        )
+        return True
+
+    @router.message(F.document, lambda m: m.from_user.id in _awaiting_vpn)
+    async def handle_vpn_document(message: Message) -> None:
+        document = message.document
+        if (document.file_size or 0) > 256 * 1024:
+            await message.answer("\u26a0 Файл слишком большой для конфига.")
+            return
+        buffer = await message.bot.download(document)
+        body = buffer.read().decode("utf-8", "replace")
+        await _consume_vpn(message, body, document.file_name or "")
+
+    @router.message(F.text, lambda m: m.from_user.id in _awaiting_vpn)
+    async def handle_vpn_text(message: Message) -> None:
+        if (message.text or "").startswith("/"):
+            # A command means the admin changed their mind; swallowing it here
+            # would make /control and /restart silently do nothing.
+            _awaiting_vpn.pop(message.from_user.id, None)
+            await message.answer("Отменил ожидание конфига.")
+            return
+        await _consume_vpn(message, message.text or "", "")
 
     @router.message(Command("restart"))
     async def handle_admin_restart(message: Message) -> None:
