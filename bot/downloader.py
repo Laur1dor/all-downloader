@@ -170,6 +170,15 @@ class DownloadFailedError(Exception):
         self.retry_via_proxy = retry_via_proxy
 
 
+class NotAVideoPostError(DownloadFailedError):
+    """The link is a real post, but a carousel rather than a video.
+
+    Its own class because the handler already knows what to do with a photo
+    post, and the generic "could not download" message sends the reader looking
+    for a fault where there is none.
+    """
+
+
 class DownloadCancelledError(DownloadFailedError):
     """The user pressed the cancel button while downloading."""
 
@@ -1272,11 +1281,20 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             continue
         try:
             scope = json.loads(found.group(1))["__DEFAULT_SCOPE__"]
-            detail = scope["webapp.video-detail"]
         except (KeyError, ValueError) as exc:
             last_reason = f"unexpected data block: {exc}"
             session.close()
             continue
+        if "webapp.video-detail" not in scope:
+            # Measured on a /photo/ post: the page is served whole and simply
+            # carries no video node, while a refusal carries the node with a
+            # status inside it. So this is a carousel, and the photo path is
+            # the one that can fetch it - walking more exits cannot help.
+            session.close()
+            raise NotAVideoPostError(
+                "Это фото-пост, видео в нём нет."
+            )
+        detail = scope["webapp.video-detail"]
         blocked = _tiktok_geo_block(detail)
         if blocked:
             # The refusal is about where the request left from, not how it
@@ -1498,7 +1516,11 @@ def _album_description(tmpdir: str) -> str | None:
 
 
 def _download_album_sync(
-    url: str, tmpdir: str, cookies_file: Path | None, proxy: str | None = None
+    url: str,
+    tmpdir: str,
+    cookies_file: Path | None,
+    proxy: str | None = None,
+    timeout: int | None = None,
 ) -> AlbumMedia:
     """Fetch a photo/carousel post with gallery-dl (yt-dlp does not support them).
 
@@ -1514,7 +1536,9 @@ def _download_album_sync(
     if cookies_file is not None:
         command += ["--cookies", str(cookies_file)]
     command.append(url)
-    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=timeout or 180
+    )
     if result.returncode != 0:
         logger.info("gallery-dl exited with %d: %s", result.returncode, result.stderr.strip())
 
@@ -1693,25 +1717,79 @@ async def download_album(
     host = (urlparse(url).hostname or "").lower()
     _plat = detect_platform(url)
     proxy = forced_proxy(_plat) if force_proxy else proxy_for(_plat)
+    # A dead exit makes gallery-dl come back empty, and "no video and no photos
+    # here" is then a claim about the post that simply is not true. TikTok is
+    # the platform where exits die under us, and it is the one with a ladder of
+    # them, so the carousel gets the same walk the video path has.
+    exits = _album_exits(_plat, proxy)
     try:
-        try:
-            if host.endswith("rule34.xxx"):
-                album = await asyncio.to_thread(_scrape_rule34_sync, url, tmpdir, proxy)
-            else:
-                album = await asyncio.to_thread(
-                    _download_album_sync, url, tmpdir, cookies_file, proxy
+        album = None
+        last_error: DownloadFailedError | None = None
+        for attempt, exit_proxy in enumerate(exits):
+            if attempt:
+                # Each attempt starts from an empty directory: a half-finished
+                # download from a dying exit would otherwise be counted as the
+                # post and sent as a truncated carousel.
+                await asyncio.to_thread(_clear_directory, tmpdir)
+            try:
+                if host.endswith("rule34.xxx"):
+                    album = await asyncio.to_thread(
+                        _scrape_rule34_sync, url, tmpdir, exit_proxy
+                    )
+                else:
+                    album = await asyncio.to_thread(
+                        _download_album_sync, url, tmpdir, cookies_file, exit_proxy,
+                        _ALBUM_RETRY_TIMEOUT if attempt else None,
+                    )
+            except subprocess.TimeoutExpired as exc:
+                last_error = DownloadFailedError(
+                    "Не удалось скачать пост: превышено время ожидания."
                 )
-        except subprocess.TimeoutExpired as exc:
-            raise DownloadFailedError(
-                "Не удалось скачать пост: превышено время ожидания."
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise DownloadFailedError("Не удалось скачать пост: сетевая ошибка.") from exc
-        if not album.items:
+                last_error.__cause__ = exc
+                continue
+            except urllib.error.URLError as exc:
+                last_error = DownloadFailedError("Не удалось скачать пост: сетевая ошибка.")
+                last_error.__cause__ = exc
+                continue
+            if album.items:
+                break
+        if album is None or not album.items:
+            if last_error is not None:
+                raise last_error
             raise DownloadFailedError("По этой ссылке не нашлось ни видео, ни фото.")
         yield album
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
+
+
+# Retries are given a shorter budget than the first try: the first is usually
+# the only one, while a retry exists because an exit is already suspect.
+_ALBUM_MAX_EXITS = 4
+_ALBUM_RETRY_TIMEOUT = 60
+
+
+def _clear_directory(path: str) -> None:
+    """Empty a directory without removing it."""
+    for entry in Path(path).iterdir():
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def _album_exits(platform: str, proxy: str | None) -> list[str | None]:
+    """Exits to try for a carousel, first one first.
+
+    Only TikTok has more than one: it is the platform whose exits are refused
+    or die mid-session, and the only one with a ladder of them to walk.
+    """
+    if platform != "tiktok":
+        return [proxy]
+    ladder = [exit_proxy for exit_proxy in proxy_ladder(platform) if exit_proxy != proxy]
+    # Four at most: gallery-dl is a subprocess with a timeout of its own, so the
+    # walk has to stay inside the patience of whoever sent the link rather than
+    # exhausting every rung.
+    return [proxy, *ladder][:_ALBUM_MAX_EXITS]
 
 
 def is_photo_post_url(url: str) -> bool:

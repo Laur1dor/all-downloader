@@ -33,6 +33,7 @@ from bot.downloader import (
     DownloadCancelledError,
     DownloadFailedError,
     FileTooLargeError,
+    NotAVideoPostError,
     OversizedError,
     QualityOption,
     detect_platform,
@@ -517,7 +518,17 @@ async def _run_link(
                 started, url_cache, album_proxy,
             ):
                 return
-        await _safe_edit(status_message, f"⚠️ {exc}")
+        if isinstance(exc, NotAVideoPostError):
+            # The post was identified correctly and the photo path still came
+            # back empty, so repeating "there is no video in it" would name the
+            # wrong problem: nothing reached the post, not the post's contents.
+            await _safe_edit(
+                status_message,
+                "⚠️ Это фото-пост, но скачать его не удалось: "
+                "ни один выход не отдал файлы. Попробуйте ещё раз.",
+            )
+        else:
+            await _safe_edit(status_message, f"⚠️ {exc}")
         await _record(
             db, user_id, STATUS_FAILED, platform, "video", started,
             file_size=getattr(exc, "size_bytes", None),
