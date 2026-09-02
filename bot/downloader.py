@@ -334,10 +334,14 @@ async def expand_short_link(url: str) -> str:
         last_exc: Exception | None = None
         for candidate in proxy_ladder(detect_platform(url)) or [proxy]:
             proxies = {"http": candidate, "https": candidate} if candidate else None
-            for target in _TIKTOK_IMPERSONATE:
+            # Two fingerprints, not five: a redirect barely depends on the
+            # client, while a dead exit costs the full timeout on every attempt,
+            # and the walk has to finish inside the patience of whoever sent the
+            # link.
+            for target in _TIKTOK_IMPERSONATE[:2]:
                 try:
                     response = cffi_requests.head(
-                        url, impersonate=target, timeout=20,
+                        url, impersonate=target, timeout=_TIKTOK_HEAD_TIMEOUT,
                         proxies=proxies, allow_redirects=True,
                     )
                 except Exception as exc:
@@ -1136,7 +1140,15 @@ def download_video(
 # --impersonate entirely, so every TikTok download failed whichever exit it went
 # through. Every other fingerprint is served the real page, so the page is
 # fetched here and read directly.
-_TIKTOK_IMPERSONATE = ("chrome131", "chrome124", "firefox133", "safari17_0", "chrome116")
+# Ordered by what TikTok actually serves rather than by version: the Chrome
+# targets are handed a WAF page ("SlardarWAF", ~1.5 KB) while Firefox and
+# Safari get the real one. The first entry is what every exit is tried with,
+# so it has to be the one most likely to work.
+_TIKTOK_IMPERSONATE = ("firefox133", "safari17_0", "chrome131", "chrome124", "chrome116")
+# A live exit answers TikTok in about a second; a dead free node accepts the
+# connection and then says nothing, so the timeout is the whole cost of it.
+_TIKTOK_TIMEOUT = 12
+_TIKTOK_HEAD_TIMEOUT = 8
 _TIKTOK_DATA_RE = re.compile(
     r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
 )
@@ -1172,6 +1184,48 @@ def _tiktok_has_media(item: dict) -> bool:
     return bool(images)
 
 
+# TikTok refuses Russian addresses playback outright, and it does so *inside* a
+# perfectly well-formed page: the data block is there, it just carries a status
+# instead of the post. Read as a parse failure this looked like a bug in the
+# extractor for as long as an exit happened to be alive, which is exactly the
+# wrong place to go looking.
+_TIKTOK_GEO_STATUS = 10204
+
+
+def _tiktok_geo_block(detail: dict) -> str | None:
+    """The message to show when TikTok refused the exit's country, else None."""
+    if not isinstance(detail, dict) or detail.get("itemInfo"):
+        return None
+    status = detail.get("statusCode")
+    message = str(detail.get("statusMsg") or "")
+    if status != _TIKTOK_GEO_STATUS and "cross_border" not in message:
+        return None
+    return (
+        "TikTok не отдаёт видео на этот адрес — региональная блокировка "
+        f"({message or status}). Нужен живой выход: проверьте VPN в /vpn "
+        "и переключатель в /control."
+    )
+
+
+def _remember_responsive(
+    exit_proxy: str | None,
+    target: str,
+    responsive: list,
+    attempts: list,
+) -> None:
+    """Queue the remaining fingerprints for an exit that answered.
+
+    They go on the end, so every exit gets its first chance before any exit gets
+    its second: the usual failure is a dead node, not a refused fingerprint.
+    """
+    if exit_proxy in responsive:
+        return
+    responsive.append(exit_proxy)
+    attempts.extend(
+        (exit_proxy, other) for other in _TIKTOK_IMPERSONATE if other != target
+    )
+
+
 def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = None):
     """The post's data block, plus the session that fetched it.
 
@@ -1186,10 +1240,20 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
     # handshake at all. Walking one without the other leaves half the failures
     # unrecoverable.
     exits = [proxy] if proxy in (None, "") else (proxy_ladder("tiktok") or [proxy])
+    # One fingerprint per exit on the first pass. The extra fingerprints are
+    # worth spending only on an exit that answered at all, and that is what the
+    # second pass over `responsive` does — otherwise a ladder of dead nodes
+    # costs five timeouts each instead of one.
+    responsive: list[str | None] = []
+    attempts = [(e, _TIKTOK_IMPERSONATE[0]) for e in exits]
     last_reason = "no response"
-    for exit_proxy, target in ((e, t) for e in exits for t in _TIKTOK_IMPERSONATE):
+    geo_reason: str | None = None
+    while attempts:
+        exit_proxy, target = attempts.pop(0)
         proxies = {"http": exit_proxy, "https": exit_proxy} if exit_proxy else None
-        session = cffi_requests.Session(impersonate=target, proxies=proxies, timeout=40)
+        session = cffi_requests.Session(
+            impersonate=target, proxies=proxies, timeout=_TIKTOK_TIMEOUT
+        )
         if cookies:
             session.cookies.update(cookies)
         try:
@@ -1198,6 +1262,7 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             last_reason = f"{type(exc).__name__}: {exc}"
             session.close()
             continue
+        _remember_responsive(exit_proxy, target, responsive, attempts)
         found = _TIKTOK_DATA_RE.search(page)
         if not found:
             # The refusal page carries no data block, and another fingerprint may
@@ -1207,8 +1272,26 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             continue
         try:
             scope = json.loads(found.group(1))["__DEFAULT_SCOPE__"]
-            item = scope["webapp.video-detail"]["itemInfo"]["itemStruct"]
+            detail = scope["webapp.video-detail"]
         except (KeyError, ValueError) as exc:
+            last_reason = f"unexpected data block: {exc}"
+            session.close()
+            continue
+        blocked = _tiktok_geo_block(detail)
+        if blocked:
+            # The refusal is about where the request left from, not how it
+            # looked, so no other fingerprint on this exit will do better — but
+            # another exit sits in another country and may well. Drop this
+            # exit's remaining attempts and keep walking; the message is only
+            # shown if every exit comes back the same way.
+            geo_reason = blocked
+            attempts[:] = [a for a in attempts if a[0] != exit_proxy]
+            last_reason = "region block"
+            session.close()
+            continue
+        try:
+            item = detail["itemInfo"]["itemStruct"]
+        except (KeyError, TypeError) as exc:
             last_reason = f"unexpected data block: {exc}"
             session.close()
             continue
@@ -1222,6 +1305,11 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             session.close()
             continue
         return item, session
+    if geo_reason is not None:
+        # Every exit that answered was refused for its country: that is the real
+        # failure, and saying "TikTok did not return the page" instead sends the
+        # reader looking in the extractor for a problem in the routing.
+        raise DownloadFailedError(geo_reason, retry_via_proxy=True)
     raise DownloadFailedError(
         f"TikTok не отдал страницу поста ({last_reason}).", retry_via_proxy=True
     )

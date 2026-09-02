@@ -41,12 +41,18 @@ _DEFAULTS: dict[str, int] = {
     # the free exits get stubbed by TikTok, and the personal node depends on the
     # provider surviving the local filtering.
     "tiktok_route": 0,
+    # Which engine serves the "main" exit: 0 = xray, 1 = AmneziaWG, 2 = sing-box.
+    # A config sent to /vpn lands in whichever engine can run its protocol, and
+    # this is what points the personal-VPN slot at that engine — otherwise a
+    # freshly loaded hysteria2 node would sit there carrying nothing.
+    "main_exit": 0,
     "bandwidth_mbit": 100,
 }
 
 # Validation range per key (min, max). solo_mode is a 0/1 toggle.
 RANGES: dict[str, tuple[int, int]] = {
     "tiktok_route": (0, 1),
+    "main_exit": (0, 2),
     "user_upload_mb": (SIZE_MIN_MB, SIZE_MAX_MB),
     "admin_upload_mb": (SIZE_MIN_MB, SIZE_MAX_MB),
     "user_speed_mbit": (0, MAIN_MAX_MBIT),
@@ -114,6 +120,11 @@ class RuntimeConfig:
     @property
     def solo_mode(self) -> bool:
         return bool(self._values["solo_mode"])
+
+    @property
+    def main_exit(self) -> str:
+        """Name of the engine behind the personal exit."""
+        return ("xray", "awg", "singbox")[self._values["main_exit"]]
 
     @property
     def tiktok_via_own_vpn(self) -> bool:

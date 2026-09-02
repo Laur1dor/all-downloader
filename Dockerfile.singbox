@@ -1,0 +1,22 @@
+# sing-box as a SOCKS proxy for the protocols xray-core does not speak —
+# hysteria2 and tuic. The binary comes from the project's own image; python is
+# what turns the admin's share links into a config.
+FROM ghcr.io/sagernet/sing-box:v1.11.4 AS singbox
+
+FROM python:3.13-slim
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=singbox /usr/local/bin/sing-box /usr/local/bin/sing-box
+
+WORKDIR /app
+COPY proxy/singbox_config.py /app/singbox_config.py
+COPY proxy/singbox-entrypoint.sh /usr/local/bin/singbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/singbox-entrypoint.sh \
+    && sed -i 's/\r$//' /usr/local/bin/singbox-entrypoint.sh \
+    && mkdir -p /etc/sing-box
+
+ENTRYPOINT ["/usr/local/bin/singbox-entrypoint.sh"]

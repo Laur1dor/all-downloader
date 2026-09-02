@@ -14,6 +14,10 @@ services:
       GOIDA_PROXY_URL: ${GOIDA_PROXY_URL:-}
       # Curated bypass pool for IP-reputation-blocked sites (DDoS-Guard etc.).
       BYPASS_PROXY_URL: ${BYPASS_PROXY_URL:-}
+      # The other two engines the personal exit can run on, selected in /control:
+      # AmneziaWG for obfuscated WireGuard, sing-box for hysteria2/tuic.
+      AWG_PROXY_URL: ${AWG_PROXY_URL:-socks5h://awg:1080}
+      SINGBOX_PROXY_URL: ${SINGBOX_PROXY_URL:-socks5h://singbox:2081}
     dns:
       # The provider intercepts and rewrites plain DNS — 1.1.1.1 comes back
       # empty for whole domains — so name resolution goes to a recursive
@@ -127,7 +131,27 @@ services:
       AWG_CONFIG: ${AWG_CONFIG:-awg0}
       AWG_SOCKS_PORT: ${AWG_SOCKS_PORT:-1080}
     volumes:
-      - ./data:/app/data:ro
+      # read-write: the config arrives from the admin chat, and this container
+      # clears the reload marker once it has restarted onto the new one.
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # sing-box carries hysteria2 and tuic — protocols xray-core does not speak at
+  # all, and the ones providers hand out when a link kills TCP sessions. Fed by
+  # data/vpn/singbox.txt, which the bot writes when the admin sends such a link
+  # to /vpn; the container restarts itself onto a new config within its poll.
+  singbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.singbox
+    container_name: singbox
+    profiles: ["singbox"]
+    dns:
+      - ${DNS_SERVER:-172.18.0.1}
+    environment:
+      SINGBOX_SOCKS_PORT: ${SINGBOX_SOCKS_PORT:-2081}
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
 
   # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's

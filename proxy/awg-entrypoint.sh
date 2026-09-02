@@ -9,7 +9,12 @@ CONF="${AWG_CONFIG_DIR:-/app/data/awg}/${AWG_CONFIG:-awg0}.conf"
 IFACE="${AWG_INTERFACE:-awg0}"
 PORT="${AWG_SOCKS_PORT:-1080}"
 
-[ -r "$CONF" ] || { echo "awg: no config at $CONF" >&2; exit 1; }
+# Exiting here would crash-loop until a config exists, which is the normal
+# state right after deploy: the tunnel is configured from the admin chat.
+while [ ! -r "$CONF" ]; do
+    echo "awg: waiting for a config at $CONF"
+    sleep "${AWG_POLL:-15}"
+done
 
 # These configs are written on whatever machine the operator uses, and a
 # trailing carriage return turns "10.8.1.6/32" into an address ip(8) refuses.
@@ -65,4 +70,27 @@ done
 awg show "$IFACE" | grep -E 'endpoint|handshake|transfer' | sed 's/^/  /'
 
 echo "awg: SOCKS5 on :${PORT}"
-exec microsocks -i 0.0.0.0 -p "$PORT"
+microsocks -i 0.0.0.0 -p "$PORT" &
+socks_pid=$!
+
+# A replacement config arrives from the admin chat: the bot writes it into
+# data/awg/ and drops the marker below. Rebuilding the interface in place would
+# mean undoing the routes and the resolver by hand and getting every step right
+# on a tunnel that is already half torn down, so the container exits instead and
+# docker's restart policy brings it back through this same script from the top.
+#
+# The bot signals through a file rather than the docker socket, which would hand
+# the bot container root on the host.
+RELOAD="${AWG_RELOAD_FILE:-/app/data/vpn/reload_awg}"
+POLL="${AWG_POLL:-15}"
+while kill -0 "$socks_pid" 2>/dev/null; do
+    sleep "$POLL"
+    if [ -f "$RELOAD" ]; then
+        rm -f "$RELOAD"
+        echo "awg: new config — restarting"
+        kill "$socks_pid" 2>/dev/null || true
+        exit 0
+    fi
+done
+
+wait "$socks_pid"
