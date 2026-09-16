@@ -266,5 +266,50 @@ assert built["route"]["final"] == "auto"
 print("proxy link parsers OK")
 
 
+# --- upload deadline and retry safety ---
+import asyncio as _asyncio
+
+import aiohttp as _aiohttp
+from aiogram.exceptions import TelegramNetworkError as _TelegramNetworkError
+
+from bot.handlers.download import (
+    _UPLOAD_KILL_SECONDS,
+    _never_reached_telegram,
+    _upload_timeout,
+)
+
+# A tiny clip must stop waiting in about a minute, not in eight.
+assert _upload_timeout(750 * 1024) == 64, _upload_timeout(750 * 1024)
+assert _upload_timeout(0) == 60
+assert _upload_timeout(None) == 60
+# A large file gets proportionally longer, but never past the point where the
+# far side hangs up on its own - beyond that the deadline would never be ours.
+assert _upload_timeout(50 * 1024 * 1024) == 360
+assert _upload_timeout(2000 * 1024 * 1024) == _UPLOAD_KILL_SECONDS - 20
+assert _upload_timeout(50 * 1024 * 1024 * 1024) < _UPLOAD_KILL_SECONDS
+
+
+def _wrapped(cause: BaseException) -> _TelegramNetworkError:
+    error = _TelegramNetworkError(method=None, message="x")
+    error.__cause__ = cause
+    return error
+
+
+# Only a failure to connect proves the body never went out; those are safe to
+# repeat. A disconnect while awaiting the response - the failure measured on
+# 16 Sep - may already have delivered the video, so repeating it is what put the
+# same clip in the chat three times.
+_connection_key = _aiohttp.client_reqrep.ConnectionKey(
+    "api.telegram.org", 443, False, True, None, None, None
+)
+assert _never_reached_telegram(
+    _wrapped(_aiohttp.ClientConnectorError(_connection_key, OSError("refused")))
+)
+assert not _never_reached_telegram(_wrapped(_aiohttp.ServerDisconnectedError()))
+assert not _never_reached_telegram(_wrapped(_asyncio.TimeoutError()))
+assert not _never_reached_telegram(_wrapped(_aiohttp.ClientOSError("boom")))
+print("upload deadline + retry safety OK")
+
+
 
 print("\nALL SMOKE TESTS PASSED")

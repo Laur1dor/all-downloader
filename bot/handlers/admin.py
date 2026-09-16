@@ -188,14 +188,24 @@ def create_router(admin_id: int) -> Router:
         )
         # Two separate HTML files (full, sorted by date) — easier to open inline
         # on mobile than a zip. Data accumulates in PostgreSQL; nothing is dropped.
+        # The timeout goes through the bot call: answer_document only builds a
+        # method object and takes anything else as an extra field, so the
+        # request_timeout that used to be passed here was quietly discarded and
+        # these reports ran on whatever the session default happened to be.
         users_report = await db.export_users_html()
-        await message.answer_document(
-            BufferedInputFile(users_report.encode("utf-8"), filename="users.html"),
+        await message.bot(
+            message.answer_document(
+                BufferedInputFile(users_report.encode("utf-8"), filename="users.html")
+            ),
             request_timeout=120,
         )
         conversions_report = await db.export_conversions_html()
-        await message.answer_document(
-            BufferedInputFile(conversions_report.encode("utf-8"), filename="conversions.html"),
+        await message.bot(
+            message.answer_document(
+                BufferedInputFile(
+                    conversions_report.encode("utf-8"), filename="conversions.html"
+                )
+            ),
             request_timeout=120,
         )
 

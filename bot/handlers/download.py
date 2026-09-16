@@ -6,11 +6,13 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext, suppress
 from threading import Event
+from typing import Any
 
-from aiogram import F, Router, html
+import aiohttp
+from aiogram import Bot, F, Router, html
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramNetworkError,
@@ -84,7 +86,25 @@ _DESCRIPTION_PREFIX = "desc:"
 _COMPRESS_CHOICE_TIMEOUT = 10.0
 _MEDIA_CHOICE_TIMEOUT = 10.0
 # Upload timeout for large files; the local Bot API hop is local so this is generous.
-_UPLOAD_TIMEOUT = 600
+# Uploads are bounded by the file's own size rather than by one blanket number.
+# Measured on 16 Sep 2026: the far side of this route hangs up after almost
+# exactly 500s, three separate times, so any budget above that is never reached —
+# the upload dies on someone else's timer and we learn nothing from it. Staying
+# under that line keeps the deadline ours: it ends when we say so, with a message
+# we choose. The slope is deliberately generous — a megabyte every six seconds
+# against the 10-12 MB/s this path actually measures — so a healthy upload never
+# trips it, while a 0.5 MB TikTok clip stops waiting after a minute instead of
+# eight.
+_UPLOAD_KILL_SECONDS = 500
+_UPLOAD_FLOOR_SECONDS = 60
+_UPLOAD_SECONDS_PER_MB = 6
+
+
+def _upload_timeout(size_bytes: int | None) -> int:
+    """Seconds to allow for one upload of this size."""
+    megabytes = (size_bytes or 0) / (1024 * 1024)
+    budget = _UPLOAD_FLOOR_SECONDS + megabytes * _UPLOAD_SECONDS_PER_MB
+    return int(min(budget, _UPLOAD_KILL_SECONDS - 20))
 # Telegram rejects photos larger than 10 MB — bigger images are sent as files.
 _PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
@@ -206,18 +226,51 @@ async def _delete_silently(message: Message) -> None:
         await message.delete()
 
 
+def _never_reached_telegram(error: TelegramNetworkError) -> bool:
+    """Whether the request provably never got to the server.
+
+    Only a failure to open the connection proves it: the body was never sent, so
+    sending it again cannot put a second copy in the chat. Everything else — a
+    timeout, or the server hanging up while the response is awaited — leaves the
+    upload's fate unknown, and unknown has to be read as delivered.
+
+    This is not hypothetical. The failure measured on 16 Sep was
+    ServerDisconnectedError raised from resp.start(): after the whole body had
+    gone out, while the response was awaited. A 0.75 MB file is on this wire in
+    under a second, so Telegram had it. Re-sending put the same video in the chat
+    again, and again — which is what people described as the bot spamming them.
+    """
+    return isinstance(error.__cause__, aiohttp.ClientConnectorError)
+
+
 async def _send_with_retries(
-    send: Callable[[], Awaitable[Message]], attempts: int = 3, delay: float = 2.0
+    build: Callable[[], Any],
+    bot: Bot,
+    timeout: int,
+    attempts: int = 3,
+    delay: float = 2.0,
 ) -> Message:
-    """Retry an upload on transient network failures (flaky route to Telegram)."""
+    """Send media under its own deadline, retrying only what delivered nothing.
+
+    The deadline is applied here rather than at the call site because the
+    answer_* shortcuts only build a method object and accept anything else as an
+    extra model field, so a request_timeout handed to them is silently dropped.
+    The bot call is the one place that honours it.
+    """
     for attempt in range(1, attempts + 1):
         try:
-            return await send()
-        except TelegramNetworkError:
-            if attempt == attempts:
+            return await bot(build(), request_timeout=timeout)
+        except TelegramNetworkError as error:
+            if attempt == attempts or not _never_reached_telegram(error):
                 raise
-            logger.warning("Upload attempt %d/%d failed, retrying", attempt, attempts)
-            await asyncio.sleep(delay)
+            # The cause is logged now: "attempt N failed" said nothing about
+            # which failure it was, and that is the one thing that decides
+            # whether a retry is safe.
+            logger.warning(
+                "Upload attempt %d/%d could not connect (%s), retrying",
+                attempt, attempts, error.__cause__ or error,
+            )
+            await asyncio.sleep(delay * attempt)
     raise AssertionError("unreachable")
 
 
@@ -458,7 +511,9 @@ async def _run_link(
                                     height=m.height,
                                     supports_streaming=True,
                                     reply_markup=_video_keyboard(token, wd),
-                                )
+                                ),
+                                message.bot,
+                                _upload_timeout(media.file_size),
                             )
                         # Telegram returns mkv uploads as documents — cache either kind.
                         # Each resolution is cached under its own key; the compressed
@@ -733,7 +788,7 @@ async def _deliver_single_video(
 ) -> bool:
     """Send one video from the fallback path the same way the video path does."""
     path = album.items[0]
-    width, height, duration = video_metadata(path)
+    width, height, duration = await asyncio.to_thread(video_metadata, path)
     token = url_cache.store(url)
     description = (album.description or "").strip()
     with_description = _description_capable(url, platform) and bool(description)
@@ -748,7 +803,9 @@ async def _deliver_single_video(
                     width=width, height=height, duration=duration,
                     supports_streaming=True,
                     reply_markup=_video_keyboard(token, with_description),
-                )
+                ),
+                message.bot,
+                _upload_timeout(path.stat().st_size),
             )
     except TelegramNetworkError:
         logger.exception("Network error while sending the fallback video for %s", url)
@@ -806,13 +863,17 @@ async def _deliver_album(
                     # container and gets it wrong whenever the file carries a
                     # rotation flag or non-square pixels — the video then plays
                     # stretched. video_metadata reports what the player draws.
-                    width, height, duration = video_metadata(path)
+                    width, height, duration = await asyncio.to_thread(
+                        video_metadata, path
+                    )
                     group.append(InputMediaVideo(
                         media=FSInputFile(path),
                         supports_streaming=True,
                         width=width, height=height, duration=duration,
                     ))
-                elif photo_needs_document(path, _PHOTO_MAX_BYTES):
+                elif await asyncio.to_thread(
+                    photo_needs_document, path, _PHOTO_MAX_BYTES
+                ):
                     documents.append(path)
                 else:
                     group.append(InputMediaPhoto(media=FSInputFile(path)))
@@ -825,18 +886,33 @@ async def _deliver_album(
                 group[0] = first.model_copy(update={"caption": _CAPTION})
                 caption_left = False
 
+            # Up to twelve separate sends happen under one slot here; each one
+            # now has a deadline of its own, so a wedged album cannot hold the
+            # upload queue for the sum of twelve blanket timeouts.
             async with _upload_slots:
                 if group:
-                    await message.answer_media_group(group)
+                    await message.bot(
+                        message.answer_media_group(group),
+                        request_timeout=_upload_timeout(
+                            sum(p.stat().st_size for p in album.items)
+                        ),
+                    )
                 for path in documents:
-                    await message.answer_document(
-                        FSInputFile(path),
-                        caption=_CAPTION if caption_left else None,
-                        request_timeout=_UPLOAD_TIMEOUT,
+                    await message.bot(
+                        message.answer_document(
+                            FSInputFile(path),
+                            caption=_CAPTION if caption_left else None,
+                        ),
+                        request_timeout=_upload_timeout(path.stat().st_size),
                     )
                     caption_left = False
                 if album.music is not None:
-                    await message.answer_audio(FSInputFile(album.music), caption=_CAPTION)
+                    await message.bot(
+                        message.answer_audio(
+                            FSInputFile(album.music), caption=_CAPTION
+                        ),
+                        request_timeout=_upload_timeout(album.music.stat().st_size),
+                    )
             total_size = album.total_size
             description = album.description
     except Exception:
@@ -1078,7 +1154,9 @@ async def _run_audio_flow(
                                     title=media.title,
                                     duration=media.duration,
                                     caption=_CAPTION,
-                                )
+                                ),
+                                message.bot,
+                                _upload_timeout(media.file_size),
                             )
                         sent_media = sent.audio or sent.document
                         if sent_media is not None:

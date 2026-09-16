@@ -1157,6 +1157,8 @@ _TIKTOK_IMPERSONATE = ("firefox133", "safari17_0", "chrome131", "chrome124", "ch
 # A live exit answers TikTok in about a second; a dead free node accepts the
 # connection and then says nothing, so the timeout is the whole cost of it.
 _TIKTOK_TIMEOUT = 12
+# Total budget for walking exits and fingerprints, before any video is fetched.
+_TIKTOK_WALK_SECONDS = int(os.getenv("TIKTOK_WALK_SECONDS", "150"))
 _TIKTOK_HEAD_TIMEOUT = 8
 _TIKTOK_DATA_RE = re.compile(
     r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
@@ -1257,7 +1259,16 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
     attempts = [(e, _TIKTOK_IMPERSONATE[0]) for e in exits]
     last_reason = "no response"
     geo_reason: str | None = None
+    # Eight exits, and four more fingerprints for each one that answers, is up to
+    # forty requests; at twelve seconds apiece that is eight minutes spent before
+    # a single byte of video is fetched, with nothing in the chat but a progress
+    # bar. The walk gets a budget: when it is gone, the attempt has failed and
+    # saying so is better than continuing to spend someone's wait.
+    walk_began = time.monotonic()
     while attempts:
+        if time.monotonic() - walk_began > _TIKTOK_WALK_SECONDS:
+            last_reason = f"{last_reason} (перебор выходов занял слишком долго)"
+            break
         exit_proxy, target = attempts.pop(0)
         proxies = {"http": exit_proxy, "https": exit_proxy} if exit_proxy else None
         session = cffi_requests.Session(
@@ -1366,6 +1377,37 @@ def _tiktok_variants(item: dict) -> list[dict]:
     return variants
 
 
+class StalledTransferError(Exception):
+    """A transfer that is technically alive but going nowhere."""
+
+
+# curl_cffi turns a scalar timeout on a streaming request into a low-speed abort
+# of one byte per second — a threshold a CDN trickling at 600 B/s never trips,
+# and 600 B/s is exactly what the slow rows measured (0.75 MB in 1184s). So the
+# transfer carries its own clock. The chunk is small because both clocks, and the
+# cancel button with them, are only read between chunks: at a pathological
+# 600 B/s a 32 KB chunk is 55 seconds, where a 256 KB one was seven minutes of a
+# Отменить that did nothing.
+_STREAM_CHUNK = 32 * 1024
+_STREAM_STALL_SECONDS = int(os.getenv("STREAM_STALL_SECONDS", "45"))
+# The budget follows the file, because a flat one would either cut a large
+# download short or let a tiny one trickle for minutes. Twelve seconds per
+# megabyte is about 85 KB/s — far below anything healthy, so only a genuinely
+# broken exit reaches it.
+_STREAM_FLOOR_SECONDS = 60
+_STREAM_SECONDS_PER_MB = 12
+_STREAM_CEILING_SECONDS = 600
+
+
+def _stream_budget(size_bytes: int | None) -> float:
+    """Seconds this transfer is allowed before it counts as stuck."""
+    megabytes = (size_bytes or 0) / (1024 * 1024)
+    return min(
+        _STREAM_FLOOR_SECONDS + megabytes * _STREAM_SECONDS_PER_MB,
+        _STREAM_CEILING_SECONDS,
+    )
+
+
 def _stream_to_file(
     session,
     media_url: str,
@@ -1392,10 +1434,22 @@ def _stream_to_file(
         if progress is not None:
             progress.total = total or None
         written = 0
+        budget = _stream_budget(total)
+        began = time.monotonic()
+        moved_at = began
         with open(destination, "wb") as handle:
-            for chunk in response.iter_content(262144):
+            for chunk in response.iter_content(_STREAM_CHUNK):
+                now = time.monotonic()
                 if cancel_event is not None and cancel_event.is_set():
                     raise DownloadCancelledError
+                if now - began > budget:
+                    raise StalledTransferError(
+                        f"{written} bytes in {int(now - began)}s"
+                    )
+                if chunk:
+                    moved_at = now
+                elif now - moved_at > _STREAM_STALL_SECONDS:
+                    raise StalledTransferError(f"no data for {int(now - moved_at)}s")
                 handle.write(chunk)
                 written += len(chunk)
                 if written > max_bytes:
@@ -1436,6 +1490,10 @@ def _download_tiktok_sync(
                     )
                 except (DownloadCancelledError, OversizedError):
                     raise
+                except StalledTransferError as exc:
+                    raise DownloadFailedError(
+                        f"Загрузка встала ({exc}).", retry_via_proxy=True
+                    ) from exc
                 except Exception as exc:
                     last_reason = f"{type(exc).__name__}: {exc}"
                     continue

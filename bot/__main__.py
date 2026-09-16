@@ -66,9 +66,15 @@ async def run() -> None:
     if proxy_router.enabled:
         logger.info("Adaptive VLESS routing enabled (fallback proxy: %s)", settings.proxy_url)
 
-    # Big uploads take minutes; the default 60s session timeout is not enough.
-    # (Message.answer_* shortcuts can't override the timeout per call.)
-    session_kwargs: dict = {"timeout": 600}
+    # Media uploads set their own deadline from the file size and pass it through
+    # the bot call, which is the only place aiogram honours one — the answer_*
+    # shortcuts really do swallow a request_timeout, as the note here used to
+    # say. What is left for this default is every other call, and ten minutes was
+    # far too patient for those: a failing edit of a progress bar sat for the
+    # whole of it, so the bar froze while the download underneath was still fine.
+    # Long polling is unaffected — aiogram asks getUpdates for this value plus the
+    # polling wait, so it stays comfortably above the 30s it needs.
+    session_kwargs: dict = {"timeout": 90}
     if settings.api_base_url:
         # Self-hosted telegram-bot-api server: raises the upload limit to 2 GB.
         session_kwargs["api"] = TelegramAPIServer.from_base(settings.api_base_url)
