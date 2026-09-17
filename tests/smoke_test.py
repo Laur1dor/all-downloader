@@ -489,4 +489,87 @@ assert Database._local(None) is None
 assert _REPORT_TZ.utcoffset(None) == _td(hours=3)
 print("report timezone OK")
 
+
+# --- flood limit ---
+# This one refuses messages before any handler sees them, so a mistake here is
+# a bot that quietly ignores people. The admin must never be refused.
+from bot.handlers.flood import FLOOD_MESSAGES, FLOOD_WINDOW_SECONDS, FloodMiddleware
+
+_flood = FloodMiddleware(admin_id=999)
+for _ in range(int(FLOOD_MESSAGES)):
+    assert _flood._allow(4242), 'a normal burst must pass'
+assert not _flood._allow(4242), 'past the burst it has to refuse'
+
+# A different person is unaffected by someone else's flood.
+assert _flood._allow(4243)
+
+# Told once, then left alone: answering every message of a flood is a flood.
+assert _flood._should_tell(4242)
+assert not _flood._should_tell(4242)
+
+# Seven a minute is above anyone typing and far below what the machine notices.
+assert 3 <= FLOOD_MESSAGES <= 30, FLOOD_MESSAGES
+assert FLOOD_WINDOW_SECONDS >= 10, FLOOD_WINDOW_SECONDS
+# The flood ceiling must sit above the download budget, or the budget could
+# never be reached and the two limits would be one.
+assert FLOOD_MESSAGES > _RATE_TOKENS, (FLOOD_MESSAGES, _RATE_TOKENS)
+print("flood limit OK")
+
+
+# --- Instagram without an account ---
+# The payload below is the shape measured from a real embed page on
+# 18 Sep 2026: the post sits under gql_data.shortcode_media, a carousel hangs
+# off edge_sidecar_to_children, and each item carries several resolutions.
+# If Instagram moves any of that, this fails here rather than in a chat.
+import json as _json
+
+from bot.instagram import _parse as _ig_parse, shortcode as _ig_shortcode
+
+assert _ig_shortcode('https://www.instagram.com/p/Cszjr-KsdT0/') == 'Cszjr-KsdT0'
+assert _ig_shortcode('https://www.instagram.com/reel/DdXBVddvguJ/?x=1') == 'DdXBVddvguJ'
+assert _ig_shortcode('https://www.instagram.com/someone/reel/AbC-123_x/') == 'AbC-123_x'
+assert _ig_shortcode('https://www.tiktok.com/@a/video/1') is None
+
+
+def _ig_page(payload: dict) -> str:
+    # contextJSON is a JSON string inside the page's JSON, so it is encoded twice.
+    return 'x = {"contextJSON":' + _json.dumps(_json.dumps(payload)) + '};'
+
+
+_carousel = {'gql_data': {'shortcode_media': {
+    '__typename': 'GraphSidecar',
+    'owner': {'username': 'someone'},
+    'edge_media_to_caption': {'edges': [{'node': {'text': '  a caption  '}}]},
+    'edge_sidecar_to_children': {'edges': [
+        {'node': {'is_video': False, 'display_url': 'https://cdn/small.jpg',
+                  'display_resources': [
+                      {'src': 'https://cdn/small.jpg', 'config_width': 640},
+                      {'src': 'https://cdn/big.jpg', 'config_width': 1440}]}},
+        {'node': {'is_video': True, 'video_url': 'https://cdn/clip.mp4',
+                  'display_url': 'https://cdn/thumb.jpg'}},
+    ]},
+}}}
+_post = _ig_parse(_ig_page(_carousel))
+assert len(_post.items) == 2, _post.items
+# The largest resolution, not the one sized for a feed.
+assert _post.items[0].url == 'https://cdn/big.jpg' and not _post.items[0].is_video
+# A video item is the video, never its thumbnail.
+assert _post.items[1].url == 'https://cdn/clip.mp4' and _post.items[1].is_video
+assert _post.caption == 'a caption'
+assert _post.owner == 'someone'
+
+_single = {'gql_data': {'shortcode_media': {
+    '__typename': 'GraphVideo', 'is_video': True,
+    'video_url': 'https://cdn/only.mp4', 'display_url': 'https://cdn/only.jpg',
+}}}
+_one = _ig_parse(_ig_page(_single))
+assert len(_one.items) == 1 and _one.items[0].url == 'https://cdn/only.mp4'
+assert _one.caption is None
+
+# A private account or a removed post returns nothing, and nothing must be
+# mistaken for a post with no media - the caller falls back on this.
+assert not _ig_parse('<html>no payload here</html>')
+assert not _ig_parse(_ig_page({'gql_data': {}}))
+print("instagram embed parsing OK")
+
 print("\nALL SMOKE TESTS PASSED")

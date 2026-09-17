@@ -35,6 +35,7 @@ from yt_dlp.utils import YoutubeDLError
 
 from bot.progress import ProgressState
 from bot.urlkey import is_short_link
+from bot import instagram
 from bot.proxy import forced_proxy, proxy_for, proxy_ladder
 
 logger = logging.getLogger(__name__)
@@ -1036,6 +1037,14 @@ def photo_needs_document(path: Path, max_bytes: int) -> bool:
     return (width + height) > 10000 or max(width, height) > 20 * min(width, height)
 
 
+def _ffprobe_duration(path: Path) -> int | None:
+    """Length in seconds as the file itself reports it, or None."""
+    try:
+        return int(float(_ffprobe_stream(path).get("duration") or 0)) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_media(path: Path, info: dict) -> Media:
     duration = info.get("duration")
     # The file itself is the authority: yt-dlp reports the coded size, which is
@@ -1135,6 +1144,15 @@ def download_video(
         # yt-dlp cannot fetch a TikTok page at all here; see _tiktok_item.
         return _tiktok_download(
             url, cookies_file, max_bytes, progress, cancel_event, force_proxy, size_guard,
+        )
+    if platform == "instagram" and instagram.shortcode(url):
+        # The embed page needs no session, so it is tried before the tools that
+        # do. When it comes back with anything other than one video — a private
+        # account, a carousel, a removed post — the context manager raises and
+        # the caller falls through to yt-dlp exactly as before.
+        return _instagram_first(
+            url, cookies_file, max_bytes, progress, cancel_event,
+            force_proxy, size_guard, options, platform,
         )
     return _temporary_download(
         url, options, format_override or _VIDEO_FORMAT_CAPPED, "tg-video-", max_bytes,
@@ -1417,13 +1435,18 @@ def _stream_to_file(
     cancel_event: threading.Event | None,
     size_guard: dict,
     declared_size: int | None,
+    referer: str = _TIKTOK_REFERER,
 ) -> bool:
-    """Stream one URL to disk, honouring the size limit and the cancel button."""
+    """Stream one URL to disk, honouring the size limit and the cancel button.
+
+    The referer travels with the request because media hosts check it: the CDN
+    serves a file to the site it belongs to and refuses it to everybody else.
+    """
     if declared_size and declared_size > max_bytes:
         size_guard["tripped"] = declared_size
         raise OversizedError(declared_size, max_bytes)
 
-    response = session.get(media_url, headers={"Referer": _TIKTOK_REFERER}, stream=True)
+    response = session.get(media_url, headers={"Referer": referer}, stream=True)
     try:
         if response.status_code != 200:
             return False
@@ -1571,6 +1594,110 @@ def _album_description(tmpdir: str) -> str | None:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+
+
+@asynccontextmanager
+async def _instagram_first(
+    url: str,
+    cookies_file: Path | None,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    force_proxy: bool,
+    size_guard: dict,
+    options: dict,
+    platform: str,
+) -> AsyncIterator[Media]:
+    """Embed page first; yt-dlp behind it, unchanged."""
+    try:
+        async with _instagram_video(
+            url, max_bytes, progress, cancel_event, force_proxy, size_guard
+        ) as media:
+            yield media
+            return
+    except (DownloadCancelledError, OversizedError):
+        raise
+    except Exception as exc:
+        logger.info("Instagram embed did not serve %s (%s); using yt-dlp", url, exc)
+
+    async with _temporary_download(
+        url, options, max_bytes, progress, cancel_event, size_guard, platform
+    ) as media:
+        yield media
+
+
+def _instagram_items_sync(
+    url: str,
+    tmpdir: str,
+    proxy: str | None,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    size_guard: dict,
+) -> tuple[list[Path], str | None]:
+    """Every item of an Instagram post, fetched without an account.
+
+    Returns ([], None) when the embed has nothing — a private account, a removed
+    post, or a change on Instagram's side — and the caller falls back to the
+    session-based tools rather than telling anyone the post does not exist.
+    """
+    post, session = instagram.read_post(url, proxy)
+    if not post or session is None:
+        if session is not None:
+            session.close()
+        return [], None
+
+    paths: list[Path] = []
+    try:
+        for index, item in enumerate(post.items):
+            suffix = ".mp4" if item.is_video else ".jpg"
+            destination = Path(tmpdir) / f"{index:02d}{suffix}"
+            written = _stream_to_file(
+                session, item.url, destination, max_bytes,
+                progress, cancel_event, size_guard, None,
+                referer=instagram.REFERER,
+            )
+            if written:
+                paths.append(destination)
+    finally:
+        session.close()
+    return paths, post.caption
+
+
+@asynccontextmanager
+async def _instagram_video(
+    url: str,
+    max_bytes: int,
+    progress: ProgressState | None,
+    cancel_event: threading.Event | None,
+    force_proxy: bool,
+    size_guard: dict,
+) -> AsyncIterator[Media]:
+    """A single-video Instagram post, taken from the embed page."""
+    tmpdir = tempfile.mkdtemp(prefix="tg-ig-")
+    proxy = forced_proxy("instagram") if force_proxy else proxy_for("instagram")
+    try:
+        paths, caption = await asyncio.to_thread(
+            _instagram_items_sync, url, tmpdir, proxy, max_bytes,
+            progress, cancel_event, size_guard,
+        )
+        if len(paths) != 1 or paths[0].suffix != ".mp4":
+            # Not a plain video post: either a carousel, which the album path
+            # handles, or nothing at all. Either way yt-dlp gets its turn.
+            raise DownloadFailedError("Instagram: пост не является одиночным видео.")
+        # The embed carries no duration, and Telegram draws a scrubber from it:
+        # without one the player shows a video of no length. The file is already
+        # on disk, so ffprobe is the authority anyway.
+        duration = await asyncio.to_thread(_ffprobe_duration, paths[0])
+        yield _build_media(paths[0], {
+            "title": "Instagram",
+            "description": caption,
+            "duration": duration,
+        })
+    finally:
+        await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
 
 
 def _download_album_sync(
@@ -1794,6 +1921,24 @@ async def download_album(
                     album = await asyncio.to_thread(
                         _scrape_rule34_sync, url, tmpdir, exit_proxy
                     )
+                elif _plat == "instagram" and instagram.shortcode(url):
+                    # No session, so nothing here can expire. gallery-dl still
+                    # runs when this comes back empty, which is what a private
+                    # account looks like.
+                    paths, caption = await asyncio.to_thread(
+                        _instagram_items_sync, url, tmpdir, exit_proxy,
+                        _ALBUM_ITEM_MAX_BYTES, None, None, {},
+                    )
+                    if paths:
+                        album = AlbumMedia(
+                            items=paths[:MAX_ALBUM_ITEMS], music=None,
+                            description=caption,
+                        )
+                    else:
+                        album = await asyncio.to_thread(
+                            _download_album_sync, url, tmpdir, cookies_file,
+                            exit_proxy, _ALBUM_RETRY_TIMEOUT if attempt else None,
+                        )
                 else:
                     album = await asyncio.to_thread(
                         _download_album_sync, url, tmpdir, cookies_file, exit_proxy,
@@ -1823,6 +1968,10 @@ async def download_album(
 # Retries are given a shorter budget than the first try: the first is usually
 # the only one, while a retry exists because an exit is already suspect.
 _ALBUM_MAX_EXITS = 4
+# Per item, not per post: an album is many files and the caller's ceiling is
+# for one upload. Generous, because a carousel item that trips it is a bug
+# in the reading, not a real post.
+_ALBUM_ITEM_MAX_BYTES = 512 * 1024 * 1024
 _ALBUM_RETRY_TIMEOUT = 60
 
 
