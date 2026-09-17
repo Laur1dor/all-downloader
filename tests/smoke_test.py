@@ -570,6 +570,28 @@ assert _one.caption is None
 # mistaken for a post with no media - the caller falls back on this.
 assert not _ig_parse('<html>no payload here</html>')
 assert not _ig_parse(_ig_page({'gql_data': {}}))
+
+# A video whose URL the embed withholds must not come back as its cover
+# frame. Measured on a real reel: GraphVideo, is_video true, video_duration
+# and view count present, no video_url. Handing back the still would look
+# like success and be wrong, so the post falls through to the session path.
+_withheld = {'gql_data': {'shortcode_media': {
+    '__typename': 'GraphVideo', 'is_video': True, 'video_duration': 12.3,
+    'display_url': 'https://cdn/cover.jpg',
+    'display_resources': [{'src': 'https://cdn/cover.jpg', 'config_width': 1080}],
+}}}
+assert not _ig_parse(_ig_page(_withheld)), 'a still must never stand in for a video'
+
+# And one withheld item must not leave a carousel half delivered.
+_mixed = {'gql_data': {'shortcode_media': {
+    '__typename': 'GraphSidecar',
+    'edge_sidecar_to_children': {'edges': [
+        {'node': {'is_video': False, 'display_url': 'https://cdn/a.jpg'}},
+        {'node': {'is_video': True, 'display_url': 'https://cdn/b.jpg'}},
+    ]},
+}}}
+assert not _ig_parse(_ig_page(_mixed)), 'half a carousel is not the post'
+
 print("instagram embed parsing OK")
 
 print("\nALL SMOKE TESTS PASSED")

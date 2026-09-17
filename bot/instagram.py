@@ -51,11 +51,18 @@ class InstagramItem:
     is_video: bool
 
 
+# What the embed page turned out to be holding.
+SERVED = "served"        # the payload was there
+GONE = "gone"            # the post does not exist any more
+WITHHELD = "withheld"    # the post exists, the data is not given out here
+
+
 @dataclass
 class InstagramPost:
     items: list[InstagramItem] = field(default_factory=list)
     caption: str | None = None
     owner: str | None = None
+    state: str = WITHHELD
 
     def __bool__(self) -> bool:
         return bool(self.items)
@@ -76,31 +83,57 @@ def _best_image(node: dict) -> str | None:
     return node.get("display_url")
 
 
+class WithheldMediaError(Exception):
+    """The post is a video, and the embed did not give its URL."""
+
+
 def _item_of(node: dict) -> InstagramItem | None:
-    if node.get("is_video") and node.get("video_url"):
-        return InstagramItem(node["video_url"], True)
+    if node.get("is_video"):
+        if node.get("video_url"):
+            return InstagramItem(node["video_url"], True)
+        # Measured on a real reel: __typename GraphVideo, is_video true,
+        # video_duration and view count all present — and no video_url. Falling
+        # back to display_url here would hand back the cover frame as if it were
+        # the video, which looks like success and is not. The post is simply not
+        # servable this way, so the session path gets it.
+        raise WithheldMediaError(node.get("shortcode") or "video")
     image = _best_image(node)
     return InstagramItem(image, False) if image else None
+
+
+# The page renders the post's own image even when it refuses the payload. Its
+# absence is therefore the tell: a post that is merely gated still shows
+# something, a post that is gone shows nothing at all. Measured on both.
+_RENDERED_MEDIA_RE = re.compile(r'EmbeddedMediaImage|src="https://[^"]*fbcdn[^"]*"')
+
+
+def _state_of(body: str) -> str:
+    return WITHHELD if _RENDERED_MEDIA_RE.search(body) else GONE
 
 
 def _parse(body: str) -> InstagramPost:
     found = _CONTEXT_RE.search(body)
     if not found:
-        return InstagramPost()
+        return InstagramPost(state=_state_of(body))
     try:
         # The payload is a JSON string inside the JSON of the page, so it is
         # decoded twice on purpose.
         context = json.loads(json.loads(found.group(1)))
     except ValueError:
-        return InstagramPost()
+        return InstagramPost(state=_state_of(body))
 
     post = (context.get("gql_data") or {}).get("shortcode_media") or {}
     if not post:
-        return InstagramPost()
+        return InstagramPost(state=_state_of(body))
 
     children = (post.get("edge_sidecar_to_children") or {}).get("edges") or []
     nodes = [edge.get("node") or {} for edge in children] if children else [post]
-    items = [item for item in (_item_of(node) for node in nodes) if item]
+    try:
+        items = [item for item in (_item_of(node) for node in nodes) if item]
+    except WithheldMediaError as exc:
+        # All or nothing: half a carousel is not the post either.
+        logger.info("Instagram withheld the video for %s", exc)
+        return InstagramPost(state=WITHHELD)
 
     captions = (post.get("edge_media_to_caption") or {}).get("edges") or []
     caption = None
@@ -111,6 +144,7 @@ def _parse(body: str) -> InstagramPost:
         items=items,
         caption=caption,
         owner=(post.get("owner") or {}).get("username"),
+        state=SERVED if items else _state_of(body),
     )
 
 
@@ -127,6 +161,8 @@ def read_post(url: str, proxy: str | None = None):
     if not code:
         return InstagramPost(), None
 
+    last = InstagramPost()
+
     proxies = {"http": proxy, "https": proxy} if proxy else None
     for target in _IMPERSONATE:
         session = cffi_requests.Session(
@@ -141,8 +177,9 @@ def read_post(url: str, proxy: str | None = None):
         post = _parse(body)
         if post:
             return post, session
+        last = post
         session.close()
         # An embed that comes back without a payload means a private account or
         # a removed post far more often than a refused fingerprint, but trying
         # the next one costs a single request.
-    return InstagramPost(), None
+    return last, None

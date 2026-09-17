@@ -171,6 +171,10 @@ class DownloadFailedError(Exception):
         self.retry_via_proxy = retry_via_proxy
 
 
+class PostGoneError(DownloadFailedError):
+    """The post itself is gone, so no exit and no account will find it."""
+
+
 class NotAVideoPostError(DownloadFailedError):
     """The link is a real post, but a carousel rather than a video.
 
@@ -1151,8 +1155,17 @@ def download_video(
         # account, a carousel, a removed post — the context manager raises and
         # the caller falls through to yt-dlp exactly as before.
         return _instagram_first(
-            url, cookies_file, max_bytes, progress, cancel_event,
-            force_proxy, size_guard, options, platform,
+            url, max_bytes, progress, cancel_event, force_proxy, size_guard,
+            # The fallback is handed over already built, rather than rebuilt
+            # from a copy of this argument list: a copy is free to drift from
+            # the original, and this one silently had, so every Instagram video
+            # the embed could not serve died on a TypeError instead of falling
+            # through to yt-dlp.
+            lambda: _temporary_download(
+                url, options, format_override or _VIDEO_FORMAT_CAPPED,
+                "tg-video-", max_bytes, cancel_event, size_guard,
+                capped or format_override is not None,
+            ),
         )
     return _temporary_download(
         url, options, format_override or _VIDEO_FORMAT_CAPPED, "tg-video-", max_bytes,
@@ -1601,30 +1614,26 @@ def _album_description(tmpdir: str) -> str | None:
 @asynccontextmanager
 async def _instagram_first(
     url: str,
-    cookies_file: Path | None,
     max_bytes: int,
     progress: ProgressState | None,
     cancel_event: threading.Event | None,
     force_proxy: bool,
     size_guard: dict,
-    options: dict,
-    platform: str,
+    fallback,
 ) -> AsyncIterator[Media]:
-    """Embed page first; yt-dlp behind it, unchanged."""
+    """Embed page first; whatever the caller normally does behind it."""
     try:
         async with _instagram_video(
             url, max_bytes, progress, cancel_event, force_proxy, size_guard
         ) as media:
             yield media
             return
-    except (DownloadCancelledError, OversizedError):
+    except (DownloadCancelledError, OversizedError, PostGoneError):
         raise
     except Exception as exc:
         logger.info("Instagram embed did not serve %s (%s); using yt-dlp", url, exc)
 
-    async with _temporary_download(
-        url, options, max_bytes, progress, cancel_event, size_guard, platform
-    ) as media:
+    async with fallback() as media:
         yield media
 
 
@@ -1647,6 +1656,11 @@ def _instagram_items_sync(
     if not post or session is None:
         if session is not None:
             session.close()
+        if post.state == instagram.GONE:
+            # Nothing downstream can find a post that no longer exists, and
+            # telling somebody it is "private or needs a login" sends them
+            # looking for an account to solve a problem no account solves.
+            raise PostGoneError("Этого поста больше нет — он удалён или скрыт автором.")
         return [], None
 
     paths: list[Path] = []
