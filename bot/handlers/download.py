@@ -256,11 +256,11 @@ _warned_users: set[int] = set()
 # minutes is unaffected; the check is long behind it by then.
 _STALE_AFTER_SECONDS = int(os.getenv("STALE_LINK_SECONDS", "180"))
 
-# Per-user token bucket: three links a minute, refilling one every twenty
-# seconds. Charged on every link, including one that is already cached — the
-# point is not only to spare the machine but to stop one person queueing work
-# faster than it can be done, and a link that is answered instantly still costs
-# a message and a place in the queue.
+# Per-user token bucket: three downloads a minute, refilling one every twenty
+# seconds. Charged where real work begins, so a stale link, a cache hit or the
+# audio branch cost nothing — they cost the machine nothing either. Pasting one
+# link repeatedly is held by the flood limit in bot/handlers/flood.py, which
+# counts messages; this one counts work.
 _RATE_TOKENS = 3.0
 _RATE_WINDOW_SECONDS = 60.0
 _rate_buckets: dict[int, tuple[float, float]] = {}
@@ -514,18 +514,6 @@ async def handle_link(
             )
             return
 
-    # The budget is charged at the door, on every link, so it also bounds how
-    # much work one person can line up: three a minute means no one can put a
-    # fourth video in the queue while three are still ahead of it.
-    if not is_admin:
-        wait = _rate_delay(user_id)
-        if wait > 0:
-            await message.answer(
-                f"🐢 Не больше {int(_RATE_TOKENS)} ссылок в минуту. "
-                f"Следующую приму через {max(1, int(wait))} с."
-            )
-            return
-
     # Solo mode: the admin reserves the whole pipe for a heavy upload.
     if config.solo_mode and not is_admin:
         await message.answer("⏸ Бот временно занят. Попробуйте через несколько минут.")
@@ -612,6 +600,25 @@ async def _run_link(
         if choice_message is not None:
             await _delete_silently(choice_message)
         return
+
+    # Everything above this point is free — a stale link, a cache hit, a link
+    # that turned out to be audio. The budget is charged here, where the machine
+    # is about to do real work, so it limits the people actually making it work
+    # and never the ones being served from something already done. Pasting the
+    # same link over and over is bounded by the flood limit in front of every
+    # router instead, which is the right shape for it: that costs messages, not
+    # downloads.
+    if not is_admin:
+        wait = _rate_delay(user_id)
+        if wait > 0:
+            if choice_message is not None:
+                await _delete_silently(choice_message)
+            await message.answer(
+                f"🐢 Не больше {int(_RATE_TOKENS)} загрузок в минуту. "
+                f"Следующую приму через {max(1, int(wait))} с — "
+                "всё, что уже скачано, по-прежнему отдаётся мгновенно."
+            )
+            return
 
     # Carousel/photo posts go straight to gallery-dl: yt-dlp would either fail
     # (TikTok /photo/) or silently drop the photos of a mixed Instagram post.

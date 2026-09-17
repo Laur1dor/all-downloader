@@ -27,17 +27,26 @@ logger = logging.getLogger(__name__)
 
 
 async def _set_command_menus(bot: Bot, settings: Settings) -> None:
-    """Public menu for everyone; the admin's chat additionally shows /admin24."""
+    """Public menu for everyone; the operator's chat gets the rest of it.
+
+    The admin commands are scoped to one chat, so nobody else is even offered
+    them. /restart used to sit in the public list, which advertised a command to
+    every user that the router rejects for all of them - the only thing that
+    reached them was the fallback's "I do not understand".
+    """
     public = [
         BotCommand(command="start", description="Запустить бота"),
         BotCommand(command="suggest", description="💡 Предложить идею или сайт"),
-        BotCommand(command="restart", description="Перезапустить бота"),
     ]
     await bot.set_my_commands(public)
     admin = [
         *public,
-        BotCommand(command="admin24", description="Статистика бота"),
+        BotCommand(command="stats", description="📈 Итоги за период"),
+        BotCommand(command="admin24", description="Статистика и выгрузки"),
         BotCommand(command="control", description="Панель управления"),
+        BotCommand(command="vpn", description="🛡 Конфиги VPN"),
+        BotCommand(command="forget", description="🗑 Забыть ссылку в кэше"),
+        BotCommand(command="restart", description="♻️ Перезапустить бота"),
     ]
     try:
         await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=settings.admin_id))
