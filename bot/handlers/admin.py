@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import html
 import logging
+import os
 import signal
 from contextlib import suppress
 
@@ -299,6 +300,35 @@ def _render_stats(label: str, data: dict) -> str:
     return NEWLINE.join(lines)
 
 
+# instagrapi lives in its own virtualenv; see the Dockerfile for why.
+_IGLOGIN_PYTHON = os.getenv("IGLOGIN_PYTHON", "/opt/iglogin/bin/python")
+_IGLOGIN_SCRIPT = os.getenv("IGLOGIN_SCRIPT", "/app/scripts/iglogin.py")
+# Logging in is rate-limited by Instagram far more harshly than reading is, and
+# a login storm is how an account gets locked rather than refreshed.
+_IGLOGIN_TIMEOUT = 300
+
+
+async def _run_iglogin() -> tuple[bool, str]:
+    """Run the login helper; returns (ok, what it said)."""
+    process = await asyncio.create_subprocess_exec(
+        _IGLOGIN_PYTHON, _IGLOGIN_SCRIPT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(), timeout=_IGLOGIN_TIMEOUT
+        )
+    except TimeoutError:
+        process.kill()
+        return False, "Не дождался — вход занял больше пяти минут."
+    output = (stdout or b"").decode("utf-8", "replace").strip()
+    # The helper prints nothing secret, but the mailbox and account names could
+    # appear in a library traceback, so only its own lines are shown.
+    lines = [ln for ln in output.splitlines() if ln.startswith("[iglogin]")]
+    return process.returncode == 0, NEWLINE.join(lines[-12:]) or output[-500:]
+
+
 def create_router(admin_id: int) -> Router:
     router = Router(name="admin")
     router.message.filter(F.from_user.id == admin_id)
@@ -363,6 +393,31 @@ def create_router(admin_id: int) -> Router:
                 await callback.message.edit_text(
                     _render_stats(label, data), reply_markup=_period_keyboard(key)
                 )
+
+    @router.message(Command("iglogin"))
+    async def handle_iglogin(message: Message) -> None:
+        """Log into Instagram from the server and store the session.
+
+        The manual loop failed three times running: export cookies from a
+        browser, watch them die a fortnight later, export them again. This does
+        the same thing from the machine that actually uses the session, so it
+        can be repeated without anybody being there.
+        """
+        if not os.getenv("IG_USERNAME"):
+            await message.answer(
+                "\u26a0 Не настроено. В <code>.env</code> нужны "
+                "<code>IG_USERNAME</code>, <code>IG_PASSWORD</code> и доступ к "
+                "почте: <code>IG_IMAP_HOST</code>, <code>IG_IMAP_USER</code>, "
+                "<code>IG_IMAP_PASSWORD</code>."
+            )
+            return
+        notice = await message.answer("\U0001f511 Вхожу в Instagram…")
+        ok, report = await _run_iglogin()
+        head = "\u2705 Сессия получена." if ok else "\u26a0 Войти не удалось."
+        with suppress(TelegramBadRequest):
+            await notice.edit_text(
+                head + NEWLINE + NEWLINE + "<pre>" + html.escape(report) + "</pre>"
+            )
 
     @router.message(Command("control"))
     async def handle_control(message: Message) -> None:

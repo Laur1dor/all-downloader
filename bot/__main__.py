@@ -45,6 +45,7 @@ async def _set_command_menus(bot: Bot, settings: Settings) -> None:
         BotCommand(command="admin24", description="Статистика и выгрузки"),
         BotCommand(command="control", description="Панель управления"),
         BotCommand(command="vpn", description="🛡 Конфиги VPN"),
+        BotCommand(command="iglogin", description="🔑 Войти в Instagram"),
         BotCommand(command="forget", description="🗑 Забыть ссылку в кэше"),
         BotCommand(command="restart", description="♻️ Перезапустить бота"),
     ]
