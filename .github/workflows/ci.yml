@@ -80,11 +80,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: compose.yml is valid
-        # Every value the file interpolates has a default or is supplied here,
-        # so this checks the shape of the file and not the contents of a .env
-        # that deliberately never leaves the server.
         env:
           DB_NAME: ci
           DB_USER: ci
           DB_PASSWORD: ci
-        run: docker compose -f compose.yml config --quiet
+        run: |
+          # compose.yml declares env_file: .env, and .env is by design never in
+          # the repository, so compose has nothing to read and refuses the file.
+          # A throwaway one written here lets the shape of compose.yml be
+          # checked without its real contents existing anywhere but the server.
+          # Written rather than copied from .env.example, so a stray inline
+          # comment in the example cannot turn into a CI failure about nothing.
+          {
+            echo BOT_TOKEN=x
+            echo ADMIN_ID=1
+            echo DB_NAME=ci
+            echo DB_USER=ci
+            echo DB_PASSWORD=ci
+          } > .env
+          docker compose -f compose.yml config --quiet
