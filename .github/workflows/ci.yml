@@ -1,0 +1,90 @@
+name: CI
+
+# The tests run inside the image the bot actually ships in, rather than against
+# a pip install on the runner. The dependency set here is fussy — aiogram pins
+# aiohttp, curl_cffi carries its own TLS build, yt-dlp and gallery-dl move
+# constantly — so "it passed in CI" is only worth something if CI is the same
+# ground the thing runs on.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read, and nothing else. Nothing here publishes, comments or tags, and a token
+# that cannot write is one that cannot be turned against the repository by
+# anything that finds its way into a build. Note the trigger is pull_request and
+# not pull_request_target: a pull request from a fork runs without access to
+# repository secrets, which is the whole difference between the two.
+permissions:
+  contents: read
+
+concurrency:
+  # A second push supersedes the first: nothing here is worth finishing twice.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the bot image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: bot-ci:${{ github.sha }}
+          # Without a cache every run reinstalls ffmpeg, the whole requirements
+          # set and spotdl's own venv, which is minutes of nothing.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke tests
+        # Mounted over the image's own copy so the tests see the checkout,
+        # including proxy/ and tests/, exactly as the deploy does on the server.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            bot-ci:${{ github.sha }} python -m tests.smoke_test
+
+  images:
+    # The bot image is covered by the job above; these are the ones that would
+    # otherwise only be found broken at deploy time.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile.xray, Dockerfile.singbox, Dockerfile.botapi, Dockerfile.awg]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.dockerfile }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: compose.yml is valid
+        # Every value the file interpolates has a default or is supplied here,
+        # so this checks the shape of the file and not the contents of a .env
+        # that deliberately never leaves the server.
+        env:
+          DB_NAME: ci
+          DB_USER: ci
+          DB_PASSWORD: ci
+        run: docker compose -f compose.yml config --quiet
