@@ -1,0 +1,25 @@
+# A browser, for the one job that needs one.
+#
+# Instagram answers a new device with a checkpoint that renders only as a page,
+# and the session cookie it eventually hands out is HttpOnly. Both of those are
+# walls to a script making requests and neither is a wall to a browser being
+# driven, so this image exists to hold one — and nothing else. Chromium only:
+# the full Playwright image carries three browsers and most of a gigabyte that
+# would sit unused on a disk that is not large.
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+
+RUN pip install --no-cache-dir playwright==1.56.0 \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY scripts/iglogin_browser.py /app/scripts/iglogin_browser.py
+COPY scripts/iglogin-entrypoint.sh /usr/local/bin/iglogin-entrypoint.sh
+RUN chmod +x /usr/local/bin/iglogin-entrypoint.sh \
+    && sed -i 's/\r$//' /usr/local/bin/iglogin-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/iglogin-entrypoint.sh"]

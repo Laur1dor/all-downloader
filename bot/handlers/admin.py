@@ -13,7 +13,10 @@ import html
 import logging
 import os
 import signal
+import time
+import sys
 from contextlib import suppress
+from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -300,33 +303,35 @@ def _render_stats(label: str, data: dict) -> str:
     return NEWLINE.join(lines)
 
 
-# instagrapi lives in its own virtualenv; see the Dockerfile for why.
-_IGLOGIN_PYTHON = os.getenv("IGLOGIN_PYTHON", "/opt/iglogin/bin/python")
-_IGLOGIN_SCRIPT = os.getenv("IGLOGIN_SCRIPT", "/app/scripts/iglogin.py")
-# Logging in is rate-limited by Instagram far more harshly than reading is, and
-# a login storm is how an account gets locked rather than refreshed.
-_IGLOGIN_TIMEOUT = 300
+# The login needs a browser, which lives in its own container; the bot asks for
+# one by dropping a file, the same way the tunnels are asked to reload. Handing
+# the bot the docker socket would hand it root on the host, and a login helper
+# is not worth that.
+_IGLOGIN_REQUEST = Path(os.getenv("IG_REQUEST_FILE", "data/iglogin_request"))
+_IGLOGIN_RESULT = Path(os.getenv("IG_RESULT_FILE", "data/iglogin_result.txt"))
+# Long, because the slow part is waiting for Instagram to send a code by mail.
+_IGLOGIN_TIMEOUT = 420
 
 
 async def _run_iglogin() -> tuple[bool, str]:
-    """Run the login helper; returns (ok, what it said)."""
-    process = await asyncio.create_subprocess_exec(
-        _IGLOGIN_PYTHON, _IGLOGIN_SCRIPT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    """Ask the browser container to sign in; returns (ok, what it said)."""
+    with suppress(FileNotFoundError):
+        _IGLOGIN_RESULT.unlink()
+    _IGLOGIN_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+    _IGLOGIN_REQUEST.write_text(str(int(time.time())), encoding="utf-8")
+
+    deadline = time.monotonic() + _IGLOGIN_TIMEOUT
+    while time.monotonic() < deadline:
+        await asyncio.sleep(5)
+        if not _IGLOGIN_RESULT.exists():
+            continue
+        report = _IGLOGIN_RESULT.read_text(encoding="utf-8", errors="replace")
+        head, _, body = report.partition(NEWLINE)
+        return head.strip() == "OK", body.strip() or head.strip()
+    return False, (
+        "Не дождался ответа. Контейнер iglogin запущен? "
+        "docker compose up -d iglogin"
     )
-    try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(), timeout=_IGLOGIN_TIMEOUT
-        )
-    except TimeoutError:
-        process.kill()
-        return False, "Не дождался — вход занял больше пяти минут."
-    output = (stdout or b"").decode("utf-8", "replace").strip()
-    # The helper prints nothing secret, but the mailbox and account names could
-    # appear in a library traceback, so only its own lines are shown.
-    lines = [ln for ln in output.splitlines() if ln.startswith("[iglogin]")]
-    return process.returncode == 0, NEWLINE.join(lines[-12:]) or output[-500:]
 
 
 def create_router(admin_id: int) -> Router:
@@ -411,7 +416,10 @@ def create_router(admin_id: int) -> Router:
                 "<code>IG_IMAP_PASSWORD</code>."
             )
             return
-        notice = await message.answer("\U0001f511 Вхожу в Instagram…")
+        notice = await message.answer(
+            "\U0001f511 Вхожу в Instagram… это может занять пару минут: "
+            "надо дождаться кода на почту."
+        )
         ok, report = await _run_iglogin()
         head = "\u2705 Сессия получена." if ok else "\u26a0 Войти не удалось."
         with suppress(TelegramBadRequest):

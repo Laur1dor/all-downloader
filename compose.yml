@@ -154,6 +154,24 @@ services:
       - ./data:/app/data
     restart: unless-stopped
 
+  # Holds a browser for the one job that needs one: signing into Instagram.
+  # The checkpoint Instagram shows a new device renders only as a page, and the
+  # session cookie it hands out is HttpOnly — both are walls to a script and
+  # neither is a wall to a driven browser. Idle almost always; it wakes when the
+  # bot drops data/iglogin_request and goes straight back to sleep.
+  iglogin:
+    build:
+      context: .
+      dockerfile: Dockerfile.iglogin
+    container_name: iglogin
+    env_file:
+      - .env
+    dns:
+      - ${DNS_SERVER:-172.18.0.1}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
   # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's
   # MTProto is often DPI-throttled even where HTTPS works, so the self-hosted Bot
   # API needs one to reach Telegram at all. Which tunnel is TUN2SOCKS_PROXY's

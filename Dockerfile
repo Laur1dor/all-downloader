@@ -21,14 +21,6 @@ RUN python -m venv /opt/spotdl \
     && /opt/spotdl/bin/pip install --no-cache-dir spotdl \
     && chmod -R a+rx /opt/spotdl
 
-# instagrapi in a venv of its own, for the same reason: it brings a large
-# dependency tree and none of it belongs near the pins yt-dlp, gallery-dl and
-# aiogram already argue over. Only scripts/iglogin.py ever runs with it.
-RUN python -m venv /opt/iglogin \
-    && /opt/iglogin/bin/pip install --no-cache-dir instagrapi==3.0.4 \
-    && chmod -R a+rx /opt/iglogin
-
-COPY scripts/iglogin.py /app/scripts/iglogin.py
 COPY bot/ ./bot/
 # Optional legacy statistics dump, imported automatically on first start with an
 # empty DB. The bracket glob makes the copy a no-op when the file is absent
