@@ -7,13 +7,15 @@ they did not exist, so they cannot be discovered or bypassed via callbacks.
 
 from __future__ import annotations
 
+import asyncio
+import gzip
 import html
 import logging
 import signal
 from contextlib import suppress
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -170,6 +172,49 @@ def _control_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# The reports are the largest thing this bot ever sends to one chat, and they go
+# over the same route that drops connections mid-upload. Three things make that
+# survivable, none of which were here before: a flat deadline generous enough for
+# the payload, retries on ANY network failure, and a size fallback.
+#
+# Retrying anything is only safe because these land in the operator's own chat: a
+# duplicate report is a shrug, where a duplicate video for a user was the bug
+# that started all of this. The user-facing sender deliberately refuses to retry
+# what may already have arrived; this one deliberately does.
+_REPORT_TIMEOUT = 180
+_REPORT_ATTEMPTS = 3
+# Past this, the markup is shipped compressed. HTML of a table is mostly markup,
+# so gzip takes roughly a tenth of it, and a tenth of the bytes is a far bigger
+# change in the odds of arriving than any retry policy.
+_REPORT_GZIP_OVER = 4 * 1024 * 1024
+
+
+async def _send_report(message: Message, filename: str, report: str) -> bool:
+    """Send one report, returning whether it actually arrived."""
+    payload = report.encode("utf-8")
+    if len(payload) > _REPORT_GZIP_OVER:
+        payload = gzip.compress(payload, compresslevel=6)
+        filename += ".gz"
+    for attempt in range(1, _REPORT_ATTEMPTS + 1):
+        try:
+            await message.bot(
+                message.answer_document(
+                    BufferedInputFile(payload, filename=filename)
+                ),
+                request_timeout=_REPORT_TIMEOUT,
+            )
+            return True
+        except TelegramNetworkError as error:
+            logger.warning(
+                "Report %s attempt %d/%d failed (%s)",
+                filename, attempt, _REPORT_ATTEMPTS, error.__cause__ or error,
+            )
+            if attempt == _REPORT_ATTEMPTS:
+                return False
+            await asyncio.sleep(2.0 * attempt)
+    return False
+
+
 def create_router(admin_id: int) -> Router:
     router = Router(name="admin")
     router.message.filter(F.from_user.id == admin_id)
@@ -188,26 +233,29 @@ def create_router(admin_id: int) -> Router:
         )
         # Two separate HTML files (full, sorted by date) — easier to open inline
         # on mobile than a zip. Data accumulates in PostgreSQL; nothing is dropped.
-        # The timeout goes through the bot call: answer_document only builds a
-        # method object and takes anything else as an extra field, so the
-        # request_timeout that used to be passed here was quietly discarded and
-        # these reports ran on whatever the session default happened to be.
-        users_report = await db.export_users_html()
-        await message.bot(
-            message.answer_document(
-                BufferedInputFile(users_report.encode("utf-8"), filename="users.html")
-            ),
-            request_timeout=120,
-        )
-        conversions_report = await db.export_conversions_html()
-        await message.bot(
-            message.answer_document(
-                BufferedInputFile(
-                    conversions_report.encode("utf-8"), filename="conversions.html"
-                )
-            ),
-            request_timeout=120,
-        )
+        sent, failed = [], []
+        for name, build in (
+            ("users.html", db.export_users_html),
+            ("conversions.html", db.export_conversions_html),
+        ):
+            try:
+                report = await build()
+            except Exception:
+                logger.exception("Could not build %s", name)
+                failed.append(name)
+                continue
+            if await _send_report(message, name, report):
+                sent.append(name)
+            else:
+                failed.append(name)
+        if failed:
+            # Saying which file did not make it is the difference between "the
+            # command is broken" and "the link dropped one file, ask again".
+            await message.answer(
+                "⚠️ Не удалось отправить: <b>" + ", ".join(failed) + "</b>."
+                + (" Отправлено: " + ", ".join(sent) + "." if sent else "")
+                + " Попробуйте ещё раз."
+            )
 
     @router.message(Command("control"))
     async def handle_control(message: Message) -> None:

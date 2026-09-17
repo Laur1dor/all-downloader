@@ -116,7 +116,13 @@ class Database:
         """Create the pool, retrying while PostgreSQL is still starting up."""
         for attempt in range(1, attempts + 1):
             try:
-                self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=10)
+                # command_timeout: without one every query waits forever, so a table lock
+                # or a stalled backend hangs the handler that issued it — and with
+                # ten connections in the pool, a handful of those take the bot with
+                # them. Nothing here legitimately runs for half a minute.
+                self._pool = await asyncpg.create_pool(
+                    self._dsn, min_size=1, max_size=10, command_timeout=30
+                )
                 logger.info("Connected to PostgreSQL")
                 return
             except (OSError, asyncpg.PostgresError) as exc:

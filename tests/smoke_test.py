@@ -311,5 +311,118 @@ assert not _never_reached_telegram(_wrapped(_aiohttp.ClientOSError("boom")))
 print("upload deadline + retry safety OK")
 
 
+# --- upload admission, admin reservation, per-user budget ---
+from bot.handlers.download import (
+    _RATE_TOKENS,
+    _RATE_WINDOW_SECONDS,
+    _STALE_AFTER_SECONDS,
+    _UPLOAD_LANE_BYTES,
+    _UploadCapacity,
+    _rate_buckets,
+    _rate_delay,
+)
+
+_SMALL = 1024
+_BIG = _UPLOAD_LANE_BYTES + 1
+
+
+async def _admission_checks() -> None:
+    cap = _UploadCapacity()
+    release = _asyncio.Event()
+    holding = []
+
+    async def hold(size, is_admin):
+        async with cap.slot(size, is_admin):
+            holding.append(size)
+            await release.wait()
+
+    # Two small uploads run together. That second lane is the whole point: one
+    # wedged upload used to hold the only place there was, for its whole ladder.
+    first = [_asyncio.create_task(hold(_SMALL, False)) for _ in range(2)]
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 2, holding
+
+    # The third waits.
+    third = _asyncio.create_task(hold(_SMALL, False))
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 2, "a third small upload must wait"
+
+    # The admin is admitted with both user lanes full. This is the case that
+    # deadlocks if the operator ever has to queue behind anybody: nothing would
+    # release, because the thing holding the lanes is waiting on the operator.
+    async def admin_upload():
+        async with cap.slot(_BIG, True):
+            return "admitted"
+
+    assert await _asyncio.wait_for(admin_upload(), timeout=1) == "admitted"
+
+    # Letting the first two go lets the waiter through.
+    release.set()
+    await _asyncio.wait_for(_asyncio.gather(*first, third), timeout=2)
+    assert cap._small == 0 and cap._large == 0 and cap._admin == 0, (
+        cap._small, cap._large, cap._admin,
+    )
+
+    # A large upload runs alone: two at once only halve each other and double the
+    # time both spend exposed to a route that drops connections.
+    release = _asyncio.Event()
+    holding.clear()
+    big = _asyncio.create_task(hold(_BIG, False))
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 1
+    second_big = _asyncio.create_task(hold(_BIG, False))
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 1, "a second large upload must wait"
+    release.set()
+    await _asyncio.wait_for(_asyncio.gather(big, second_big), timeout=2)
+    assert cap._large == 0
+
+
+async def _reservation_check() -> None:
+    """While the operator uploads, the users' small lane gives up a place."""
+    cap = _UploadCapacity()
+    release = _asyncio.Event()
+    holding = []
+
+    async def hold(size, is_admin):
+        async with cap.slot(size, is_admin):
+            holding.append(size)
+            await release.wait()
+
+    admin = _asyncio.create_task(hold(_SMALL, True))
+    await _asyncio.sleep(0.05)
+    user_one = _asyncio.create_task(hold(_SMALL, False))
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 2, holding
+    # Narrowed to one place, so the second user waits - but the lane is never
+    # closed outright, which is what max(1, ...) guarantees.
+    user_two = _asyncio.create_task(hold(_SMALL, False))
+    await _asyncio.sleep(0.05)
+    assert len(holding) == 2, "the reservation must narrow the user lane"
+    release.set()
+    await _asyncio.wait_for(_asyncio.gather(admin, user_one, user_two), timeout=2)
+    assert cap._small == 0 and cap._admin == 0
+
+
+_asyncio.run(_admission_checks())
+_asyncio.run(_reservation_check())
+print("upload admission + admin reservation OK")
+
+# The budget: a burst is fine, a flood is not, and it refills.
+_rate_buckets.clear()
+for _ in range(int(_RATE_TOKENS)):
+    assert _rate_delay(4242) == 0.0
+blocked = _rate_delay(4242)
+assert blocked > 0, blocked
+# What it reports is the time to earn one token back, never the whole window.
+assert blocked <= _RATE_WINDOW_SECONDS / _RATE_TOKENS + 1, blocked
+_rate_buckets.clear()
+
+# Ten minutes at the door catches a restart backlog without cancelling anyone
+# who merely waited their turn in the queue.
+assert _STALE_AFTER_SECONDS >= 300
+print("user budget + staleness OK")
+
+
 
 print("\nALL SMOKE TESTS PASSED")

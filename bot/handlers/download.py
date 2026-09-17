@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext, suppress
+from datetime import datetime, timezone
 from threading import Event
 from typing import Any
 
@@ -121,15 +122,128 @@ def _remember_description(token: str, description: str) -> None:
     while len(_album_descriptions) > 500:
         _album_descriptions.popitem(last=False)
 
-# Machine protection: cap concurrent non-admin downloads and serialise uploads
-# so the uplink isn't saturated. The admin bypasses both (priority).
+# Machine protection: cap concurrent non-admin downloads. The admin bypasses it.
 _download_slots = asyncio.Semaphore(3)
-_upload_slots = asyncio.Semaphore(1)
+
+# Upload admission. Uploads used to be serialised outright, one at a time, and a
+# single wedged one held that place for its whole retry ladder — which is how one
+# stuck 0.5 MB clip made everybody else wait. Measured offered load is about
+# 0.3% of the link (roughly fifty uploads a day of a few seconds each), so there
+# is no congestion here to regulate and nothing a regulator could even measure at
+# two samples an hour. The problem was never throughput; it was one job blocking
+# the queue. So: a second lane, and a lane of its own for large files, which
+# would otherwise halve each other's speed and double the time both spend
+# exposed to a route that drops connections.
+_UPLOAD_LANE_BYTES = 32 * 1024 * 1024
+_UPLOAD_LANE_SMALL = 2
+_UPLOAD_LANE_LARGE = 1
+
+
+class _UploadCapacity:
+    """Who may upload right now.
+
+    The admin never waits — that is the whole of "admin first" that can honestly
+    be offered, since an HTTP upload already in flight cannot be cut short. On
+    top of admission, while an admin upload is running the users' small lane
+    gives up one of its places, so the operator gets a larger share of the link
+    rather than merely being let in first.
+
+    Deliberately not an asyncio.Semaphore that gets resized: shrinking one means
+    absorbing permits, and two shrinks racing with releases can strand them for
+    good, leaving a limiter that admits nobody and can never recover.
+    """
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._small = 0
+        self._large = 0
+        self._admin = 0
+
+    def _has_room(self, large: bool) -> bool:
+        if large:
+            return self._large < _UPLOAD_LANE_LARGE
+        # max(1, ...) — the reservation narrows the lane, it never closes it.
+        return self._small < max(1, _UPLOAD_LANE_SMALL - self._admin)
+
+    @asynccontextmanager
+    async def slot(self, size_bytes: int | None, is_admin: bool):
+        large = (size_bytes or 0) >= _UPLOAD_LANE_BYTES
+        async with self._cond:
+            if is_admin:
+                self._admin += 1
+            else:
+                await self._cond.wait_for(lambda: self._has_room(large))
+                if large:
+                    self._large += 1
+                else:
+                    self._small += 1
+            self._cond.notify_all()
+        try:
+            yield
+        finally:
+            async with self._cond:
+                if is_admin:
+                    self._admin -= 1
+                elif large:
+                    self._large -= 1
+                else:
+                    self._small -= 1
+                # notify_all, not notify: a release can free room for a waiter in
+                # either lane, and waking only one can leave the other asleep
+                # until a release that may never come.
+                self._cond.notify_all()
+
+
+_upload_capacity = _UploadCapacity()
 
 # Anti-spam: each non-admin user may have only one link download in flight.
 # A user who pastes more links while busy is warned once and then ignored.
 _busy_users: set[int] = set()
 _warned_users: set[int] = set()
+
+# A link that sat in Telegram's queue while the bot was wedged is almost never
+# still wanted by the time it is delivered: the person gave up, or sent it again,
+# and downloading all of it at once is how the bot came back from a freeze and
+# immediately buried itself. Ten minutes is deliberately generous — this is meant
+# to catch a restart backlog, not someone who waited their turn.
+_STALE_AFTER_SECONDS = 600
+
+# Per-user token bucket: room for a normal burst of links to a friend, not
+# enough for one person to keep the machine busy. Charged when work actually
+# starts, so a stale link or a cache hit costs nothing.
+_RATE_TOKENS = 5.0
+_RATE_WINDOW_SECONDS = 600.0
+_rate_buckets: dict[int, tuple[float, float]] = {}
+
+# Expansion is a walk over the proxy ladder, so ten identical pastes would pay it
+# ten times before anything could notice they are the same link. Remembering the
+# raw string is what makes a repeated paste cheap.
+_expanded_links: OrderedDict[str, str] = OrderedDict()
+
+
+def _remember_expansion(raw: str, expanded: str) -> None:
+    _expanded_links[raw] = expanded
+    _expanded_links.move_to_end(raw)
+    while len(_expanded_links) > 500:
+        _expanded_links.popitem(last=False)
+
+
+def _rate_delay(user_id: int) -> float:
+    """Seconds this user must wait, or 0.0 when they may proceed.
+
+    A token is taken on success, so this both asks and charges.
+    """
+    now = time.monotonic()
+    tokens, stamp = _rate_buckets.get(user_id, (_RATE_TOKENS, now))
+    tokens = min(
+        _RATE_TOKENS,
+        tokens + (now - stamp) * _RATE_TOKENS / _RATE_WINDOW_SECONDS,
+    )
+    if tokens < 1.0:
+        _rate_buckets[user_id] = (tokens, now)
+        return (1.0 - tokens) * _RATE_WINDOW_SECONDS / _RATE_TOKENS
+    _rate_buckets[user_id] = (tokens - 1.0, now)
+    return 0.0
 
 
 @asynccontextmanager
@@ -328,6 +442,28 @@ async def handle_link(
 ) -> None:
     user_id = message.from_user.id
     is_admin = user_id == settings.admin_id
+
+    # Telegram holds updates for a wedged bot and delivers the lot at once when
+    # it recovers. Those links are almost never still wanted — the person gave up
+    # or sent them again — and downloading all of them is how the bot came back
+    # from a freeze straight into another one. Ten minutes is deliberately
+    # generous: this is meant to catch a restart backlog, not somebody who
+    # waited their turn in a queue.
+    if not is_admin and message.date is not None:
+        age = (datetime.now(timezone.utc) - message.date).total_seconds()
+        # The upper bound is a guard against the machine's own clock rather than
+        # against old links: Telegram drops undelivered updates after a day, so
+        # anything "older" than that is the host having drifted, and dropping
+        # live links because of a bad clock would be far worse than keeping a
+        # stale one. NTP is not running on this box.
+        if _STALE_AFTER_SECONDS < age < 86400:
+            logger.info("Dropping stale link from %s (%.0fs old)", user_id, age)
+            await message.answer(
+                "⌛ Эта ссылка пролежала слишком долго, пока бот был занят, "
+                "и я её пропускаю. Отправьте ещё раз, если всё ещё нужна."
+            )
+            return
+
     # Solo mode: the admin reserves the whole pipe for a heavy upload.
     if config.solo_mode and not is_admin:
         await message.answer("⏸ Бот временно занят. Попробуйте через несколько минут.")
@@ -355,7 +491,17 @@ async def _run_link(
     # internal services through the bot and map the network from the errors.
     # A per-share short link hides the post's identity behind a redirect, and the
     # cache cannot recognise the video until it is expanded.
-    url = await expand_short_link(url)
+    # Expansion walks the proxy ladder, so ten identical pastes would each pay
+    # for it before anything could notice they are the same link.
+    raw_url = url
+    cached_expansion = _expanded_links.get(raw_url)
+    if cached_expansion is not None:
+        url = cached_expansion
+        _expanded_links.move_to_end(raw_url)
+    else:
+        url = await expand_short_link(url)
+        if url != raw_url:
+            _remember_expansion(raw_url, url)
     platform = detect_platform(url)
 
     try:
@@ -404,6 +550,22 @@ async def _run_link(
         if choice_message is not None:
             await _delete_silently(choice_message)
         return
+
+    # Everything above this point is free — a stale link, a cache hit, a link
+    # that turned out to be audio. The budget is charged here, where the machine
+    # is about to do actual work, so the people it limits are the ones actually
+    # making it work.
+    if not is_admin:
+        wait = _rate_delay(user_id)
+        if wait > 0:
+            if choice_message is not None:
+                await _delete_silently(choice_message)
+            await message.answer(
+                f"🐢 Слишком много ссылок подряд. Следующую приму через "
+                f"{int(wait) // 60 + 1} мин — всё, что уже скачано, "
+                "по-прежнему отдаётся мгновенно."
+            )
+            return
 
     # Carousel/photo posts go straight to gallery-dl: yt-dlp would either fail
     # (TikTok /photo/) or silently drop the photos of a mixed Instagram post.
@@ -501,7 +663,7 @@ async def _run_link(
                         with_description = _description_capable(url, platform) and bool(
                             media.description and media.description.strip()
                         )
-                        async with (nullcontext() if is_admin else _upload_slots):
+                        async with _upload_capacity.slot(media.file_size, is_admin):
                             sent = await _send_with_retries(
                                 lambda m=media, wd=with_description: message.answer_video(
                                     FSInputFile(m.path),
@@ -785,6 +947,7 @@ async def _deliver_single_video(
     user_id: int,
     started: float,
     url_cache: UrlCache,
+    is_admin: bool = False,
 ) -> bool:
     """Send one video from the fallback path the same way the video path does."""
     path = album.items[0]
@@ -795,7 +958,7 @@ async def _deliver_single_video(
     if with_description:
         _remember_description(token, description)
     try:
-        async with _upload_slots:
+        async with _upload_capacity.slot(path.stat().st_size, is_admin):
             sent = await _send_with_retries(
                 lambda: message.answer_video(
                     FSInputFile(path),
@@ -838,6 +1001,10 @@ async def _deliver_album(
 
     Returns True on success; on False the caller falls back to other flows.
     """
+    # This path and the single-video one below it used to take upload capacity
+    # with no admin bypass at all, so a carousel or a fallback video from the
+    # operator queued behind users like anyone else.
+    is_admin = user_id == settings.admin_id
     try:
         async with download_album(url, settings.cookies_file, force_proxy) as album:
             # A single video here means this was never a carousel — the video
@@ -852,7 +1019,7 @@ async def _deliver_album(
             if single_video:
                 return await _deliver_single_video(
                     message, db, status_message, url, album, platform,
-                    user_id, started, url_cache,
+                    user_id, started, url_cache, is_admin,
                 )
 
             group = []
@@ -889,7 +1056,9 @@ async def _deliver_album(
             # Up to twelve separate sends happen under one slot here; each one
             # now has a deadline of its own, so a wedged album cannot hold the
             # upload queue for the sum of twelve blanket timeouts.
-            async with _upload_slots:
+            async with _upload_capacity.slot(
+                sum(p.stat().st_size for p in album.items), is_admin
+            ):
                 if group:
                     await message.bot(
                         message.answer_media_group(group),
@@ -1147,7 +1316,7 @@ async def _run_audio_flow(
                         file_size = media.file_size
                         progress.downloaded = file_size
                         progress.phase = PHASE_UPLOAD
-                        async with (nullcontext() if is_admin else _upload_slots):
+                        async with _upload_capacity.slot(media.file_size, is_admin):
                             sent = await _send_with_retries(
                                 lambda: message.answer_audio(
                                     FSInputFile(media.path),
