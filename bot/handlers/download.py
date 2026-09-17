@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -168,6 +169,7 @@ class _UploadCapacity:
     @asynccontextmanager
     async def slot(self, size_bytes: int | None, is_admin: bool):
         large = (size_bytes or 0) >= _UPLOAD_LANE_BYTES
+        queued_at = time.monotonic()
         async with self._cond:
             if is_admin:
                 self._admin += 1
@@ -178,6 +180,11 @@ class _UploadCapacity:
                 else:
                     self._small += 1
             self._cond.notify_all()
+            started_at = time.monotonic()
+            # Logged so the question "how many of these can the link carry at
+            # once" gets answered by the traffic that actually runs here, rather
+            # than by a load test against the machine people are using.
+            alongside = self._small + self._large + self._admin - 1
         try:
             yield
         finally:
@@ -192,6 +199,17 @@ class _UploadCapacity:
                 # either lane, and waking only one can leave the other asleep
                 # until a release that may never come.
                 self._cond.notify_all()
+            elapsed = time.monotonic() - started_at
+            megabytes = (size_bytes or 0) / (1024 * 1024)
+            logger.info(
+                "upload done: %.2f MB in %.1fs (%.2f MB/s), waited %.1fs, "
+                "alongside %d, lane=%s%s",
+                megabytes, elapsed,
+                megabytes / elapsed if elapsed > 0.05 else 0.0,
+                started_at - queued_at, alongside,
+                "large" if large else "small",
+                ", admin" if is_admin else "",
+            )
 
 
 _upload_capacity = _UploadCapacity()
@@ -204,9 +222,12 @@ _warned_users: set[int] = set()
 # A link that sat in Telegram's queue while the bot was wedged is almost never
 # still wanted by the time it is delivered: the person gave up, or sent it again,
 # and downloading all of it at once is how the bot came back from a freeze and
-# immediately buried itself. Ten minutes is deliberately generous — this is meant
-# to catch a restart backlog, not someone who waited their turn.
-_STALE_AFTER_SECONDS = 600
+# immediately buried itself.
+#
+# This is the age of the MESSAGE when the bot picks it up, checked once, before
+# any work starts — not how long a download may take. A file that needs forty
+# minutes is unaffected; the check is long behind it by then.
+_STALE_AFTER_SECONDS = int(os.getenv("STALE_LINK_SECONDS", "180"))
 
 # Per-user token bucket: room for a normal burst of links to a friend, not
 # enough for one person to keep the machine busy. Charged when work actually

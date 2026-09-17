@@ -418,11 +418,28 @@ assert blocked > 0, blocked
 assert blocked <= _RATE_WINDOW_SECONDS / _RATE_TOKENS + 1, blocked
 _rate_buckets.clear()
 
-# Ten minutes at the door catches a restart backlog without cancelling anyone
-# who merely waited their turn in the queue.
-assert _STALE_AFTER_SECONDS >= 300
+# The gate is on the age of the MESSAGE when the bot picks it up, checked once
+# before any work starts - not on how long a download runs. A file that needs
+# forty minutes is unaffected, because the check is long behind it by then.
+assert 60 <= _STALE_AFTER_SECONDS <= 3600, _STALE_AFTER_SECONDS
 print("user budget + staleness OK")
 
 
+
+
+# --- report timestamps are the operator's wall clock, not UTC ---
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+from bot.db import _REPORT_TZ, Database
+
+_utc_noon = _dt(2026, 9, 17, 12, 0, tzinfo=_tz.utc)
+assert f"{Database._local(_utc_noon):%d.%m.%y %H:%M}" == "17.09.26 15:00"
+# Crossing midnight has to move the date too, which is exactly what adding
+# three hours to an already-formatted string would have got wrong.
+_late = _dt(2026, 9, 17, 23, 30, tzinfo=_tz.utc)
+assert f"{Database._local(_late):%d.%m.%y %H:%M}" == "18.09.26 02:30"
+assert Database._local(None) is None
+assert _REPORT_TZ.utcoffset(None) == _td(hours=3)
+print("report timezone OK")
 
 print("\nALL SMOKE TESTS PASSED")

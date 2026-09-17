@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import html
 import logging
+import os
 from bot.urlkey import canonical_key
 from dataclasses import dataclass
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import asyncpg
@@ -15,6 +17,9 @@ import asyncpg
 from bot.legacy import parse_legacy_dump
 
 logger = logging.getLogger(__name__)
+
+# The reports are read by one person, in one place. Hours east of UTC.
+_REPORT_TZ = timezone(timedelta(hours=float(os.getenv("REPORT_UTC_OFFSET", "3"))))
 
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
@@ -264,6 +269,18 @@ class Database:
         return SummaryStats(**dict(row))
 
     @staticmethod
+    def _local(value):
+        """A stored instant as the operator's wall clock.
+
+        Every timestamp is TIMESTAMPTZ and the server runs on UTC, so asyncpg
+        hands back aware datetimes in UTC and formatting them straight put the
+        reports three hours behind the clock on the wall. A fixed offset rather
+        than a zone name on purpose: Moscow has had no summer time since 2014,
+        so the offset is exact, and it needs no tzdata inside the image.
+        """
+        return value.astimezone(_REPORT_TZ) if value is not None else None
+
+    @staticmethod
     def _user_link(telegram_id: int, username: str | None) -> str:
         """Clickable user reference: `@tag (id)`, both parts linking to the user.
 
@@ -304,12 +321,12 @@ th{{background:#f0f0f0;position:sticky;top:0}}
             "SELECT * FROM user_conversion_stats ORDER BY registration_date DESC"
         )
         def last_seen(row: asyncpg.Record) -> str:
-            value = row["last_conversion_at"]
+            value = Database._local(row["last_conversion_at"])
             return f"{value:%d.%m.%y %H:%M}" if value else "—"
 
         body = "".join(
             f"<tr><td>{self._user_link(row['telegram_id'], row['username'])}</td>"
-            f"<td>{row['registration_date']:%d.%m.%y %H:%M}</td>"
+            f"<td>{Database._local(row['registration_date']):%d.%m.%y %H:%M}</td>"
             f"<td class=n>{row['total_conversions']}</td>"
             f"<td class='n ok'>{row['done']}</td><td class='n fail'>{row['failed']}</td>"
             f"<td>{last_seen(row)}</td></tr>"
@@ -342,7 +359,7 @@ th{{background:#f0f0f0;position:sticky;top:0}}
         body = "".join(
             f"<tr><td>{row['id']}</td>"
             f"<td>{self._user_link(row['telegram_id'], row['username'])}</td>"
-            f"<td>{row['created_at']:%d.%m.%y %H:%M}</td>"
+            f"<td>{Database._local(row['created_at']):%d.%m.%y %H:%M}</td>"
             f"<td class={status_class.get(row['status'], '')}>{html.escape(row['status'])}</td>"
             f"<td>{row['source_platform'] or '—'}</td><td>{row['media_type'] or '—'}</td>"
             f"<td class=n>{mb(row)}</td><td class=n>{sec(row)}</td></tr>"
