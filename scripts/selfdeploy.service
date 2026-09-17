@@ -1,0 +1,15 @@
+[Unit]
+Description=Deploy the bot when the private repo's main branch moves
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# A clone of its own, used by nothing else. Sharing the working clone would mean
+# a commit made there is already at origin/main by the time the timer looks, so
+# the deploy would silently never fire for the pushes that matter most.
+Environment=DEPLOY_REPO=/root/deploy-src
+Environment=DEPLOY_LIVE=/root/tiktok-bot
+ExecStart=/usr/local/bin/selfdeploy.sh
+# One deploy at a time, and never one that outlives the interval between them.
+TimeoutStartSec=1800

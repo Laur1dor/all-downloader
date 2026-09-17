@@ -29,17 +29,44 @@ assert settings.admin_id == 111111111
 assert settings.database_dsn == "postgresql://x:p%40ss%3Aword%2F%21@localhost:5432/x"
 print("config OK:", settings.database_dsn)
 
-# --- legacy parser on the real dump ---
-users, conversions = parse_legacy_dump(Path("info.txt"))
-print(f"parsed: {len(users)} users, {len(conversions)} conversions")
-assert len(users) == 499, len(users)
-assert len(conversions) == 7942, len(conversions)
-assert users[0].telegram_id == 6321925656 and users[0].username == "vitaIy04"
+# --- legacy parser ---
+# info.txt is the export from the old bot and carries real people's ids, so it
+# is not in the repository and cannot be. Where it exists the checks run against
+# it; everywhere else - CI, a fresh clone - they run against a dump written here
+# in the same shape, so the parser stays covered either way.
+if Path("info.txt").exists():
+    users, conversions = parse_legacy_dump(Path("info.txt"))
+    print(f"parsed: {len(users)} users, {len(conversions)} conversions")
+    assert len(users) == 499, len(users)
+    assert len(conversions) == 7942, len(conversions)
+    assert users[0].telegram_id == 6321925656 and users[0].username == "vitaIy04"
+else:
+    import tempfile as _tempfile
+
+    _sample = chr(10).join([
+        "USERS",
+        "data: (1, 111, 'alice', '15/04/2025 14:57')",
+        "data: (2, 222, None, '16/04/2025 09:01')",
+        "CONVERTATIONS",
+        "data: (1, 111, '15/04/2025 14:55', 'Done')",
+        "data: (2, 222, '16/04/2025 09:05', 'Failed')",
+    ])
+    _dump = Path(_tempfile.mkdtemp(prefix='legacy-')) / 'info.txt'
+    _dump.write_text(_sample, encoding='utf-8')
+    users, conversions = parse_legacy_dump(_dump)
+    print(f"parsed a written-here dump: {len(users)} users, {len(conversions)} conversions")
+    assert len(users) == 2, len(users)
+    assert len(conversions) == 2, len(conversions)
+    assert users[0].telegram_id == 111 and users[0].username == "alice"
+
+# A missing username has to survive as None rather than becoming the string.
 assert any(u.username is None for u in users), "None usernames must survive parsing"
 statuses = {c.status for c in conversions}
 assert statuses == {"done", "failed"}, statuses
-assert conversions[-1].id == 8094
+# Ordering and date parsing, stated so they hold for either dump.
+assert conversions[0].id < conversions[-1].id
 assert conversions[0].created_at.year == 2025
+assert conversions[0].created_at.tzinfo is not None, 'timestamps must be aware'
 print("legacy parser OK, statuses:", statuses)
 
 # --- platform detection ---
@@ -317,6 +344,9 @@ from bot.handlers.download import (
     _RATE_WINDOW_SECONDS,
     _STALE_AFTER_SECONDS,
     _UPLOAD_LANE_BYTES,
+    _UPLOAD_LANE_LARGE,
+    _UPLOAD_LANE_SMALL,
+    _UPLOAD_TOTAL,
     _UploadCapacity,
     _rate_buckets,
     _rate_delay,
@@ -336,16 +366,18 @@ async def _admission_checks() -> None:
             holding.append(size)
             await release.wait()
 
-    # Two small uploads run together. That second lane is the whole point: one
-    # wedged upload used to hold the only place there was, for its whole ladder.
-    first = [_asyncio.create_task(hold(_SMALL, False)) for _ in range(2)]
+    # The small lane runs several at once. That extra room is the whole point:
+    # one wedged upload used to hold the only place there was, for its whole
+    # retry ladder, and everybody else waited behind it.
+    room = min(_UPLOAD_LANE_SMALL, _UPLOAD_TOTAL)
+    first = [_asyncio.create_task(hold(_SMALL, False)) for _ in range(room)]
     await _asyncio.sleep(0.05)
-    assert len(holding) == 2, holding
+    assert len(holding) == room, holding
 
-    # The third waits.
+    # One more than the lane holds has to wait.
     third = _asyncio.create_task(hold(_SMALL, False))
     await _asyncio.sleep(0.05)
-    assert len(holding) == 2, "a third small upload must wait"
+    assert len(holding) == room, "the lane must not admit past its width"
 
     # The admin is admitted with both user lanes full. This is the case that
     # deadlocks if the operator ever has to queue behind anybody: nothing would
@@ -391,21 +423,32 @@ async def _reservation_check() -> None:
 
     admin = _asyncio.create_task(hold(_SMALL, True))
     await _asyncio.sleep(0.05)
-    user_one = _asyncio.create_task(hold(_SMALL, False))
+    # One place goes to the operator, so the users' room shrinks by one.
+    room = max(1, min(_UPLOAD_LANE_SMALL, _UPLOAD_TOTAL) - 1)
+    users = [_asyncio.create_task(hold(_SMALL, False)) for _ in range(room)]
     await _asyncio.sleep(0.05)
-    assert len(holding) == 2, holding
-    # Narrowed to one place, so the second user waits - but the lane is never
-    # closed outright, which is what max(1, ...) guarantees.
-    user_two = _asyncio.create_task(hold(_SMALL, False))
+    assert len(holding) == room + 1, holding
+    # The next one waits - but the lane is never closed outright, which is
+    # what max(1, ...) guarantees.
+    extra = _asyncio.create_task(hold(_SMALL, False))
     await _asyncio.sleep(0.05)
-    assert len(holding) == 2, "the reservation must narrow the user lane"
+    assert len(holding) == room + 1, "the reservation must narrow the user lane"
     release.set()
-    await _asyncio.wait_for(_asyncio.gather(admin, user_one, user_two), timeout=2)
+    await _asyncio.wait_for(
+        _asyncio.gather(admin, *users, extra), timeout=3
+    )
     assert cap._small == 0 and cap._admin == 0
 
 
 _asyncio.run(_admission_checks())
 _asyncio.run(_reservation_check())
+
+# Lane widths must stay consistent with the global cap, or the two numbers
+# describe different systems and the one that binds is whichever is smaller.
+assert _UPLOAD_LANE_LARGE <= _UPLOAD_TOTAL
+assert _UPLOAD_TOTAL >= 1 and _UPLOAD_LANE_SMALL >= 1
+assert _UPLOAD_LANE_BYTES >= 1024 * 1024
+
 print("upload admission + admin reservation OK")
 
 # The budget: a burst is fine, a flood is not, and it refills.
@@ -416,6 +459,10 @@ blocked = _rate_delay(4242)
 assert blocked > 0, blocked
 # What it reports is the time to earn one token back, never the whole window.
 assert blocked <= _RATE_WINDOW_SECONDS / _RATE_TOKENS + 1, blocked
+# Three a minute, so a place comes back within about twenty seconds - short
+# enough that a person who simply types fast is not locked out, long enough
+# that nobody can queue a fourth video while three are still ahead of it.
+assert _RATE_WINDOW_SECONDS / _RATE_TOKENS <= 60, _RATE_WINDOW_SECONDS
 _rate_buckets.clear()
 
 # The gate is on the age of the MESSAGE when the bot picks it up, checked once

@@ -215,6 +215,90 @@ async def _send_report(message: Message, filename: str, report: str) -> bool:
     return False
 
 
+_PERIOD_PREFIX = "stat:"
+# Hours, and what to call them. None is the whole history.
+_PERIODS: tuple[tuple[str, str, int | None], ...] = (
+    ("24h", "24 часа", 24),
+    ("7d", "7 дней", 24 * 7),
+    ("30d", "30 дней", 24 * 30),
+    ("all", "всё время", None),
+)
+
+
+def _gb(value) -> str:
+    gigabytes = (value or 0) / (1024 ** 3)
+    return f"{gigabytes:.2f} ГБ" if gigabytes >= 0.01 else f"{(value or 0) / 1048576:.0f} МБ"
+
+
+def _secs(value) -> str:
+    return "—" if value is None else f"{float(value):.1f} с"
+
+
+def _period_keyboard(active: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=(f"• {label} •" if key == active else label),
+            callback_data=f"{_PERIOD_PREFIX}{key}",
+        )
+        for key, label, _ in _PERIODS
+    ]])
+
+
+def _render_stats(label: str, data: dict) -> str:
+    totals = data["totals"]
+    uploads = data["uploads"]
+    total = totals["total"] or 0
+    done = totals["done"] or 0
+    share = f"{done * 100 // total}%" if total else "—"
+    lines = [
+        f"\U0001f4c8 <b>Итоги — {label}</b>",
+        "",
+        f"\U0001f3ac Запросов: <b>{total}</b> "
+        f"(\u2705 {done} / \u274c {totals['failed'] or 0} / "
+        f"\U0001f6ab {totals['cancelled'] or 0}) — успех <b>{share}</b>",
+        f"\U0001f465 Активных: <b>{totals['users'] or 0}</b>, "
+        f"новых: <b>{data['new_users'] or 0}</b>",
+        f"\U0001f4be Отдано: <b>{_gb(totals['bytes'])}</b>",
+        f"\u23f1 Время запроса: медиана <b>{_secs(totals['median_seconds'])}</b>, "
+        f"95-й процентиль <b>{_secs(totals['p95_seconds'])}</b>",
+    ]
+
+    if uploads and (uploads["total"] or 0):
+        speed = uploads["median_bps"]
+        speed_text = f"{float(speed) / 1048576:.1f} МБ/с" if speed else "—"
+        lines += [
+            "",
+            "\U0001f4e4 <b>Отправка</b> — это и есть ответ про канал:",
+            f"   скорость (медиана): <b>{speed_text}</b>",
+            f"   ждали очереди: <b>{uploads['queued'] or 0}</b> из "
+            f"{uploads['total']}, 95-й процентиль "
+            f"<b>{_secs(uploads['p95_wait'])}</b>",
+            f"   максимум одновременно рядом: <b>{uploads['max_alongside'] or 0}</b>",
+        ]
+    else:
+        lines += ["", "<i>Замеров отправки за период пока нет.</i>"]
+
+    platforms = data["platforms"]
+    if platforms:
+        lines += ["", "<b>По площадкам</b>"]
+        for row in platforms:
+            row_total = row["total"] or 0
+            row_done = row["done"] or 0
+            ok = f"{row_done * 100 // row_total}%" if row_total else "—"
+            lines.append(
+                f"   {row['platform']}: {row_total} ({ok}), "
+                f"{_gb(row['bytes'])}, медиана {_secs(row['median_seconds'])}"
+            )
+
+    busiest = data["busiest"]
+    if busiest:
+        hours = ", ".join(
+            f"{int(r['hour']):02d}:00 ({r['total']})" for r in busiest
+        )
+        lines += ["", f"\U0001f552 Пик (UTC): {hours}"]
+    return NEWLINE.join(lines)
+
+
 def create_router(admin_id: int) -> Router:
     router = Router(name="admin")
     router.message.filter(F.from_user.id == admin_id)
@@ -256,6 +340,29 @@ def create_router(admin_id: int) -> Router:
                 + (" Отправлено: " + ", ".join(sent) + "." if sent else "")
                 + " Попробуйте ещё раз."
             )
+
+    @router.message(Command("stats"))
+    async def handle_stats(message: Message, db: Database) -> None:
+        data = await db.fetch_period_stats(24)
+        await message.answer(
+            _render_stats("24 часа", data), reply_markup=_period_keyboard("24h")
+        )
+
+    @router.callback_query(F.data.startswith(_PERIOD_PREFIX))
+    async def handle_stats_period(callback: CallbackQuery, db: Database) -> None:
+        key = callback.data.removeprefix(_PERIOD_PREFIX)
+        chosen = next((p for p in _PERIODS if p[0] == key), None)
+        if chosen is None:
+            await callback.answer()
+            return
+        _, label, hours = chosen
+        data = await db.fetch_period_stats(hours)
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            with suppress(TelegramBadRequest):
+                await callback.message.edit_text(
+                    _render_stats(label, data), reply_markup=_period_keyboard(key)
+                )
 
     @router.message(Command("control"))
     async def handle_control(message: Message) -> None:

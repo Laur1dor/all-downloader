@@ -1,0 +1,16 @@
+[Unit]
+Description=Look for a new commit to deploy
+
+[Timer]
+# Five minutes is frequent enough that a fix reaches the bot while you are still
+# looking at it, and rare enough that the check itself — one git fetch — costs
+# nothing. A run that finds nothing new exits in under a second.
+OnBootSec=3min
+OnUnitActiveSec=5min
+# Without this every boot would fire a deploy at the same instant as everything
+# else starting up, on a box where docker is still settling.
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -135,9 +135,19 @@ _download_slots = asyncio.Semaphore(3)
 # the queue. So: a second lane, and a lane of its own for large files, which
 # would otherwise halve each other's speed and double the time both spend
 # exposed to a route that drops connections.
-_UPLOAD_LANE_BYTES = 32 * 1024 * 1024
-_UPLOAD_LANE_SMALL = 2
+#
+# Raised from two small places to three, and the boundary from 32 to 64 MB. 64
+# is where the per-file deadline still has room: it budgets 60s + 6s/MB and caps
+# at 480s, so a 64 MB file gets 444s of its own while anything past ~70 MB is on
+# the cap and has stopped scaling — which is the honest line between "a clip"
+# and "a big file", rather than a round number.
+_UPLOAD_LANE_BYTES = 64 * 1024 * 1024
+_UPLOAD_LANE_SMALL = 3
 _UPLOAD_LANE_LARGE = 1
+# The lanes are separate, so without this a large upload and a full small lane
+# would add up to one more concurrent upload than either number suggests. This
+# is the number that actually meets the link.
+_UPLOAD_TOTAL = 3
 
 
 class _UploadCapacity:
@@ -161,13 +171,22 @@ class _UploadCapacity:
         self._admin = 0
 
     def _has_room(self, large: bool) -> bool:
+        # max(1, ...) — the reservation narrows a lane, it never closes it, so
+        # there is no state in which a user upload can never be admitted.
+        if self._small + self._large >= max(1, _UPLOAD_TOTAL - self._admin):
+            return False
         if large:
             return self._large < _UPLOAD_LANE_LARGE
-        # max(1, ...) — the reservation narrows the lane, it never closes it.
         return self._small < max(1, _UPLOAD_LANE_SMALL - self._admin)
 
     @asynccontextmanager
-    async def slot(self, size_bytes: int | None, is_admin: bool):
+    async def slot(
+        self,
+        size_bytes: int | None,
+        is_admin: bool,
+        db: Database | None = None,
+        platform: str | None = None,
+    ):
         large = (size_bytes or 0) >= _UPLOAD_LANE_BYTES
         queued_at = time.monotonic()
         async with self._cond:
@@ -200,16 +219,24 @@ class _UploadCapacity:
                 # until a release that may never come.
                 self._cond.notify_all()
             elapsed = time.monotonic() - started_at
+            waited = started_at - queued_at
             megabytes = (size_bytes or 0) / (1024 * 1024)
             logger.info(
                 "upload done: %.2f MB in %.1fs (%.2f MB/s), waited %.1fs, "
                 "alongside %d, lane=%s%s",
                 megabytes, elapsed,
                 megabytes / elapsed if elapsed > 0.05 else 0.0,
-                started_at - queued_at, alongside,
+                waited, alongside,
                 "large" if large else "small",
                 ", admin" if is_admin else "",
             )
+            if db is not None:
+                # Kept out of the lock above, and never allowed to fail the
+                # upload it is describing.
+                await db.record_upload(
+                    platform, "large" if large else "small", is_admin,
+                    size_bytes, elapsed, waited, alongside,
+                )
 
 
 _upload_capacity = _UploadCapacity()
@@ -229,11 +256,13 @@ _warned_users: set[int] = set()
 # minutes is unaffected; the check is long behind it by then.
 _STALE_AFTER_SECONDS = int(os.getenv("STALE_LINK_SECONDS", "180"))
 
-# Per-user token bucket: room for a normal burst of links to a friend, not
-# enough for one person to keep the machine busy. Charged when work actually
-# starts, so a stale link or a cache hit costs nothing.
-_RATE_TOKENS = 5.0
-_RATE_WINDOW_SECONDS = 600.0
+# Per-user token bucket: three links a minute, refilling one every twenty
+# seconds. Charged on every link, including one that is already cached — the
+# point is not only to spare the machine but to stop one person queueing work
+# faster than it can be done, and a link that is answered instantly still costs
+# a message and a place in the queue.
+_RATE_TOKENS = 3.0
+_RATE_WINDOW_SECONDS = 60.0
 _rate_buckets: dict[int, tuple[float, float]] = {}
 
 # Expansion is a walk over the proxy ladder, so ten identical pastes would pay it
@@ -485,6 +514,18 @@ async def handle_link(
             )
             return
 
+    # The budget is charged at the door, on every link, so it also bounds how
+    # much work one person can line up: three a minute means no one can put a
+    # fourth video in the queue while three are still ahead of it.
+    if not is_admin:
+        wait = _rate_delay(user_id)
+        if wait > 0:
+            await message.answer(
+                f"🐢 Не больше {int(_RATE_TOKENS)} ссылок в минуту. "
+                f"Следующую приму через {max(1, int(wait))} с."
+            )
+            return
+
     # Solo mode: the admin reserves the whole pipe for a heavy upload.
     if config.solo_mode and not is_admin:
         await message.answer("⏸ Бот временно занят. Попробуйте через несколько минут.")
@@ -571,22 +612,6 @@ async def _run_link(
         if choice_message is not None:
             await _delete_silently(choice_message)
         return
-
-    # Everything above this point is free — a stale link, a cache hit, a link
-    # that turned out to be audio. The budget is charged here, where the machine
-    # is about to do actual work, so the people it limits are the ones actually
-    # making it work.
-    if not is_admin:
-        wait = _rate_delay(user_id)
-        if wait > 0:
-            if choice_message is not None:
-                await _delete_silently(choice_message)
-            await message.answer(
-                f"🐢 Слишком много ссылок подряд. Следующую приму через "
-                f"{int(wait) // 60 + 1} мин — всё, что уже скачано, "
-                "по-прежнему отдаётся мгновенно."
-            )
-            return
 
     # Carousel/photo posts go straight to gallery-dl: yt-dlp would either fail
     # (TikTok /photo/) or silently drop the photos of a mixed Instagram post.
@@ -684,7 +709,9 @@ async def _run_link(
                         with_description = _description_capable(url, platform) and bool(
                             media.description and media.description.strip()
                         )
-                        async with _upload_capacity.slot(media.file_size, is_admin):
+                        async with _upload_capacity.slot(
+                            media.file_size, is_admin, db, platform
+                        ):
                             sent = await _send_with_retries(
                                 lambda m=media, wd=with_description: message.answer_video(
                                     FSInputFile(m.path),
@@ -979,7 +1006,9 @@ async def _deliver_single_video(
     if with_description:
         _remember_description(token, description)
     try:
-        async with _upload_capacity.slot(path.stat().st_size, is_admin):
+        async with _upload_capacity.slot(
+            path.stat().st_size, is_admin, db, platform
+        ):
             sent = await _send_with_retries(
                 lambda: message.answer_video(
                     FSInputFile(path),
@@ -1078,7 +1107,8 @@ async def _deliver_album(
             # now has a deadline of its own, so a wedged album cannot hold the
             # upload queue for the sum of twelve blanket timeouts.
             async with _upload_capacity.slot(
-                sum(p.stat().st_size for p in album.items), is_admin
+                sum(p.stat().st_size for p in album.items),
+                is_admin, db, platform,
             ):
                 if group:
                     await message.bot(
@@ -1337,7 +1367,9 @@ async def _run_audio_flow(
                         file_size = media.file_size
                         progress.downloaded = file_size
                         progress.phase = PHASE_UPLOAD
-                        async with _upload_capacity.slot(media.file_size, is_admin):
+                        async with _upload_capacity.slot(
+                            media.file_size, is_admin, db, platform
+                        ):
                             sent = await _send_with_retries(
                                 lambda: message.answer_audio(
                                     FSInputFile(media.path),
