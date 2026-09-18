@@ -592,6 +592,22 @@ _mixed = {'gql_data': {'shortcode_media': {
 }}}
 assert not _ig_parse(_ig_page(_mixed)), 'half a carousel is not the post'
 
+# Whatever the reason an embed came back empty, it must not be reported as one
+# the caller can act on. An earlier version read the page for a rendered image
+# and called its absence proof of deletion, which stopped the session tools from
+# running; measured against posts of known state it got a live post wrong, and
+# that post downloads from those tools in three seconds. So the only two answers
+# are served and not served.
+import bot.instagram as _ig
+import bot.downloader as _dl
+
+assert not hasattr(_ig, 'GONE'), 'the embed must not have a verdict for deletion'
+assert not hasattr(_dl, 'PostGoneError'), 'nothing may raise a deletion'
+assert _ig._parse('<html>gated, no payload</html>').state == _ig.WITHHELD
+assert _ig._parse('<html>EmbeddedMediaImage</html>').state == _ig.WITHHELD
+# The one that used to be called gone: a share link behind a follow prompt.
+assert _ig._parse('<html>no media, no payload, still a live post</html>').state == _ig.WITHHELD
+
 print("instagram embed parsing OK")
 
 print("\nALL SMOKE TESTS PASSED")

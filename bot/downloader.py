@@ -171,10 +171,6 @@ class DownloadFailedError(Exception):
         self.retry_via_proxy = retry_via_proxy
 
 
-class PostGoneError(DownloadFailedError):
-    """The post itself is gone, so no exit and no account will find it."""
-
-
 class NotAVideoPostError(DownloadFailedError):
     """The link is a real post, but a carousel rather than a video.
 
@@ -1628,7 +1624,7 @@ async def _instagram_first(
         ) as media:
             yield media
             return
-    except (DownloadCancelledError, OversizedError, PostGoneError):
+    except (DownloadCancelledError, OversizedError):
         raise
     except Exception as exc:
         logger.info("Instagram embed did not serve %s (%s); using yt-dlp", url, exc)
@@ -1648,19 +1644,16 @@ def _instagram_items_sync(
 ) -> tuple[list[Path], str | None]:
     """Every item of an Instagram post, fetched without an account.
 
-    Returns ([], None) when the embed has nothing — a private account, a removed
-    post, or a change on Instagram's side — and the caller falls back to the
-    session-based tools rather than telling anyone the post does not exist.
+    Returns ([], None) when the embed has nothing — a private account, a share
+    link that wants a follow first, a removed post, or a change on Instagram's
+    side. Which of those it is cannot be told apart here, and the difference
+    matters to the caller only in that all of them go to the session tools: one
+    of the posts this wrongly gave up on downloads from them without complaint.
     """
     post, session = instagram.read_post(url, proxy)
     if not post or session is None:
         if session is not None:
             session.close()
-        if post.state == instagram.GONE:
-            # Nothing downstream can find a post that no longer exists, and
-            # telling somebody it is "private or needs a login" sends them
-            # looking for an account to solve a problem no account solves.
-            raise PostGoneError("Этого поста больше нет — он удалён или скрыт автором.")
         return [], None
 
     paths: list[Path] = []

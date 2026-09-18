@@ -51,10 +51,10 @@ class InstagramItem:
     is_video: bool
 
 
-# What the embed page turned out to be holding.
+# What the embed page turned out to be holding. There is no third value on
+# purpose: see the note above _parse for why this cannot report a deletion.
 SERVED = "served"        # the payload was there
-GONE = "gone"            # the post does not exist any more
-WITHHELD = "withheld"    # the post exists, the data is not given out here
+WITHHELD = "withheld"    # it was not, and the reason is not knowable here
 
 
 @dataclass
@@ -101,30 +101,32 @@ def _item_of(node: dict) -> InstagramItem | None:
     return InstagramItem(image, False) if image else None
 
 
-# The page renders the post's own image even when it refuses the payload. Its
-# absence is therefore the tell: a post that is merely gated still shows
-# something, a post that is gone shows nothing at all. Measured on both.
-_RENDERED_MEDIA_RE = re.compile(r'EmbeddedMediaImage|src="https://[^"]*fbcdn[^"]*"')
-
-
-def _state_of(body: str) -> str:
-    return WITHHELD if _RENDERED_MEDIA_RE.search(body) else GONE
+# An empty embed does not say why it is empty, and a guess here is expensive.
+#
+# This used to read the page for a rendered image and call its absence proof the
+# post had been deleted. Measured against five posts of known state, that is
+# simply untrue: of three live posts one rendered nothing and was declared gone,
+# while the two genuinely deleted ones looked the same as it. The post page and
+# the cookie-fed embed do not separate them either. The one witness that does is
+# the session path, which fetched both live posts and returned nothing for the
+# deleted one — so that verdict belongs downstream, and this reports only whether
+# it was served.
 
 
 def _parse(body: str) -> InstagramPost:
     found = _CONTEXT_RE.search(body)
     if not found:
-        return InstagramPost(state=_state_of(body))
+        return InstagramPost(state=WITHHELD)
     try:
         # The payload is a JSON string inside the JSON of the page, so it is
         # decoded twice on purpose.
         context = json.loads(json.loads(found.group(1)))
     except ValueError:
-        return InstagramPost(state=_state_of(body))
+        return InstagramPost(state=WITHHELD)
 
     post = (context.get("gql_data") or {}).get("shortcode_media") or {}
     if not post:
-        return InstagramPost(state=_state_of(body))
+        return InstagramPost(state=WITHHELD)
 
     children = (post.get("edge_sidecar_to_children") or {}).get("edges") or []
     nodes = [edge.get("node") or {} for edge in children] if children else [post]
@@ -144,7 +146,7 @@ def _parse(body: str) -> InstagramPost:
         items=items,
         caption=caption,
         owner=(post.get("owner") or {}).get("username"),
-        state=SERVED if items else _state_of(body),
+        state=SERVED if items else WITHHELD,
     )
 
 
