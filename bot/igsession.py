@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from html import escape as html_escape
 from pathlib import Path
@@ -88,6 +89,19 @@ _INTERVAL = 900
 # they fix it, without filling the log.
 _BACKOFF = (0, 600, 1800, 3600, 7200)
 _LOGIN_TIMEOUT = 420
+# A ceiling on logins per day, independent of the backoff.
+#
+# Measured the hard way: a bug in the signed-in check reported every successful
+# login as failed, so this asked for another, and another. Instagram answered
+# with "we suspect automated behavior on your account" and began serving HTML to
+# the API calls the downloader needs - an account-level restriction that no code
+# here can work around. The backoff alone did not bound that, because each
+# attempt looked like a fresh first failure.
+#
+# Four is generous for a session that normally lasts days. What it rules out is
+# the loop, and it does so without needing to know why the loop is happening.
+_LOGINS_PER_DAY = int(os.getenv("IG_LOGINS_PER_DAY", "4"))
+_DAY_SECONDS = 24 * 3600
 
 
 def _read_answer(status: int, body: str) -> tuple[str, str | None]:
@@ -189,6 +203,8 @@ class InstagramSession:
         self._wake = asyncio.Event()
         self._failures = 0
         self._next_attempt = 0.0
+        # Monotonic stamps of the logins asked for, newest last.
+        self._logins: list[float] = []
         self._state = UNKNOWN
         self._told_admin_dead = False
 
@@ -313,6 +329,18 @@ class InstagramSession:
             waiting = int((self._next_attempt - now) / 60)
             logger.info("Instagram signed out; next attempt in ~%d min", waiting)
             return
+
+        self._logins = [t for t in self._logins if now - t < _DAY_SECONDS]
+        if len(self._logins) >= _LOGINS_PER_DAY:
+            # Deliberately quiet: the operator has already been told once that a
+            # login is needed, and repeating it every quarter of an hour would
+            # be the same loop wearing different clothes.
+            logger.warning(
+                "Instagram signed out, but %d logins already today - not asking "
+                "again until one ages out", len(self._logins)
+            )
+            return
+        self._logins.append(now)
 
         logger.warning("Instagram is signed out; asking for a login")
         ok, report = await self._ask_for_login()

@@ -207,8 +207,14 @@ def _logged_in(page) -> bool:
     The cookie alone proves nothing: one was present here while the site kept
     showing the account behind a "Continue" button, and the jar written from it
     authenticated nothing - gallery-dl got 400 from the media API with it.
-    /data/shared_data/ names the viewer when there is one, and returns a null
-    viewer when there is not.
+    /data/shared_data/ names the viewer when there is one.
+
+    The parsing happens inside the page on purpose. An earlier version pulled
+    the body out and sliced it to 4000 characters first; the answer is about
+    38 KB, so every parse got half a JSON document and failed, and this returned
+    False even with the feed on the screen. A login that worked was written off
+    as failed, its cookies were dropped, and the watchdog asked for another one
+    - which is the loop that got the account flagged for automation.
     """
     if not any(c["name"] == "sessionid" and c["value"]
                for c in page.context.cookies()):
@@ -218,22 +224,18 @@ def _logged_in(page) -> bool:
             """async () => {
                 const r = await fetch('/data/shared_data/',
                                       {credentials: 'include'});
-                return {status: r.status, body: (await r.text()).slice(0, 4000)};
+                if (r.status !== 200) return {status: r.status, user: null};
+                let data = null;
+                try { data = await r.json(); }
+                catch (e) { return {status: r.status, user: null}; }
+                const viewer = (data.config || {}).viewer;
+                return {status: r.status,
+                        user: viewer && viewer.username ? viewer.username : null};
             }"""
         )
     except Exception:
         return False
-    if result.get("status") != 200:
-        return False
-    body = result.get("body") or ""
-    if body.lstrip()[:1] != "{":
-        return False
-    try:
-        config = (json.loads(body) or {}).get("config") or {}
-    except ValueError:
-        return False
-    viewer = config.get("viewer")
-    return bool(isinstance(viewer, dict) and (viewer.get("username") or "").strip())
+    return bool((result or {}).get("user"))
 
 
 _CODE_FIELDS = (
@@ -268,6 +270,13 @@ def _fill_code(page, code: str) -> bool:
 # was sitting there. This is the good case, not an edge case: it needs no
 # password and raises no checkpoint.
 _CONTINUE_LABELS = ("Continue", "Продолжить")
+# Pages that stand between a correct password and a session. Each is one button
+# and no inputs, so a flow looking for a form finds nothing to do and gives up.
+# Measured: /accounts/scraping_warning/ ("We suspect automated behavior on your
+# account") offers only Dismiss, and pressing it lands on the feed, signed in.
+_INTERSTITIAL_LABELS = ("Dismiss", "Not now", "Не сейчас", "OK", "Закрыть",
+                        "Continue", "Продолжить")
+_SETTLE_ROUNDS = 6
 _ANOTHER_LABELS = ("Use another profile", "Log into another account",
                    "Войти в другой аккаунт", "Использовать другой профиль")
 
@@ -284,17 +293,43 @@ def _click_named(page, labels, timeout: int = 4000) -> bool:
     return False
 
 
+def _settle(page, password: str) -> bool:
+    """Walk whatever Instagram puts between here and a session. True if signed in.
+
+    There is no single shape to expect any more, so this does not expect one. It
+    looks at what the page offers - a password box, a one-button interstitial -
+    deals with that, and asks again. It stops the moment the session answers.
+    """
+    for _ in range(_SETTLE_ROUNDS):
+        if _logged_in(page):
+            return True
+
+        box = _first_visible(page, _PASS_FIELDS)
+        if box is not None:
+            box.fill(password)
+            box.press("Enter")
+            page.wait_for_timeout(9000)
+            continue
+
+        if _click_named(page, _INTERSTITIAL_LABELS):
+            page.wait_for_timeout(6000)
+            continue
+
+        # Nothing offered and not signed in: say what the page was, so the next
+        # failure is diagnosable rather than just a timeout.
+        _describe(page)
+        return False
+
+    return _logged_in(page)
+
+
 def _one_tap(page, password: str) -> bool:
-    """Take the saved-account route if this is that page. True if signed in.
+    """Take the saved-account route when Instagram offers it.
 
-    Instagram serves a remembered browser the account and a button rather than
-    a form, and the profile is kept between runs precisely to be remembered - so
-    this is the ordinary case, not an edge one. Measured: the page carried the
-    handle, two "Continue" buttons and no inputs at all, so waiting for a
-    password box timed out after 45s every time while the way in sat there.
-
-    Clicking it does not sign in by itself. It reveals a password field named
-    "pass" for that account, which is what actually completes the login.
+    It serves a remembered browser the account and a button rather than a form,
+    and the profile is kept between runs precisely to be remembered - so this is
+    the ordinary case. Clicking it does not sign in by itself; it reveals a
+    password field for that account, and may put a warning page in front first.
     """
     try:
         body = page.inner_text("body")[:600]
@@ -302,28 +337,21 @@ def _one_tap(page, password: str) -> bool:
         return False
 
     handle = os.getenv("IG_HANDLE", "").strip()
-    if handle and handle not in body:
+    # The handle is on the saved-account screen, but not on an interstitial, so
+    # its absence is only a reason to refuse when this IS that screen.
+    offers_account = _first_visible(page, _PASS_FIELDS) is None and any(
+        label in body for label in _CONTINUE_LABELS
+    )
+    if handle and offers_account and handle not in body:
         log(f"the saved account on the page is not {handle}; using the form")
         return False
-    if not _click_named(page, _CONTINUE_LABELS):
-        return False
-    log("Instagram offered the saved account; continuing as it")
-    page.wait_for_timeout(4000)
+    if offers_account:
+        if not _click_named(page, _CONTINUE_LABELS):
+            return False
+        log("Instagram offered the saved account; continuing as it")
+        page.wait_for_timeout(4000)
 
-    if _logged_in(page):
-        return True
-
-    box = _first_visible(page, _PASS_FIELDS)
-    if box is None:
-        log("the saved account asked for no password and did not sign in")
-        return False
-    box.fill(password)
-    box.press("Enter")
-    for _ in range(9):
-        page.wait_for_timeout(3000)
-        if _logged_in(page):
-            return True
-    return False
+    return _settle(page, password)
 
 
 # How long to sit on a checkpoint before giving up. The approval kind is the
@@ -425,29 +453,12 @@ def run() -> int:
 
                 started = time.time() - 60
                 if _one_tap(page, password):
-                    log("signed in via the saved account")
-                else:
-                    try:
-                        page.wait_for_selector(
-                            ", ".join(_PASS_FIELDS), timeout=45000
-                        )
-                    except Exception:
-                        # Say what the page was rather than only that a selector
-                        # never appeared - that is the one thing a timeout does
-                        # not tell you, and it cost a day here.
-                        _describe(page)
-                        return 1
-                    user_box = _first_visible(page, _USER_FIELDS)
-                    pass_box = _first_visible(page, _PASS_FIELDS)
-                    if user_box is None or pass_box is None:
-                        log("the login form is not the shape this knows")
-                        _describe(page)
-                        return 1
-                    user_box.fill(username)
-                    pass_box.fill(password)
-                    pass_box.press("Enter")
-                    page.wait_for_timeout(9000)
+                    log("signed in")
+                elif not _settle(page, password):
+                    log("could not get past what Instagram is showing")
 
+                # Only a checkpoint - a mailed code, an approval from another
+                # device - is left once the ordinary pages have been walked.
                 if not _logged_in(page):
                     _clear_checkpoint(page, started)
 

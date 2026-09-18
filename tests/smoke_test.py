@@ -747,6 +747,33 @@ with _tmp.TemporaryDirectory() as _d:
     assert _w2._told_admin_dead is False, (
         'a rejected send is not a warning delivered')
 
+
+    # However often the session looks dead, the bot may not spend the day
+    # signing in. A bug on the signed-in side once did exactly that, and
+    # Instagram answered by restricting the account rather than the request.
+    _w3 = _igs.InstagramSession(_empty, _dir / 'req3', _dir / 'res3', None)
+    _asked = []
+
+    async def _count_login():
+        _asked.append(1)
+        return False, 'nope'
+
+    _w3._ask_for_login = _count_login
+
+    async def _always_dead(_fn, _cookies, _proxy):
+        return (_igs.DEAD, None)
+
+    _real2 = _aio.to_thread
+    _aio.to_thread = _always_dead
+    try:
+        for _ in range(12):
+            _w3._next_attempt = 0.0   # pretend the backoff has elapsed
+            _aio.run(_w3.check())
+    finally:
+        _aio.to_thread = _real2
+    assert len(_asked) <= _igs._LOGINS_PER_DAY, (
+        f'{len(_asked)} logins in a day, cap is {_igs._LOGINS_PER_DAY}')
+
 print("instagram session watch OK")
 
 print("\nALL SMOKE TESTS PASSED")
