@@ -400,7 +400,7 @@ def create_router(admin_id: int) -> Router:
                 )
 
     @router.message(Command("iglogin"))
-    async def handle_iglogin(message: Message) -> None:
+    async def handle_iglogin(message: Message, ig_session=None) -> None:
         """Log into Instagram from the server and store the session.
 
         The manual loop failed three times running: export cookies from a
@@ -420,7 +420,13 @@ def create_router(admin_id: int) -> Router:
             "\U0001f511 Вхожу в Instagram… это может занять пару минут: "
             "надо дождаться кода на почту."
         )
-        ok, report = await _run_iglogin()
+        # Through the watch when there is one: it holds the only lock over
+        # the request/result files, and two callers racing on those is how a
+        # login that worked gets reported as a timeout.
+        if ig_session is not None and getattr(ig_session, "enabled", False):
+            ok, report = await ig_session.login_now()
+        else:
+            ok, report = await _run_iglogin()
         head = "\u2705 Сессия получена." if ok else "\u26a0 Войти не удалось."
         with suppress(TelegramBadRequest):
             await notice.edit_text(

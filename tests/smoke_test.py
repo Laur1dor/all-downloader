@@ -610,4 +610,126 @@ assert _ig._parse('<html>no media, no payload, still a live post</html>').state 
 
 print("instagram embed parsing OK")
 
+# --- Instagram session watch -------------------------------------------------
+# The bug this guards against is the one that already shipped once: a guess
+# promoted to a verdict. Here the verdict is "the account is signed out", and
+# what must never reach it is a request that simply failed.
+
+import asyncio as _aio
+import pathlib as _pathlib
+import tempfile as _tmp
+
+from bot import igsession as _igs
+
+assert _igs._username_in('{"config":{"viewer":{"username":"an_account"}}}') == 'an_account'
+assert _igs._username_in('{"config":{"viewer":null}}') is None
+assert _igs._username_in('{"config":{}}') is None
+assert _igs._username_in('not json at all') is None
+assert _igs._username_in('{"config":{"viewer":{"username":"   "}}}') is None
+
+
+async def _note(bucket, text):
+    bucket.append(text)
+
+
+async def _fake_login(ok):
+    return ok, 'fake'
+
+
+async def _drive(jar, folder, probe_answers, login_ok):
+    """One check() with the probe and the login faked, so what is measured is
+    the decision-making rather than Instagram."""
+    said = []
+    watch = _igs.InstagramSession(
+        jar, folder / 'req', folder / 'res',
+        lambda text: _note(said, text),
+    )
+    answers = list(probe_answers)
+
+    async def _fake_probe(_fn, _cookies, _proxy):
+        return answers.pop(0) if answers else (_igs.UNKNOWN, None)
+
+    watch._ask_for_login = lambda: _fake_login(login_ok)
+    real = _aio.to_thread
+    _aio.to_thread = _fake_probe
+    try:
+        first = await watch.check()
+    finally:
+        _aio.to_thread = real
+    return watch, first, said
+
+
+with _tmp.TemporaryDirectory() as _d:
+    _dir = _pathlib.Path(_d)
+
+    # A jar that cannot be read says nothing about Instagram, so: UNKNOWN. This
+    # is the branch that keeps a local problem from being read as a remote one.
+    assert _igs._probe_sync(_dir / 'missing.txt', None)[0] == _igs.UNKNOWN
+    # A jar with no sessionid needs no network to be sure.
+    _empty = _dir / 'empty.txt'
+    _empty.write_text('# Netscape HTTP Cookie File' + '\n', encoding='utf-8')
+    assert _igs._probe_sync(_empty, None)[0] == _igs.DEAD
+
+    # A probe that could not be taken changes nothing and tells nobody. Without
+    # this, every network blip would spend a login attempt.
+    _w, _first, _said = _aio.run(_drive(_empty, _dir, [(_igs.UNKNOWN, None)], True))
+    assert _first == _igs.UNKNOWN, _first
+    assert not _said, _said
+
+    # Signed out, the login works and the probe confirms it: recovered, and the
+    # admin hears about it once.
+    _w, _first, _said = _aio.run(
+        _drive(_empty, _dir, [(_igs.DEAD, None), (_igs.LIVE, 'an_account')], True))
+    assert _first == _igs.LIVE, _first
+    assert len(_said) == 1 and 'Instagram' in _said[0], _said
+
+    # A login that claims success while the session is still dead is not
+    # believed - the probe is what settles it.
+    _w, _first, _said = _aio.run(
+        _drive(_empty, _dir, [(_igs.DEAD, None), (_igs.DEAD, None)], True))
+    assert _first == _igs.DEAD, _first
+    assert _w._failures == 1, _w._failures
+
+    # Signed out and the login fails: the admin is told once, and the next
+    # attempt is pushed into the future rather than retried on the spot.
+    _w, _first, _said = _aio.run(_drive(_empty, _dir, [(_igs.DEAD, None)], False))
+    assert _first == _igs.DEAD, _first
+    assert len(_said) == 1, _said
+    assert _w._next_attempt > 0, 'a failed login must back off'
+    assert _w._failures == 1
+
+
+    # A login that worked, followed by a probe that could not be taken, is
+    # NOT a failed login - the two go out over different routes, so one
+    # saying nothing carries no news about the other. Telling the operator
+    # the login failed here would be this module's own rule broken against
+    # them: an answer invented where there was none.
+    _w, _first, _said = _aio.run(
+        _drive(_empty, _dir, [(_igs.DEAD, None), (_igs.UNKNOWN, None)], True))
+    assert not _said, 'an unconfirmed login must not be reported as failed'
+    assert _w._next_attempt > 0, 'but it must still space the next attempt out'
+
+    # If the warning could not be delivered, the watch has not warned
+    # anybody - and must not believe it has. Otherwise the one message an
+    # outage ever gets is the one that never arrived.
+    async def _refuse(_text):
+        raise RuntimeError('Telegram said no')
+
+    _w2 = _igs.InstagramSession(_empty, _dir / 'req2', _dir / 'res2', _refuse)
+    _w2._ask_for_login = lambda: _fake_login(False)
+
+    async def _dead_probe(_fn, _cookies, _proxy):
+        return (_igs.DEAD, None)
+
+    _real_thread = _aio.to_thread
+    _aio.to_thread = _dead_probe
+    try:
+        _aio.run(_w2.check())
+    finally:
+        _aio.to_thread = _real_thread
+    assert _w2._told_admin_dead is False, (
+        'a rejected send is not a warning delivered')
+
+print("instagram session watch OK")
+
 print("\nALL SMOKE TESTS PASSED")

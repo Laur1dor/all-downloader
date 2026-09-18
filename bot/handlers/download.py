@@ -466,6 +466,17 @@ async def _edit_progress_loop(
             await status_message.edit_text(text, reply_markup=markup)
 
 
+# Set once at startup. A failed Instagram download is a reason to go and ask
+# whether the account is still signed in - never an answer to that question, so
+# nothing here decides anything. See bot/igsession.py.
+_instagram_watch = None
+
+
+def set_instagram_watch(watch) -> None:
+    global _instagram_watch
+    _instagram_watch = watch
+
+
 async def _record(
     db: Database,
     telegram_id: int,
@@ -475,6 +486,12 @@ async def _record(
     started: float,
     file_size: int | None = None,
 ) -> None:
+    if (
+        status == STATUS_FAILED
+        and platform == "instagram"
+        and _instagram_watch is not None
+    ):
+        _instagram_watch.nudge()
     await db.add_conversion(
         telegram_id, status, platform, media_type,
         file_size=file_size,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -17,7 +18,9 @@ from aiogram.types import BotCommand, BotCommandScopeChat
 from bot.config import Settings, load_settings
 from bot.db import Database
 from bot.handlers import create_root_router
+from bot.handlers.download import set_instagram_watch
 from bot.health import start_health_server
+from bot.igsession import InstagramSession
 from bot.progress import CancelRegistry
 from bot.proxy import configure_router
 from bot.runtime import config
@@ -103,6 +106,24 @@ async def run() -> None:
     )
     dispatcher.include_router(create_root_router(settings.admin_id))
 
+    # The account has been renewed by hand three times, each time after users
+    # noticed before the bot did. This asks Instagram who it is signed in as and
+    # signs back in on its own; see bot/igsession.py for why it asks rather than
+    # infers, and why acting on a wrong answer is cheap.
+    async def _tell_admin(text: str) -> None:
+        await bot.send_message(settings.admin_id, text)
+
+    ig_session = InstagramSession(
+        settings.cookies_file,
+        Path(os.getenv("IG_REQUEST_FILE", "data/iglogin_request")),
+        Path(os.getenv("IG_RESULT_FILE", "data/iglogin_result.txt")),
+        _tell_admin,
+        enabled=os.getenv("IG_AUTOLOGIN", "1") not in ("0", "false", "no"),
+    )
+    dispatcher["ig_session"] = ig_session
+    set_instagram_watch(ig_session)
+    await ig_session.start()
+
     health_runner = await start_health_server(settings.health_port)
     try:
         await _set_command_menus(bot, settings)
@@ -114,6 +135,7 @@ async def run() -> None:
         logger.info("Starting polling")
         await dispatcher.start_polling(bot)
     finally:
+        await ig_session.stop()
         await proxy_router.stop()
         await health_runner.cleanup()
         await db.close()
