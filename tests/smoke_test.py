@@ -621,11 +621,27 @@ import tempfile as _tmp
 
 from bot import igsession as _igs
 
-assert _igs._username_in('{"config":{"viewer":{"username":"an_account"}}}') == 'an_account'
-assert _igs._username_in('{"config":{"viewer":null}}') is None
-assert _igs._username_in('{"config":{}}') is None
-assert _igs._username_in('not json at all') is None
-assert _igs._username_in('{"config":{"viewer":{"username":"   "}}}') is None
+# What the probe makes of each reply. The rule that matters: only a reply in
+# which Instagram says a login is needed counts as signed out. Everything else
+# it cannot read is unknown, because two earlier versions read a page instead
+# and both called a live session dead - the login screen shows the remembered
+# account's handle, and Instagram issues a sessionid cookie to a browser it
+# merely remembers, so neither is evidence of being signed in.
+assert _igs._read_answer(200, '{"data":{"user":{"id":"1"}}}') == _igs.LIVE
+assert _igs._read_answer(401, '{"require_login":true,"status":"fail"}') == _igs.DEAD
+
+# Rate limiting wears the same 401 and the same require_login. Read as signed
+# out it would spend a login attempt on every limited minute - and logins are
+# what provoke the limit in the first place.
+assert _igs._read_answer(
+    401, '{"message":"Please wait a few minutes before you try again.",'
+         '"require_login":true}') == _igs.UNKNOWN
+
+assert _igs._read_answer(200, 'not json') == _igs.UNKNOWN
+assert _igs._read_answer(200, '{"data":{}}') == _igs.UNKNOWN
+assert _igs._read_answer(429, '') == _igs.UNKNOWN
+assert _igs._read_answer(500, '') == _igs.UNKNOWN
+assert _igs._read_answer(302, '') == _igs.UNKNOWN
 
 
 async def _note(bucket, text):

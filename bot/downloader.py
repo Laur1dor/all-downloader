@@ -10,6 +10,7 @@ the Telegram Bot API upload limit at all.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
@@ -406,6 +407,53 @@ def _impersonate_target():
         return None
 
 
+# yt-dlp treats `cookiefile` as read-write and saves the jar back when it is
+# done. That is fine for a file it owns and wrong for this one: it is shared
+# with gallery-dl, with the embed reader and with the login that produces it,
+# and it holds the Instagram session - the single value here that no code can
+# regenerate without a browser and, sometimes, a person.
+#
+# Measured 18 Sep 2026: one yt-dlp run against a jar holding eight Instagram
+# cookies left seven behind, and sessionid was the one it dropped. The same day,
+# the live jar lost its session between two timestamps with no login in between,
+# and the bot then reported Instagram as signed out - which it was, by its own
+# hand. gallery-dl, given the same file, left it untouched.
+#
+# So yt-dlp gets a copy. Whatever it writes back dies with the temporary file.
+_JAR_COPIES: dict[str, str] = {}
+
+
+def _readonly_jar(cookies_file: Path | None) -> str | None:
+    """A throwaway copy of the jar, so a tool that rewrites it cannot."""
+    if cookies_file is None:
+        return None
+    try:
+        source = cookies_file.read_bytes()
+    except OSError as exc:
+        logger.warning("Could not read the cookie jar: %s", exc)
+        return None
+    # Keyed by content, so a jar that has not changed is copied once rather than
+    # once per download, and a refreshed one is picked up on its next use.
+    key = hashlib.sha256(source).hexdigest()
+    cached = _JAR_COPIES.get(key)
+    if cached and os.path.exists(cached):
+        return cached
+    handle, copy_path = tempfile.mkstemp(prefix="tg-jar-", suffix=".txt")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(source)
+    except OSError as exc:
+        logger.warning("Could not stage the cookie jar: %s", exc)
+        return str(cookies_file)
+    for stale_key, stale in list(_JAR_COPIES.items()):
+        if stale != copy_path:
+            with suppress(OSError):
+                os.unlink(stale)
+            _JAR_COPIES.pop(stale_key, None)
+    _JAR_COPIES[key] = copy_path
+    return copy_path
+
+
 def _base_options(cookies_file: Path | None, url: str = "", force_proxy: bool = False) -> dict:
     options = {
         "quiet": True,
@@ -418,7 +466,9 @@ def _base_options(cookies_file: Path | None, url: str = "", force_proxy: bool = 
         "restrictfilenames": True,
     }
     if cookies_file is not None:
-        options["cookiefile"] = str(cookies_file)
+        staged = _readonly_jar(cookies_file)
+        if staged is not None:
+            options["cookiefile"] = staged
 
     host = (urlparse(url).hostname or "").lower()
     if any(host == h or host.endswith("." + h) for h in _IMPERSONATE_HOSTS):

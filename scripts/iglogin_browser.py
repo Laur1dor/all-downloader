@@ -180,11 +180,46 @@ def _first_visible(page, selectors):
     return None
 
 
+def _describe(page) -> None:
+    """Log what the page offered, so a failure is diagnosable from the report."""
+    try:
+        buttons = []
+        for item in page.get_by_role("button").all()[:8]:
+            label = (item.inner_text() or "").strip().replace(chr(10), " ")
+            if label:
+                buttons.append(label[:24])
+        fields = page.eval_on_selector_all("input", "els => els.map(e => e.name)")
+        log(f"page {page.url.split('?')[0]} offered buttons={buttons} inputs={fields}")
+    except Exception as exc:
+        log(f"could not read the page: {type(exc).__name__}")
+
+
+# Instagram hands a sessionid cookie to a browser it merely remembers, so its
+# presence is not authentication. Measured here: the profile held one while the
+# site kept showing the account behind a "Continue" button, and the jar written
+# from it authenticated nothing - gallery-dl got 400 from the media API with it.
+# So the question is asked of the site, using an endpoint that answers only for
+# a session that is really signed in.
+_APP_ID = "936619743392459"
+
+
 def _logged_in(page) -> bool:
-    for cookie in page.context.cookies():
-        if cookie["name"] == "sessionid" and cookie["value"]:
-            return True
-    return False
+    if not any(c["name"] == "sessionid" and c["value"]
+               for c in page.context.cookies()):
+        return False
+    try:
+        result = page.evaluate(
+            """async (appId) => {
+                const r = await fetch(
+                    '/api/v1/users/web_profile_info/?username=instagram',
+                    {headers: {'X-IG-App-ID': appId}, credentials: 'include'});
+                return {status: r.status, body: (await r.text()).slice(0, 200)};
+            }""",
+            _APP_ID,
+        )
+    except Exception:
+        return False
+    return result.get("status") == 200 and '"user"' in (result.get("body") or "")
 
 
 _CODE_FIELDS = (
@@ -208,6 +243,72 @@ def _fill_code(page, code: str) -> bool:
                 return True
         except Exception:
             continue
+    return False
+
+
+# Instagram does not always serve a form. To a browser it remembers - and the
+# profile is kept between runs precisely so it is remembered - it serves the
+# saved account and a button, with no input on the page at all. Measured: the
+# login page carried the account name, two "Continue" buttons and zero inputs,
+# so waiting for a password box timed out after 45s every time while the way in
+# was sitting there. This is the good case, not an edge case: it needs no
+# password and raises no checkpoint.
+_CONTINUE_LABELS = ("Continue", "Продолжить")
+_ANOTHER_LABELS = ("Use another profile", "Log into another account",
+                   "Войти в другой аккаунт", "Использовать другой профиль")
+
+
+def _click_named(page, labels, timeout: int = 4000) -> bool:
+    for label in labels:
+        try:
+            button = page.get_by_role("button", name=label)
+            if button.count() and button.first.is_visible():
+                button.first.click(timeout=timeout)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _one_tap(page, password: str) -> bool:
+    """Take the saved-account route if this is that page. True if signed in.
+
+    Instagram serves a remembered browser the account and a button rather than
+    a form, and the profile is kept between runs precisely to be remembered - so
+    this is the ordinary case, not an edge one. Measured: the page carried the
+    handle, two "Continue" buttons and no inputs at all, so waiting for a
+    password box timed out after 45s every time while the way in sat there.
+
+    Clicking it does not sign in by itself. It reveals a password field named
+    "pass" for that account, which is what actually completes the login.
+    """
+    try:
+        body = page.inner_text("body")[:600]
+    except Exception:
+        return False
+
+    handle = os.getenv("IG_HANDLE", "").strip()
+    if handle and handle not in body:
+        log(f"the saved account on the page is not {handle}; using the form")
+        return False
+    if not _click_named(page, _CONTINUE_LABELS):
+        return False
+    log("Instagram offered the saved account; continuing as it")
+    page.wait_for_timeout(4000)
+
+    if _logged_in(page):
+        return True
+
+    box = _first_visible(page, _PASS_FIELDS)
+    if box is None:
+        log("the saved account asked for no password and did not sign in")
+        return False
+    box.fill(password)
+    box.press("Enter")
+    for _ in range(9):
+        page.wait_for_timeout(3000)
+        if _logged_in(page):
+            return True
     return False
 
 
@@ -306,19 +407,32 @@ def run() -> int:
                 page.goto(
                     "https://www.instagram.com/accounts/login/", timeout=60000
                 )
-                page.wait_for_selector(
-                    ", ".join(_PASS_FIELDS), timeout=45000
-                )
-                user_box = _first_visible(page, _USER_FIELDS)
-                pass_box = _first_visible(page, _PASS_FIELDS)
-                if user_box is None or pass_box is None:
-                    log("the login form is not the shape this knows")
-                    return 1
-                user_box.fill(username)
-                pass_box.fill(password)
+                page.wait_for_timeout(4000)
+
                 started = time.time() - 60
-                pass_box.press("Enter")
-                page.wait_for_timeout(9000)
+                if _one_tap(page, password):
+                    log("signed in via the saved account")
+                else:
+                    try:
+                        page.wait_for_selector(
+                            ", ".join(_PASS_FIELDS), timeout=45000
+                        )
+                    except Exception:
+                        # Say what the page was rather than only that a selector
+                        # never appeared - that is the one thing a timeout does
+                        # not tell you, and it cost a day here.
+                        _describe(page)
+                        return 1
+                    user_box = _first_visible(page, _USER_FIELDS)
+                    pass_box = _first_visible(page, _PASS_FIELDS)
+                    if user_box is None or pass_box is None:
+                        log("the login form is not the shape this knows")
+                        _describe(page)
+                        return 1
+                    user_box.fill(username)
+                    pass_box.fill(password)
+                    pass_box.press("Enter")
+                    page.wait_for_timeout(9000)
 
                 if not _logged_in(page):
                     _clear_checkpoint(page, started)

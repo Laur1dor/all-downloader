@@ -11,9 +11,12 @@ reading "the session is dead" out of those is the mistake that already shipped
 once, when a live post was declared deleted on a guess. So this does not infer.
 It asks Instagram who it is signed in as.
 
-    /data/shared_data/ answers with config.viewer.username. Measured against
-    four states: the real jar named the account, while no cookies, a corrupted
-    sessionid and a removed sessionid all returned nothing.
+    It asks an endpoint that only a signed-in session can answer, rather than
+    reading a page. Two earlier versions read pages and both were fooled the
+    same way: Instagram remembers a browser and offers the account back on the
+    login screen, so the handle appears there too, and it issues a sessionid
+    cookie to a browser it merely remembers. Neither the name nor the cookie is
+    evidence of being signed in; an answer from the API is.
 
 The probe has three answers, not two, and the third is what keeps it safe. When
 the request itself cannot be made — no network, no exit, Instagram unreachable —
@@ -31,16 +34,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from html import escape as html_escape
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_SHARED_DATA = "https://www.instagram.com/data/shared_data/"
+# Ask something only a signed-in session can answer.
+#
+# Two earlier attempts read a page instead, and both were wrong in the same way.
+# /data/shared_data/ names the account - but it names it on the signed-out page
+# too, because Instagram remembers the browser and offers the account back as a
+# button. A probe that searched for the handle therefore reported a live session
+# while the site was showing a login screen, and the jar it blessed held a
+# sessionid that authenticates nothing. Presence of that cookie is not
+# authentication either: Instagram issues one to a browser it merely remembers.
+#
+# This endpoint has no such ambiguity. It answers 200 with data to a session
+# that is signed in, and 401 require_login to one that is not.
+_PROFILE_API = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram"
+)
+# The web app's own id. Without it the endpoint refuses everyone alike, which
+# would make the probe measure the header rather than the session.
+_APP_ID = "936619743392459"
+_HEADERS = {"X-IG-App-ID": _APP_ID, "Referer": "https://www.instagram.com/"}
+# Instagram rate-limits by account and says so in the same 401 shape it uses for
+# "you are not signed in", require_login included. Read as signed out, that
+# would spend a login attempt on every limited minute - and logins are what
+# provoke the limit. It is the absence of an answer, so it is UNKNOWN.
+_RATE_LIMITED = "wait a few minutes"
 _PROBE_TIMEOUT = 25
 
-# Answers of the probe. UNKNOWN is not a failure — it is the absence of an
+# Answers of the probe. UNKNOWN is not a failure - it is the absence of an
 # answer, and it must never be treated as one.
 LIVE = "live"
 DEAD = "dead"
@@ -58,15 +85,26 @@ _BACKOFF = (0, 600, 1800, 3600, 7200)
 _LOGIN_TIMEOUT = 420
 
 
-def _username_in(body: str) -> str | None:
-    """The account /data/shared_data/ says it is signed in as, if any."""
-    try:
-        data = json.loads(body)
-    except ValueError:
-        return None
-    viewer = ((data.get("config") or {}).get("viewer")) or {}
-    name = viewer.get("username")
-    return name.strip() if isinstance(name, str) and name.strip() else None
+def _read_answer(status: int, body: str) -> str:
+    """What this reply says about the session, and nothing more."""
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return UNKNOWN
+        user = ((data.get("data") or {}).get("user")) or {}
+        return LIVE if user else UNKNOWN
+    if status == 401:
+        if _RATE_LIMITED in body.lower():
+            return UNKNOWN
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return UNKNOWN
+        # Instagram saying in so many words that this needs a login.
+        return DEAD if data.get("require_login") else UNKNOWN
+    # A 429, a 5xx, a redirect: all of them describe the request, not the account.
+    return UNKNOWN
 
 
 def _probe_sync(cookies_file: Path, proxy: str | None) -> tuple[str, str | None]:
@@ -92,26 +130,27 @@ def _probe_sync(cookies_file: Path, proxy: str | None) -> tuple[str, str | None]
     try:
         session = cffi_requests.Session(
             impersonate="chrome131", proxies=proxies, cookies=cookies,
-            timeout=_PROBE_TIMEOUT,
+            headers=_HEADERS, timeout=_PROBE_TIMEOUT,
         )
     except Exception as exc:
         logger.info("Instagram probe could not start: %s", exc)
         return UNKNOWN, None
     try:
-        response = session.get(_SHARED_DATA)
+        response = session.get(_PROFILE_API)
     except Exception as exc:
         logger.info("Instagram probe did not reach the site: %s", exc)
         return UNKNOWN, None
     finally:
         session.close()
 
-    if response.status_code != 200:
-        # A 429 or a 5xx says something about the request, not the account.
-        logger.info("Instagram probe answered HTTP %s", response.status_code)
-        return UNKNOWN, None
-
-    name = _username_in(response.text)
-    return (LIVE, name) if name else (DEAD, None)
+    state = _read_answer(response.status_code, response.text)
+    if state == UNKNOWN:
+        logger.info(
+            "Instagram probe was inconclusive (HTTP %s)", response.status_code
+        )
+    # The account is named by configuration rather than by this reply, so that
+    # nothing here reports a name Instagram did not actually confirm.
+    return state, (os.getenv("IG_HANDLE") or None) if state == LIVE else None
 
 
 class InstagramSession:
