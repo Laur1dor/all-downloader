@@ -621,27 +621,28 @@ import tempfile as _tmp
 
 from bot import igsession as _igs
 
-# What the probe makes of each reply. The rule that matters: only a reply in
-# which Instagram says a login is needed counts as signed out. Everything else
-# it cannot read is unknown, because two earlier versions read a page instead
-# and both called a live session dead - the login screen shows the remembered
-# account's handle, and Instagram issues a sessionid cookie to a browser it
-# merely remembers, so neither is evidence of being signed in.
-assert _igs._read_answer(200, '{"data":{"user":{"id":"1"}}}') == _igs.LIVE
-assert _igs._read_answer(401, '{"require_login":true,"status":"fail"}') == _igs.DEAD
-
-# Rate limiting wears the same 401 and the same require_login. Read as signed
-# out it would spend a login attempt on every limited minute - and logins are
-# what provoke the limit in the first place.
+# What the probe makes of each reply, measured against a real session and two
+# controls. The rule that matters: only the JSON in which Instagram itself
+# reports nobody signed in counts as signed out.
 assert _igs._read_answer(
-    401, '{"message":"Please wait a few minutes before you try again.",'
-         '"require_login":true}') == _igs.UNKNOWN
+    200, '{"config":{"viewer":{"username":"an_account"},"viewerId":"1"}}') == (
+        _igs.LIVE, 'an_account')
+assert _igs._read_answer(
+    200, '{"config":{"csrf_token":"x","viewer":null,"viewerId":null}}') == (
+        _igs.DEAD, None)
 
-assert _igs._read_answer(200, 'not json') == _igs.UNKNOWN
-assert _igs._read_answer(200, '{"data":{}}') == _igs.UNKNOWN
-assert _igs._read_answer(429, '') == _igs.UNKNOWN
-assert _igs._read_answer(500, '') == _igs.UNKNOWN
-assert _igs._read_answer(302, '') == _igs.UNKNOWN
+# The page this serves a half-remembered browser carries the account handle
+# whether or not anybody is signed in. A version of this probe searched the body
+# for that handle and called a login screen a live session, so the rendered page
+# is now evidence of nothing.
+assert _igs._read_answer(
+    200, '<html>"username":"an_account" Create new account</html>')[0] == _igs.UNKNOWN
+
+assert _igs._read_answer(200, 'not json')[0] == _igs.UNKNOWN
+assert _igs._read_answer(200, '{"config":{}}')[0] == _igs.UNKNOWN
+assert _igs._read_answer(200, '{"config":{"viewer":{"username":"  "}}}')[0] == _igs.UNKNOWN
+assert _igs._read_answer(429, '{"config":{"viewer":null,"viewerId":"1"}}')[0] == _igs.UNKNOWN
+assert _igs._read_answer(500, '')[0] == _igs.UNKNOWN
 
 
 async def _note(bucket, text):

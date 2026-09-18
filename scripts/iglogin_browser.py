@@ -24,6 +24,7 @@ from __future__ import annotations
 import email
 import email.utils
 import imaplib
+import json
 import os
 import re
 import shutil
@@ -200,26 +201,39 @@ def _describe(page) -> None:
 # from it authenticated nothing - gallery-dl got 400 from the media API with it.
 # So the question is asked of the site, using an endpoint that answers only for
 # a session that is really signed in.
-_APP_ID = "936619743392459"
-
-
 def _logged_in(page) -> bool:
+    """Whether this browser is signed in, asked of Instagram rather than assumed.
+
+    The cookie alone proves nothing: one was present here while the site kept
+    showing the account behind a "Continue" button, and the jar written from it
+    authenticated nothing - gallery-dl got 400 from the media API with it.
+    /data/shared_data/ names the viewer when there is one, and returns a null
+    viewer when there is not.
+    """
     if not any(c["name"] == "sessionid" and c["value"]
                for c in page.context.cookies()):
         return False
     try:
         result = page.evaluate(
-            """async (appId) => {
-                const r = await fetch(
-                    '/api/v1/users/web_profile_info/?username=instagram',
-                    {headers: {'X-IG-App-ID': appId}, credentials: 'include'});
-                return {status: r.status, body: (await r.text()).slice(0, 200)};
-            }""",
-            _APP_ID,
+            """async () => {
+                const r = await fetch('/data/shared_data/',
+                                      {credentials: 'include'});
+                return {status: r.status, body: (await r.text()).slice(0, 4000)};
+            }"""
         )
     except Exception:
         return False
-    return result.get("status") == 200 and '"user"' in (result.get("body") or "")
+    if result.get("status") != 200:
+        return False
+    body = result.get("body") or ""
+    if body.lstrip()[:1] != "{":
+        return False
+    try:
+        config = (json.loads(body) or {}).get("config") or {}
+    except ValueError:
+        return False
+    viewer = config.get("viewer")
+    return bool(isinstance(viewer, dict) and (viewer.get("username") or "").strip())
 
 
 _CODE_FIELDS = (

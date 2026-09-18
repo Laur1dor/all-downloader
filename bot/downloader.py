@@ -417,9 +417,11 @@ def _impersonate_target():
 # cookies left seven behind, and sessionid was the one it dropped. The same day,
 # the live jar lost its session between two timestamps with no login in between,
 # and the bot then reported Instagram as signed out - which it was, by its own
-# hand. gallery-dl, given the same file, left it untouched.
+# hand. gallery-dl does the same on an extraction that succeeds; it only looked
+# innocent because the first jar it was measured against made it fail early.
 #
-# So yt-dlp gets a copy. Whatever it writes back dies with the temporary file.
+# So both get a copy. Whatever they write back dies with the temporary file,
+# and the jar has exactly one author: the login that produces it.
 _JAR_COPIES: dict[str, str] = {}
 
 
@@ -1776,7 +1778,14 @@ def _download_album_sync(
     if proxy:
         command += ["--proxy", proxy]
     if cookies_file is not None:
-        command += ["--cookies", str(cookies_file)]
+        # A copy here too. gallery-dl looked harmless when measured on an
+        # extraction that failed - it left the file alone - but on one that
+        # succeeds it writes the jar back like yt-dlp does, and a real download
+        # then cost the jar a cookie. Measuring only the failing case is how
+        # that got missed.
+        staged = _readonly_jar(cookies_file)
+        if staged is not None:
+            command += ["--cookies", staged]
     command.append(url)
     result = subprocess.run(
         command, capture_output=True, text=True, timeout=timeout or 180
