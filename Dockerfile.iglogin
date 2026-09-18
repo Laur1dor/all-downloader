@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir playwright==1.56.0 \
 
 WORKDIR /app
 COPY scripts/iglogin_browser.py /app/scripts/iglogin_browser.py
+# The same browser also answers "what is in this post"; see igresolve.py.
+COPY scripts/igresolve.py /app/scripts/igresolve.py
 COPY scripts/iglogin-entrypoint.sh /usr/local/bin/iglogin-entrypoint.sh
 RUN chmod +x /usr/local/bin/iglogin-entrypoint.sh \
     && sed -i 's/\r$//' /usr/local/bin/iglogin-entrypoint.sh

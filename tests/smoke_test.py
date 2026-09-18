@@ -776,4 +776,58 @@ with _tmp.TemporaryDirectory() as _d:
 
 print("instagram session watch OK")
 
+# --- the browser resolver's side of the handshake ----------------------------
+# The reading of the page happens in the other container; what is testable here
+# is what this makes of the answer. The rule that matters: a refusal and a
+# half-answer both become None, because a partial post that looks like a whole
+# one is the failure this project keeps meeting.
+import json as _rjson
+
+from bot import igbrowser as _igb
+
+
+def _resolved(payload, folder):
+    req = folder / 'rq'
+    res = folder / 'rs'
+    res.write_text(_rjson.dumps(payload), encoding='utf-8')
+    _igb.REQUEST_FILE, _igb.RESULT_FILE = req, res
+    _igb.TIMEOUT = 6
+
+    # The client deletes the result before asking, so put it back once the
+    # request appears - standing in for the container that normally answers.
+    async def _drive():
+        task = _aio.ensure_future(_igb.resolve('https://www.instagram.com/p/X/'))
+        for _ in range(20):
+            await _aio.sleep(0.2)
+            if req.exists() or not res.exists():
+                res.write_text(_rjson.dumps(payload), encoding='utf-8')
+                break
+        return await task
+
+    return _aio.run(_drive())
+
+
+with _tmp.TemporaryDirectory() as _d2:
+    _f = _pathlib.Path(_d2)
+    _ok = _resolved({'ok': True, 'seconds': 3,
+                     'items': [{'url': 'https://cdn/a.jpg', 'is_video': False},
+                               {'url': 'https://cdn/b.mp4', 'is_video': True}],
+                     'owner': 'someone', 'caption': 'hi'}, _f)
+    assert _ok is not None and len(_ok.items) == 2, _ok
+    assert _ok.items[0] == ('https://cdn/a.jpg', False)
+    assert _ok.items[1] == ('https://cdn/b.mp4', True)
+    assert _ok.owner == 'someone'
+
+    # A refusal is not a post.
+    assert _resolved({'ok': False, 'error': 'no media on the page'}, _f) is None
+    # Nor is an empty one.
+    assert _resolved({'ok': True, 'items': []}, _f) is None
+    # An item with no URL is dropped rather than downloaded as nothing; if
+    # that leaves none, the answer is None.
+    assert _resolved({'ok': True, 'items': [{'is_video': True}]}, _f) is None
+
+print('instagram browser resolver OK')
+
+
+
 print("\nALL SMOKE TESTS PASSED")

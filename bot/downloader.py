@@ -1959,6 +1959,53 @@ def _rule34_media_ok(path: Path, expected_len: int) -> bool:
     return not (head.startswith(b"<!doctype") or head.startswith(b"<html") or head[:1] == b"<")
 
 
+async def _instagram_browser_album(url: str, tmpdir: str) -> AlbumMedia | None:
+    """The post as the browser sees it, when neither cheaper road served it.
+
+    Last on purpose: it costs a page load and a Chromium where the embed costs
+    one request. It earns that only in the state both other roads are shut at
+    once - the embed answering with a null payload, and the account restricted
+    so every API call comes back as the home page - which is exactly the state
+    this was written in.
+    """
+    from bot import igbrowser
+
+    post = await igbrowser.resolve(url)
+    if post is None or not post.items:
+        return None
+
+    def _fetch() -> list[Path]:
+        from curl_cffi import requests as cffi_requests
+
+        paths: list[Path] = []
+        session = cffi_requests.Session(impersonate="chrome131", timeout=60)
+        try:
+            for index, (media_url, is_video) in enumerate(post.items):
+                destination = Path(tmpdir) / f"{index:02d}{'.mp4' if is_video else '.jpg'}"
+                written = _stream_to_file(
+                    session, media_url, destination, _ALBUM_ITEM_MAX_BYTES,
+                    None, None, {}, None, referer=instagram.REFERER,
+                )
+                if written:
+                    paths.append(destination)
+        finally:
+            session.close()
+        return paths
+
+    paths = await asyncio.to_thread(_fetch)
+    if len(paths) != len(post.items):
+        # All or nothing: half a carousel is not the post, and a partial album
+        # looks like success.
+        logger.info(
+            "Browser gave %d item(s) for %s but only %d downloaded",
+            len(post.items), url, len(paths),
+        )
+        return None
+    return AlbumMedia(
+        items=paths[:MAX_ALBUM_ITEMS], music=None, description=post.caption
+    )
+
+
 @asynccontextmanager
 async def download_album(
     url: str, cookies_file: Path | None, force_proxy: bool = False
@@ -2001,10 +2048,19 @@ async def download_album(
                             description=caption,
                         )
                     else:
-                        album = await asyncio.to_thread(
-                            _download_album_sync, url, tmpdir, cookies_file,
-                            exit_proxy, _ALBUM_RETRY_TIMEOUT if attempt else None,
-                        )
+                        try:
+                            album = await asyncio.to_thread(
+                                _download_album_sync, url, tmpdir, cookies_file,
+                                exit_proxy,
+                                _ALBUM_RETRY_TIMEOUT if attempt else None,
+                            )
+                        except DownloadFailedError:
+                            album = None
+                        if album is None or not album.items:
+                            # Both cheaper roads came back with nothing, which
+                            # is the state the browser path exists for.
+                            await asyncio.to_thread(_clear_directory, tmpdir)
+                            album = await _instagram_browser_album(url, tmpdir)
                 else:
                     album = await asyncio.to_thread(
                         _download_album_sync, url, tmpdir, cookies_file, exit_proxy,

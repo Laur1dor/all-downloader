@@ -9,6 +9,13 @@ set -eu
 REQUEST="${IG_REQUEST_FILE:-/app/data/iglogin_request}"
 POLL="${IG_POLL:-10}"
 
+# The same browser answers two questions: sign in, and what is in this post.
+# The resolver runs alongside rather than inside this loop, because a login can
+# take minutes waiting on a mailed code and a post must not queue behind it.
+python /app/scripts/igresolve.py &
+RESOLVER=$!
+echo "iglogin: resolver started (pid $RESOLVER)"
+
 echo "iglogin: waiting for a request at $REQUEST"
 while true; do
     if [ -f "$REQUEST" ]; then
