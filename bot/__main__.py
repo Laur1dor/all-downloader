@@ -122,6 +122,9 @@ async def run() -> None:
     )
     dispatcher["ig_session"] = ig_session
     set_instagram_watch(ig_session)
+    from bot import igbrowser
+
+    igbrowser.set_notifier(_tell_admin)
     await ig_session.start()
 
     health_runner = await start_health_server(settings.health_port)

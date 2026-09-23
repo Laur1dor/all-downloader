@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -150,6 +152,182 @@ def _parse(body: str) -> InstagramPost:
     )
 
 
+# --- the logged-out GraphQL read ------------------------------------------------
+#
+# The road that needs no account and still carries most posts.
+#
+# By 23 Sep every other road was shut or thinning. The account met a CAPTCHA on
+# every page, so the browser and the session saw nothing - and a CAPTCHA is for a
+# person, not for code. The embed answered with a null payload for most posts.
+# What the logged-out web app does instead is ask /api/graphql for the post by
+# media id, and it is given the post in Instagram's v1 shape. yt-dlp uses the same
+# call, but only after trying the account first whenever it has cookies - which,
+# with a restricted account, fails before it gets there - and it discards photo
+# posts entirely.
+#
+# Measured on eleven posts: seven of ten live posts served in under a second,
+# including three of the four that had just failed in the bot, reels as video
+# and carousels whole; the deleted control came back empty. The two it did not
+# serve carry a gating_ruling - hidden from logged-out visitors - and fall
+# through to the roads behind it.
+#
+# Candidate order was measured rather than assumed: the first image candidate was
+# the largest on all four posts checked and equal to the original size, up to
+# 3072x4096, and the three video types were identical. Width wins when it is
+# given; the first entry otherwise.
+_GRAPHQL_URL = "https://www.instagram.com/api/graphql"
+_GRAPHQL_DOC = "27130156389949648"
+_GRAPHQL_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery"
+_APP_ID = "936619743392459"
+_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_LSD_RE = re.compile(r'"LSD",\[\],\{"token":"([^"]+)"')
+# The token comes from the home page, which is half a megabyte. Fetching it for
+# every post would double the anonymous requests - and anonymous access is rate
+# limited per address - so it is kept for a while and refetched when refused.
+_TOKEN_TTL = 1200
+
+_token_lock = threading.Lock()
+_token: dict = {"lsd": None, "cookies": {}, "at": 0.0, "proxy": object()}
+
+
+def _media_id(code: str) -> str:
+    """The numeric id a shortcode stands for. Longer codes are private posts,
+    whose first eleven characters are the public part."""
+    value = 0
+    for char in code[:11]:
+        value = value * 64 + _ALPHABET.index(char)
+    return str(value)
+
+
+def _largest(candidates) -> str | None:
+    usable = [c for c in candidates or [] if isinstance(c, dict) and c.get("url")]
+    if not usable:
+        return None
+    if any(c.get("width") for c in usable):
+        return max(usable, key=lambda c: c.get("width") or 0)["url"]
+    return usable[0]["url"]
+
+
+def _graphql_items(product: dict) -> list[InstagramItem]:
+    nodes = product.get("carousel_media") or [product]
+    items: list[InstagramItem] = []
+    for node in nodes:
+        if node.get("video_versions") or node.get("media_type") == 2:
+            url = _largest(node.get("video_versions"))
+            if not url:
+                # Never the cover frame in place of the video.
+                raise WithheldMediaError(product.get("code") or "video")
+            items.append(InstagramItem(url, True))
+            continue
+        url = _largest((node.get("image_versions2") or {}).get("candidates"))
+        if url:
+            items.append(InstagramItem(url, False))
+    return items
+
+
+def _parse_graphql(body: str) -> InstagramPost:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return InstagramPost(state=WITHHELD)
+    media = ((data.get("data") or {}).get("xig_polaris_media")) or {}
+    product = media.get("if_not_gated_logged_out")
+    if not isinstance(product, dict):
+        # Gated for logged-out visitors, removed, or refused. Which of those it
+        # is does not matter here: every one of them goes on to the next road.
+        return InstagramPost(state=WITHHELD)
+    try:
+        items = _graphql_items(product)
+    except WithheldMediaError as exc:
+        logger.info("Instagram withheld the video for %s", exc)
+        return InstagramPost(state=WITHHELD)
+    caption = product.get("caption") or {}
+    return InstagramPost(
+        items=items,
+        caption=((caption.get("text") or "").strip() or None)
+        if isinstance(caption, dict) else None,
+        owner=(product.get("user") or {}).get("username"),
+        state=SERVED if items else WITHHELD,
+    )
+
+
+def _logged_out_token(session, proxy, refresh: bool = False):
+    """(lsd, cookies) for a logged-out client, reused while it is fresh."""
+    with _token_lock:
+        fresh = (
+            not refresh
+            and _token["lsd"]
+            and _token["proxy"] == proxy
+            and time.monotonic() - _token["at"] < _TOKEN_TTL
+        )
+        if fresh:
+            return _token["lsd"], dict(_token["cookies"])
+    home = session.get("https://www.instagram.com/").text
+    found = _LSD_RE.search(home)
+    if not found:
+        return None, {}
+    cookies = {name: value for name, value in session.cookies.items()}
+    with _token_lock:
+        _token.update(lsd=found.group(1), cookies=cookies,
+                      at=time.monotonic(), proxy=proxy)
+    return found.group(1), cookies
+
+
+def read_post_graphql(url: str, proxy: str | None = None):
+    """The post as the logged-out web app is given it. Returns (post, session)."""
+    from curl_cffi import requests as cffi_requests
+
+    code = shortcode(url)
+    if not code:
+        return InstagramPost(), None
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    session = cffi_requests.Session(
+        impersonate="chrome131", proxies=proxies, timeout=_TIMEOUT
+    )
+    try:
+        for refresh in (False, True):
+            lsd, cookies = _logged_out_token(session, proxy, refresh=refresh)
+            if not lsd:
+                break
+            for name, value in cookies.items():
+                session.cookies.set(name, value, domain=".instagram.com")
+            response = session.post(
+                _GRAPHQL_URL,
+                headers={
+                    "X-IG-App-ID": _APP_ID,
+                    "X-FB-LSD": lsd,
+                    "X-CSRFToken": cookies.get("csrftoken", ""),
+                    "X-FB-Friendly-Name": _GRAPHQL_NAME,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"https://www.instagram.com/p/{code}/",
+                },
+                data={
+                    "lsd": lsd,
+                    "fb_api_caller_class": "RelayModern",
+                    "fb_api_req_friendly_name": _GRAPHQL_NAME,
+                    "server_timestamps": "true",
+                    "variables": json.dumps(
+                        {"media_id": _media_id(code)}, separators=(",", ":")
+                    ),
+                    "doc_id": _GRAPHQL_DOC,
+                },
+            )
+            if response.status_code == 200 and response.text.lstrip()[:1] == "{":
+                post = _parse_graphql(response.text)
+                if post:
+                    return post, session
+                session.close()
+                return post, None
+            # A stale token is answered with something that is not the JSON;
+            # one refetch, then this road has had its turn.
+            logger.debug("Instagram GraphQL answered HTTP %s", response.status_code)
+    except Exception as exc:
+        logger.debug("Instagram GraphQL read failed: %s", exc)
+    session.close()
+    return InstagramPost(), None
+
+
 def read_post(url: str, proxy: str | None = None):
     """The post's media, or an empty result. Returns (post, session).
 
@@ -162,6 +340,12 @@ def read_post(url: str, proxy: str | None = None):
     code = shortcode(url)
     if not code:
         return InstagramPost(), None
+
+    # The logged-out GraphQL read carries most posts; the embed is kept behind
+    # it for the ones it does not.
+    post, session = read_post_graphql(url, proxy)
+    if post and session is not None:
+        return post, session
 
     last = InstagramPost()
 

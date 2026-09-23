@@ -828,6 +828,99 @@ with _tmp.TemporaryDirectory() as _d2:
 
 print('instagram browser resolver OK')
 
+# --- the logged-out GraphQL read -------------------------------------------------
+from bot import instagram as _igq
+
+# Shortcode to media id, checked against a real post.
+assert _igq._media_id('DaU8OdPxuwW') == '3933033250867833878'
+
+# Largest candidate: by width when given; the first entry otherwise, because the
+# first was measured to be the original size on every post checked.
+assert _igq._largest([{'url': 's', 'width': 320}, {'url': 'L', 'width': 1080}]) == 'L'
+assert _igq._largest([{'url': 'first'}, {'url': 'second'}]) == 'first'
+assert _igq._largest([]) is None
+
+
+def _gql(product):
+    return _json.dumps({'data': {'xig_polaris_media': {
+        'if_not_gated_logged_out': product}}})
+
+
+_photo = _igq._parse_graphql(_gql({
+    'code': 'X', 'media_type': 1, 'user': {'username': 'someone'},
+    'caption': {'text': '  hi  '},
+    'image_versions2': {'candidates': [{'url': 'https://cdn/big.jpg'},
+                                       {'url': 'https://cdn/small.jpg'}]}}))
+assert [(i.url, i.is_video) for i in _photo.items] == [('https://cdn/big.jpg', False)]
+assert _photo.owner == 'someone' and _photo.caption == 'hi'
+
+_reel = _igq._parse_graphql(_gql({
+    'code': 'R', 'media_type': 2,
+    'video_versions': [{'type': 101, 'url': 'https://cdn/v.mp4'}],
+    'image_versions2': {'candidates': [{'url': 'https://cdn/cover.jpg'}]}}))
+assert [(i.url, i.is_video) for i in _reel.items] == [('https://cdn/v.mp4', True)], (
+    'a reel must come back as its video, never its cover')
+
+_car = _igq._parse_graphql(_gql({
+    'code': 'C', 'carousel_media': [
+        {'image_versions2': {'candidates': [{'url': 'https://cdn/1.jpg'}]}},
+        {'media_type': 2, 'video_versions': [{'url': 'https://cdn/2.mp4'}]}]}))
+assert [i.is_video for i in _car.items] == [False, True]
+
+# A video with no URL is not the post, and half a carousel is not either.
+assert not _igq._parse_graphql(_gql({'code': 'W', 'media_type': 2,
+    'image_versions2': {'candidates': [{'url': 'https://cdn/cover.jpg'}]}}))
+# Gated, removed or refused: nothing, and no verdict about which.
+assert not _igq._parse_graphql(_json.dumps({'data': {'xig_polaris_media': {
+    'if_not_gated_logged_out': None, 'gating_ruling': {}}}}))
+assert not _igq._parse_graphql(_json.dumps({'data': {'xig_polaris_media': {}}}))
+assert not _igq._parse_graphql('not json')
+
+# --- every Instagram road empty must end in 'not found', not a crash ---------
+import bot.downloader as _dlz
+
+_saved = (_dlz._instagram_items_sync, _dlz._download_album_sync,
+          _dlz._instagram_browser_album)
+
+
+def _empty_items(*_a, **_k):
+    return [], None
+
+
+def _gdl_fails(*_a, **_k):
+    raise _dlz.DownloadFailedError('gallery-dl found nothing')
+
+
+async def _browser_none(*_a, **_k):
+    return None
+
+
+async def _open_album():
+    async with _dlz.download_album('https://www.instagram.com/p/AAAAAAAAAAA/', None):
+        return 'opened'
+
+
+_dlz._instagram_items_sync = _empty_items
+_dlz._download_album_sync = _gdl_fails
+_dlz._instagram_browser_album = _browser_none
+try:
+    try:
+        _aio.run(_open_album())
+        raise AssertionError('an empty post must not open as an album')
+    except _dlz.DownloadFailedError:
+        pass
+finally:
+    (_dlz._instagram_items_sync, _dlz._download_album_sync,
+     _dlz._instagram_browser_album) = _saved
+
+# While a CAPTCHA answer is fresh, the browser is not asked again: every page
+# meets it, so each ask is eleven seconds and one more page load on a flagged
+# account for an answer known in advance.
+_igb._captcha_until = __import__('time').monotonic() + 60
+assert _aio.run(_igb.resolve('https://www.instagram.com/p/X/')) is None
+_igb._captcha_until = 0.0
+print('instagram graphql reader OK')
+
 
 
 print("\nALL SMOKE TESTS PASSED")

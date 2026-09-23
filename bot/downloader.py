@@ -2023,6 +2023,10 @@ async def download_album(
     try:
         album = None
         last_error: DownloadFailedError | None = None
+        # The browser has its own network in its own container, so walking the
+        # exit ladder changes nothing for it. It used to run once per exit -
+        # twenty seconds each, twice over, for the same answer.
+        browser_tried = False
         for attempt, exit_proxy in enumerate(exits):
             if attempt:
                 # Each attempt starts from an empty directory: a half-finished
@@ -2056,9 +2060,10 @@ async def download_album(
                             )
                         except DownloadFailedError:
                             album = None
-                        if album is None or not album.items:
+                        if (album is None or not album.items) and not browser_tried:
                             # Both cheaper roads came back with nothing, which
                             # is the state the browser path exists for.
+                            browser_tried = True
                             await asyncio.to_thread(_clear_directory, tmpdir)
                             album = await _instagram_browser_album(url, tmpdir)
                 else:
@@ -2076,7 +2081,10 @@ async def download_album(
                 last_error = DownloadFailedError("Не удалось скачать пост: сетевая ошибка.")
                 last_error.__cause__ = exc
                 continue
-            if album.items:
+            # None is a real answer here: every Instagram road can come back
+            # empty, and the browser returns None rather than an empty album.
+            # Reading .items off it crashed instead of saying "not found".
+            if album is not None and album.items:
                 break
         if album is None or not album.items:
             if last_error is not None:

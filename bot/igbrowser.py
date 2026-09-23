@@ -42,6 +42,44 @@ ENABLED = os.getenv("IG_RESOLVE", "1") not in ("0", "false", "no")
 # profile, and two of those at once would fight over it.
 _lock = asyncio.Lock()
 
+# Who to tell when the account itself needs a person, and when it was last done.
+# A CAPTCHA cannot be answered by code - nothing here should try - so the only
+# useful thing is to say so, and not every time a link fails.
+_notify = None
+_CAPTCHA_NOTICE_EVERY = 12 * 3600
+_last_captcha_notice = 0.0
+# How long a CAPTCHA answer is believed before the browser is tried again. While
+# one is up, every page load meets it - measured: every post, including ones
+# other roads still fetched - so asking again costs eleven seconds per link and
+# one more page load on an account that is already flagged, for an answer known
+# in advance. Short enough that a CAPTCHA solved by hand is noticed soon after.
+_CAPTCHA_MEMO = int(os.getenv("IG_CAPTCHA_MEMO", "900"))
+_captcha_until = 0.0
+
+
+def set_notifier(notify) -> None:
+    global _notify
+    _notify = notify
+
+
+async def _captcha_notice() -> None:
+    global _last_captcha_notice
+    now = time.monotonic()
+    if _notify is None or (
+        _last_captcha_notice and now - _last_captcha_notice < _CAPTCHA_NOTICE_EVERY
+    ):
+        return
+    try:
+        await _notify(
+            "⚠️ Instagram просит капчу у аккаунта бота. Её может пройти "
+            "только человек: зайдите в этот аккаунт в браузере или приложении "
+            "и подтвердите. Пока капча висит, посты, скрытые от незалогиненных, "
+            "не скачиваются; остальные бот берёт без аккаунта."
+        )
+        _last_captcha_notice = now
+    except Exception:
+        logger.exception("Could not tell the admin about the captcha")
+
 
 @dataclass
 class ResolvedPost:
@@ -52,7 +90,11 @@ class ResolvedPost:
 
 async def resolve(url: str) -> ResolvedPost | None:
     """The post's media, or None when the browser could not produce it."""
+    global _captcha_until
     if not ENABLED:
+        return None
+    if time.monotonic() < _captcha_until:
+        logger.info("Browser skipped for %s: the account is behind a captcha", url)
         return None
 
     async with _lock:
@@ -84,6 +126,9 @@ async def resolve(url: str) -> ResolvedPost | None:
                     "Browser could not resolve %s: %s",
                     url, payload.get("error", "no reason given"),
                 )
+                if payload.get("captcha"):
+                    _captcha_until = time.monotonic() + _CAPTCHA_MEMO
+                    await _captcha_notice()
                 return None
 
             items = [

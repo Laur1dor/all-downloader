@@ -118,6 +118,12 @@ def _shortcode(url: str) -> str | None:
     return found.group(1) if found else None
 
 
+def _challenged(page) -> bool:
+    """Whether Instagram put a challenge in front of the page instead of it."""
+    where = page.url or ""
+    return "/auth_platform/" in where or "/challenge/" in where
+
+
 def _dismiss(page) -> None:
     """Whatever one-button page is in the way, including the scraping warning."""
     for label in ("Dismiss", "Not now", "Не сейчас", "Закрыть"):
@@ -153,6 +159,12 @@ def resolve(url: str) -> dict:
         try:
             page.goto(f"https://www.instagram.com/p/{code}/", timeout=NAV_TIMEOUT)
             page.wait_for_timeout(PAGE_WAIT)
+            if _challenged(page):
+                # Measured 23 Sep: every post, including ones other roads could
+                # still fetch, redirected here. No page load will get past it,
+                # and nothing here should try - it is for a person.
+                return {"ok": False, "captcha": True,
+                        "error": "instagram is asking this account for a captcha"}
             data = page.evaluate(_EXTRACT, code)
             if not data.get("found"):
                 # One retry behind whatever interstitial appeared, then give up
