@@ -323,6 +323,36 @@ def _yandex_to_ytsearch_sync(url: str) -> str:
 
 
 
+def _unwrap_login_redirect(url: str) -> str:
+    """The video a TikTok login redirect is standing in front of.
+
+    TikTok now answers some short links with /login?redirect_url=<the video>
+    &enter_method=mandatory instead of the video - measured on several links,
+    all of them clips that are region-blocked for this address. The expander
+    took that as the expansion, so the bot went on to download the login page:
+    no video in it ("this is a photo post"), then gallery-dl refusing an
+    unsupported URL. The real address is in the query, and the ordinary exit
+    ladder fetches it - through the configured router, every rung served a
+    region-blocked clip that the direct route could not.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not (host == "tiktok.com" or host.endswith(".tiktok.com")):
+        return url
+    if not parsed.path.rstrip("/").endswith("/login"):
+        return url
+    from urllib.parse import parse_qs
+
+    target = (parse_qs(parsed.query).get("redirect_url") or [""])[0]
+    inner = urlparse(target)
+    inner_host = (inner.hostname or "").lower()
+    if inner.scheme in ("http", "https") and (
+        inner_host == "tiktok.com" or inner_host.endswith(".tiktok.com")
+    ):
+        return target
+    return url
+
+
 async def expand_short_link(url: str) -> str:
     """Follow a per-share short link to the address that names the post.
 
@@ -358,7 +388,7 @@ async def expand_short_link(url: str) -> str:
                 except Exception as exc:
                     last_exc = exc
                     continue
-                resolved = str(response.url or url)
+                resolved = _unwrap_login_redirect(str(response.url or url))
                 if resolved != url:
                     return resolved
         if last_exc is not None:

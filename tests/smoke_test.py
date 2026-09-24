@@ -920,6 +920,25 @@ _igb._captcha_until = __import__('time').monotonic() + 60
 assert _aio.run(_igb.resolve('https://www.instagram.com/p/X/')) is None
 _igb._captcha_until = 0.0
 print('instagram graphql reader OK')
+# --- TikTok's login redirect ------------------------------------------------------
+# Some short links now land on /login?redirect_url=<video>; the video is what the
+# link means, and downloading the login page is what the bot used to do instead.
+from bot.downloader import _unwrap_login_redirect as _unwrap
+
+_login = ("https://www.tiktok.com/login?redirect_url=https%3A%2F%2Fwww.tiktok.com"
+          "%2F%407d5.4%2Fvideo%2F7465397792442273031%3F_r%3D1%26_t%3DZS-9A0CeOlFsqg"
+          "&lang=en&enter_method=mandatory")
+assert _unwrap(_login).startswith(
+    "https://www.tiktok.com/@7d5.4/video/7465397792442273031"), _unwrap(_login)
+# Anything else passes through untouched.
+assert _unwrap("https://www.tiktok.com/@a/video/1") == "https://www.tiktok.com/@a/video/1"
+assert _unwrap("https://example.com/login?redirect_url=https://www.tiktok.com/@a/video/1") \
+    == "https://example.com/login?redirect_url=https://www.tiktok.com/@a/video/1"
+# A redirect that points off TikTok is not followed.
+assert _unwrap("https://www.tiktok.com/login?redirect_url=https%3A%2F%2Fevil.example%2F") \
+    .startswith("https://www.tiktok.com/login")
+print('tiktok login redirect OK')
+
 
 
 
