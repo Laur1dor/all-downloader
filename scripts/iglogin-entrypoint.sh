@@ -16,8 +16,18 @@ python /app/scripts/igresolve.py &
 RESOLVER=$!
 echo "iglogin: resolver started (pid $RESOLVER)"
 
+# And a third: on request, put this browser's screen in front of a person so
+# they can answer a CAPTCHA on the account. Idle otherwise - nothing listens.
+python /app/scripts/igremote.py &
+echo "iglogin: remote screen helper started (pid $!)"
+
 echo "iglogin: waiting for a request at $REQUEST"
 while true; do
+    if [ -f "$REQUEST" ] && [ -f /app/data/igremote.active ]; then
+        # A person has the browser; the login waits for them to finish.
+        sleep "$POLL"
+        continue
+    fi
     if [ -f "$REQUEST" ]; then
         rm -f "$REQUEST"
         echo "iglogin: request received"

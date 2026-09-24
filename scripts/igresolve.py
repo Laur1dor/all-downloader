@@ -143,6 +143,10 @@ def resolve(url: str) -> dict:
     code = _shortcode(url)
     if not code:
         return {"ok": False, "error": "not an instagram post link"}
+    if Path(os.getenv("IG_REMOTE_ACTIVE", "/app/data/igremote.active")).exists():
+        # A person has the browser open to answer a CAPTCHA. Launching a second
+        # Chromium on the same profile would fail on its lock - or worse, win it.
+        return {"ok": False, "error": "the browser is in use for a captcha"}
 
     with sync_playwright() as driver:
         context = driver.chromium.launch_persistent_context(

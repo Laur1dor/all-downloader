@@ -170,6 +170,10 @@ services:
       - ${DNS_SERVER:-172.18.0.1}
     volumes:
       - ./data:/app/data
+    # noVNC, for answering a CAPTCHA by hand (scripts/igremote.py). Nothing
+    # listens here between sessions, and each session has its own password.
+    ports:
+      - "${IG_REMOTE_PORT:-6080}:6080"
     restart: unless-stopped
 
   # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's

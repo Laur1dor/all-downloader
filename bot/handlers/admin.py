@@ -334,6 +334,24 @@ async def _run_iglogin() -> tuple[bool, str]:
     )
 
 
+# A CAPTCHA on the account is for a person. This puts the server's own browser
+# in front of one - see scripts/igremote.py - because the session that has to
+# answer it lives in that browser's profile, not on anybody's phone.
+_IGREMOTE_REQUEST = Path(os.getenv("IG_REMOTE_REQUEST", "data/igremote_request"))
+_IGREMOTE_STATUS = Path(os.getenv("IG_REMOTE_STATUS", "data/igremote_status.json"))
+_IGREMOTE_URL = os.getenv("IG_REMOTE_URL", "").rstrip("/")
+_IGREMOTE_LIFETIME = int(os.getenv("IG_REMOTE_LIFETIME", "1200"))
+
+
+def _igremote_status() -> dict:
+    try:
+        import json as _json
+
+        return _json.loads(_IGREMOTE_STATUS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 def create_router(admin_id: int) -> Router:
     router = Router(name="admin")
     router.message.filter(F.from_user.id == admin_id)
@@ -432,6 +450,81 @@ def create_router(admin_id: int) -> Router:
             await notice.edit_text(
                 head + NEWLINE + NEWLINE + "<pre>" + html.escape(report) + "</pre>"
             )
+
+    @router.message(Command("igcaptcha"))
+    async def handle_igcaptcha(message: Message, ig_session=None) -> None:
+        if not _IGREMOTE_URL:
+            await message.answer(
+                "\u26a0 Не настроено: в <code>.env</code> нужен "
+                "<code>IG_REMOTE_URL</code>, например "
+                "<code>http://192.168.1.107:6080</code>."
+            )
+            return
+        with suppress(FileNotFoundError):
+            _IGREMOTE_STATUS.unlink()
+        _IGREMOTE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        _IGREMOTE_REQUEST.write_text(str(int(time.time())), encoding="utf-8")
+        notice = await message.answer("\U0001f5a5 Поднимаю браузер сервера…")
+
+        status: dict = {}
+        for _ in range(40):
+            await asyncio.sleep(1.5)
+            status = _igremote_status()
+            if status.get("state") in ("open", "failed", "signed_in"):
+                break
+        if status.get("state") == "signed_in":
+            await notice.edit_text("\u2705 Капчи нет, сессия в порядке.")
+            return
+        if status.get("state") != "open":
+            await notice.edit_text(
+                "\u26a0 Браузер не поднялся: "
+                + html.escape(str(status.get("error") or "нет ответа"))
+            )
+            return
+
+        link = (f"{_IGREMOTE_URL}/vnc.html?autoconnect=1&resize=scale"
+                f"&password={status['password']}")
+        lead = ("Instagram показывает капчу." if status.get("challenged")
+                else "Капчи сейчас нет — можно просто проверить, что всё в порядке.")
+        await notice.edit_text(
+            f"\U0001f5a5 {lead}" + NEWLINE + NEWLINE
+            + f'<a href="{html.escape(link)}">Открыть браузер сервера</a>'
+            + NEWLINE + NEWLINE
+            + "Пройди капчу сам — как только Instagram её уберёт, бот сохранит "
+            "сессию и закроет доступ. Работает из домашней сети; ссылка живёт "
+            f"{_IGREMOTE_LIFETIME // 60} минут."
+        )
+
+        # Wait for the person, then say how it ended.
+        deadline = time.monotonic() + _IGREMOTE_LIFETIME + 60
+        while time.monotonic() < deadline:
+            await asyncio.sleep(5)
+            state = _igremote_status().get("state")
+            if state in ("signed_in", "cleared_not_signed_in", "expired", "failed"):
+                break
+        else:
+            state = "expired"
+
+        from bot import igbrowser
+
+        if state == "signed_in":
+            igbrowser._captcha_until = 0.0
+            await message.answer("\u2705 Капча пройдена, сессия сохранена. "
+                                 "Посты 18+ снова качаются.")
+        elif state == "cleared_not_signed_in":
+            igbrowser._captcha_until = 0.0
+            await message.answer("\u2705 Капча пройдена. Вхожу в аккаунт…")
+            if ig_session is not None and getattr(ig_session, "enabled", False):
+                ok, report = await ig_session.login_now()
+                await message.answer(
+                    ("\u2705 Вошёл." if ok else "\u26a0 Войти не вышло: ")
+                    + ("" if ok else "<pre>" + html.escape(report[-600:]) + "</pre>")
+                )
+        elif state == "expired":
+            await message.answer("\u231b Время вышло, браузер закрыт. "
+                                 "Можно запустить /igcaptcha ещё раз.")
+        else:
+            await message.answer("\u26a0 Сессия с браузером оборвалась.")
 
     @router.message(Command("control"))
     async def handle_control(message: Message) -> None:
