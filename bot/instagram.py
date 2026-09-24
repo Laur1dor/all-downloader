@@ -65,6 +65,9 @@ class InstagramPost:
     caption: str | None = None
     owner: str | None = None
     state: str = WITHHELD
+    # Set only when Instagram itself said why it withheld the post - never
+    # inferred from an empty answer. See _gate_of.
+    gate: str | None = None
 
     def __bool__(self) -> bool:
         return bool(self.items)
@@ -225,6 +228,28 @@ def _graphql_items(product: dict) -> list[InstagramItem]:
     return items
 
 
+AGE_GATE = "age"
+
+
+def _gate_of(media: dict) -> str | None:
+    """Instagram's own reason for withholding the post, when it gives one.
+
+    Age-restricted posts come back with a gating_ruling that says so in words -
+    measured on both such posts to hand: gating_type 3, title "Age-restricted
+    content". Nothing anonymous can serve those: the embed answered null and the
+    browser needed the signed-in account. So this is the one withheld answer
+    that is allowed to change the route, and only because Instagram stated it
+    rather than because something came back empty.
+    """
+    ruling = media.get("gating_ruling")
+    if not isinstance(ruling, dict):
+        return None
+    words = " ".join(
+        str(ruling.get(key) or "") for key in ("title", "description")
+    ).lower()
+    return AGE_GATE if "age-restricted" in words else None
+
+
 def _parse_graphql(body: str) -> InstagramPost:
     try:
         data = json.loads(body)
@@ -233,9 +258,10 @@ def _parse_graphql(body: str) -> InstagramPost:
     media = ((data.get("data") or {}).get("xig_polaris_media")) or {}
     product = media.get("if_not_gated_logged_out")
     if not isinstance(product, dict):
-        # Gated for logged-out visitors, removed, or refused. Which of those it
-        # is does not matter here: every one of them goes on to the next road.
-        return InstagramPost(state=WITHHELD)
+        # Gated for logged-out visitors, removed, or refused. Only the first,
+        # and only when Instagram names it, is recorded; the rest go on to the
+        # next road as they always did.
+        return InstagramPost(state=WITHHELD, gate=_gate_of(media))
     try:
         items = _graphql_items(product)
     except WithheldMediaError as exc:
@@ -346,6 +372,9 @@ def read_post(url: str, proxy: str | None = None):
     post, session = read_post_graphql(url, proxy)
     if post and session is not None:
         return post, session
+    if post.gate == AGE_GATE:
+        # The embed is anonymous too; it answered null for these. Skip it.
+        return post, None
 
     last = InstagramPost()
 

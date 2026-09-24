@@ -172,6 +172,10 @@ class DownloadFailedError(Exception):
         self.retry_via_proxy = retry_via_proxy
 
 
+class AgeRestrictedError(DownloadFailedError):
+    """Instagram said the post is age-restricted, so only the account can fetch it."""
+
+
 class NotAVideoPostError(DownloadFailedError):
     """The link is a real post, but a carousel rather than a video.
 
@@ -1706,13 +1710,19 @@ async def _instagram_first(
         ) as media:
             yield media
             return
-    except (DownloadCancelledError, OversizedError):
+    except (DownloadCancelledError, OversizedError, AgeRestrictedError):
         raise
     except Exception as exc:
         logger.info("Instagram embed did not serve %s (%s); using yt-dlp", url, exc)
 
     async with fallback() as media:
         yield media
+
+
+_AGE_RESTRICTED_MESSAGE = (
+    "Этот пост с возрастным ограничением: Instagram показывает его только "
+    "залогиненным взрослым аккаунтам, а войти сейчас не получилось."
+)
 
 
 def _instagram_items_sync(
@@ -1736,6 +1746,8 @@ def _instagram_items_sync(
     if not post or session is None:
         if session is not None:
             session.close()
+        if post.gate == instagram.AGE_GATE:
+            raise AgeRestrictedError(_AGE_RESTRICTED_MESSAGE)
         return [], None
 
     paths: list[Path] = []
@@ -2072,10 +2084,36 @@ async def download_album(
                     # No session, so nothing here can expire. gallery-dl still
                     # runs when this comes back empty, which is what a private
                     # account looks like.
-                    paths, caption = await asyncio.to_thread(
-                        _instagram_items_sync, url, tmpdir, exit_proxy,
-                        _ALBUM_ITEM_MAX_BYTES, None, None, {},
-                    )
+                    try:
+                        paths, caption = await asyncio.to_thread(
+                            _instagram_items_sync, url, tmpdir, exit_proxy,
+                            _ALBUM_ITEM_MAX_BYTES, None, None, {},
+                        )
+                    except AgeRestrictedError as exc:
+                        # Instagram said so itself, and nothing anonymous can
+                        # serve it: straight to the roads that use the account.
+                        # gallery-dl first - two seconds while the account's
+                        # API is restricted, but the quick one once it is not -
+                        # then the browser, which measured 4 of 4 at 12-13s.
+                        age_error = exc
+                        paths, caption = [], None
+                        album = None
+                        try:
+                            album = await asyncio.to_thread(
+                                _download_album_sync, url, tmpdir, cookies_file,
+                                exit_proxy, None,
+                            )
+                        except DownloadFailedError:
+                            album = None
+                        if (album is None or not album.items) and not browser_tried:
+                            browser_tried = True
+                            await asyncio.to_thread(_clear_directory, tmpdir)
+                            album = await _instagram_browser_album(url, tmpdir)
+                        if album is None or not album.items:
+                            # Walking the exit ladder cannot change an age gate.
+                            last_error = age_error
+                            break
+                        break
                     if paths:
                         album = AlbumMedia(
                             items=paths[:MAX_ALBUM_ITEMS], music=None,

@@ -920,6 +920,71 @@ _igb._captcha_until = __import__('time').monotonic() + 60
 assert _aio.run(_igb.resolve('https://www.instagram.com/p/X/')) is None
 _igb._captcha_until = 0.0
 print('instagram graphql reader OK')
+
+# --- age-restricted posts go straight to the account roads -----------------------
+# Only when Instagram says so in words - the one withheld answer allowed to
+# change the route. Measured: gating_type 3, title "Age-restricted content".
+_age_media = {'if_not_gated_logged_out': None, 'gating_ruling': {
+    'gating_type': 3, 'title': 'Age-restricted content',
+    'description': 'This content is age-restricted based on your age or account settings.'}}
+assert _igq._gate_of(_age_media) == _igq.AGE_GATE
+assert _igq._gate_of({'gating_ruling': {'title': 'Sensitive content'}}) is None
+assert _igq._gate_of({}) is None
+_gated = _igq._parse_graphql(_json.dumps({'data': {'xig_polaris_media': _age_media}}))
+assert not _gated and _gated.gate == _igq.AGE_GATE
+# An empty answer with no stated reason carries no gate - no inference.
+assert _igq._parse_graphql(_json.dumps({'data': {'xig_polaris_media': {}}})).gate is None
+
+# read_post skips the embed on a stated age gate (the embed is anonymous too).
+_saved_gql = _igq.read_post_graphql
+_embed_asked = []
+_igq.read_post_graphql = lambda url, proxy=None: (_gated, None)
+_saved_parse = _igq._parse
+_igq._parse = lambda body: _embed_asked.append(1) or _igq.InstagramPost()
+try:
+    _p, _s = _igq.read_post('https://www.instagram.com/p/AAAAAAAAAAA/')
+    assert _p.gate == _igq.AGE_GATE and _s is None
+    assert not _embed_asked, 'the embed must not be asked about an age-gated post'
+finally:
+    _igq.read_post_graphql = _saved_gql
+    _igq._parse = _saved_parse
+
+# The album path: age gate -> gallery-dl -> browser, once, then an honest error.
+_saved3 = (_dlz._instagram_items_sync, _dlz._download_album_sync,
+           _dlz._instagram_browser_album)
+_calls = {'gdl': 0, 'browser': 0}
+
+
+def _age_items(*_a, **_k):
+    raise _dlz.AgeRestrictedError(_dlz._AGE_RESTRICTED_MESSAGE)
+
+
+def _gdl_count(*_a, **_k):
+    _calls['gdl'] += 1
+    raise _dlz.DownloadFailedError('redirect to home page')
+
+
+async def _browser_count(*_a, **_k):
+    _calls['browser'] += 1
+    return None
+
+
+_dlz._instagram_items_sync = _age_items
+_dlz._download_album_sync = _gdl_count
+_dlz._instagram_browser_album = _browser_count
+try:
+    try:
+        _aio.run(_open_album())
+        raise AssertionError('an age-gated post nobody could fetch must not open')
+    except _dlz.AgeRestrictedError as _exc:
+        assert 'возрастным' in str(_exc), str(_exc)
+    assert _calls['browser'] == 1, _calls
+    assert _calls['gdl'] == 1, ('the exit ladder cannot change an age gate', _calls)
+finally:
+    (_dlz._instagram_items_sync, _dlz._download_album_sync,
+     _dlz._instagram_browser_album) = _saved3
+print('instagram age gate OK')
+
 # --- TikTok's login redirect ------------------------------------------------------
 # Some short links now land on /login?redirect_url=<video>; the video is what the
 # link means, and downloading the login page is what the bot used to do instead.
