@@ -414,6 +414,35 @@ def _clear_checkpoint(page, since: float) -> None:
     log(f"checkpoint not cleared within {_CHECKPOINT_WAIT}s")
 
 
+def clear_stale_profile_lock(profile: Path) -> None:
+    """Remove Chromium's singleton lock when the browser holding it is gone.
+
+    The lock is a symlink naming host-pid. When the container is recreated while
+    a browser is open, the browser dies without removing it, and every launch in
+    the new container then sees the profile "in use on another computer" and
+    refuses - measured: the lock still named the old container's hostname and
+    every launch failed until it was cleared. The lock is removed only when its
+    owner is provably not a live process here, so two browsers are never let
+    onto one profile.
+    """
+    import socket
+
+    lock = profile / "SingletonLock"
+    try:
+        target = os.readlink(lock)
+    except OSError:
+        return
+    host, _, pid = target.rpartition("-")
+    if host == socket.gethostname() and pid.isdigit() and Path(f"/proc/{pid}").exists():
+        return
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile / name).unlink()
+        except OSError:
+            pass
+    log(f"cleared a stale browser lock left by {target}")
+
+
 def run() -> int:
     username = os.getenv("IG_USERNAME", "")
     password = os.getenv("IG_PASSWORD", "")
@@ -424,6 +453,7 @@ def run() -> int:
     from playwright.sync_api import sync_playwright
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    clear_stale_profile_lock(PROFILE_DIR)
     with sync_playwright() as driver:
         context = driver.chromium.launch_persistent_context(
             str(PROFILE_DIR),

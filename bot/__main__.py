@@ -111,8 +111,17 @@ async def run() -> None:
     # noticed before the bot did. This asks Instagram who it is signed in as and
     # signs back in on its own; see bot/igsession.py for why it asks rather than
     # infers, and why acting on a wrong answer is cheap.
-    async def _tell_admin(text: str) -> None:
-        await bot.send_message(settings.admin_id, text)
+    async def _tell_admin(text: str, kind: str | None = None) -> None:
+        markup = None
+        if kind == "captcha":
+            # One tap from the notice to a link, so a CAPTCHA that appears at
+            # night costs a tap in the morning rather than a command to recall.
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+            markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="\U0001f5a5 Пройти капчу", callback_data="igcaptcha",
+            )]])
+        await bot.send_message(settings.admin_id, text, reply_markup=markup)
 
     ig_session = InstagramSession(
         settings.cookies_file,

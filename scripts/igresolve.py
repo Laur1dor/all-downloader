@@ -148,6 +148,10 @@ def resolve(url: str) -> dict:
         # Chromium on the same profile would fail on its lock - or worse, win it.
         return {"ok": False, "error": "the browser is in use for a captcha"}
 
+    sys.path.insert(0, "/app/scripts")
+    from iglogin_browser import clear_stale_profile_lock
+
+    clear_stale_profile_lock(PROFILE_DIR)
     with sync_playwright() as driver:
         context = driver.chromium.launch_persistent_context(
             str(PROFILE_DIR),

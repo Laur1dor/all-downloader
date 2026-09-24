@@ -37,6 +37,25 @@ DISPLAY = ":99"
 SCREEN = os.getenv("IG_REMOTE_SCREEN", "900x1200")
 LIFETIME = int(os.getenv("IG_REMOTE_LIFETIME", "1200"))
 _CHALLENGE_MARKS = ("/auth_platform/", "/challenge/")
+# A public address, so the link works from a phone that is not on the home
+# network. It comes from the igtunnel service, which runs a Cloudflare quick
+# tunnel through the VPN - run from this machine's own line, the tunnel
+# registered and then answered 530 to everything. That service reports its
+# hostname on its metrics port, which is how this learns it without being given
+# the docker socket.
+TUNNEL_METRICS = os.getenv("IG_REMOTE_TUNNEL_METRICS", "http://tun2socks:20241")
+
+
+def _public_address() -> str | None:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{TUNNEL_METRICS}/quicktunnel", timeout=5) as r:
+            host = (json.loads(r.read() or b"{}") or {}).get("hostname")
+    except Exception as exc:
+        log(f"no public address: {type(exc).__name__}")
+        return None
+    return f"https://{host}" if host else None
 
 
 def log(message: str) -> None:
@@ -60,9 +79,14 @@ def _challenged(url: str) -> bool:
 def session() -> None:
     from playwright.sync_api import sync_playwright
 
-    from iglogin_browser import _logged_in, write_cookies
+    from iglogin_browser import _logged_in, clear_stale_profile_lock, write_cookies
 
+    # With the tunnel the page can be reached from the internet for the life of
+    # the session. A VNC password is at most eight characters, so the length an
+    # outsider would have to guess lives in the address instead: the page is
+    # served only under a random path, and the password guards the screen.
     password = secrets.token_urlsafe(6)[:8]
+    token = secrets.token_urlsafe(18)
     width, height = SCREEN.split("x")
     procs: list[subprocess.Popen] = []
     ACTIVE_FILE.write_text(str(int(time.time())), encoding="utf-8")
@@ -79,14 +103,27 @@ def session() -> None:
              "-passwd", password, "-forever", "-shared", "-quiet", "-noxdamage"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
+        # The static page is served from a directory whose name is the token,
+        # so the address is unguessable as well as the password.
+        web_root = Path("/tmp/igremote-web")
+        if web_root.exists():
+            subprocess.run(["rm", "-rf", str(web_root)], check=False)
+        (web_root).mkdir(parents=True)
+        # An empty index, or the plain file server lists the directory at "/"
+        # and hands the token to anyone who opens the bare address.
+        (web_root / "index.html").write_text("", encoding="utf-8")
+        (web_root / token).symlink_to("/usr/share/novnc")
         procs.append(subprocess.Popen(
-            ["websockify", "--web", "/usr/share/novnc", str(WEB_PORT),
+            ["websockify", "--web", str(web_root), str(WEB_PORT),
              f"localhost:{VNC_PORT}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
         time.sleep(1.5)
+        public = _public_address()
+        log(f"public address: {'yes' if public else 'none'}")
 
         env_display = {"DISPLAY": DISPLAY}
+        clear_stale_profile_lock(PROFILE_DIR)
         with sync_playwright() as driver:
             context = driver.chromium.launch_persistent_context(
                 str(PROFILE_DIR),
@@ -106,7 +143,8 @@ def session() -> None:
                 page.goto("https://www.instagram.com/", timeout=60000)
                 page.wait_for_timeout(4000)
                 was_challenged = _challenged(page.url)
-                _status(state="open", password=password, port=WEB_PORT,
+                _status(state="open", password=password, token=token,
+                        port=WEB_PORT, public=public,
                         challenged=was_challenged, url=page.url.split("?")[0])
                 log(f"open on :{WEB_PORT}, challenged={was_challenged}")
 

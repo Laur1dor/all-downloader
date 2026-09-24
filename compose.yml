@@ -176,6 +176,28 @@ services:
       - "${IG_REMOTE_PORT:-6080}:6080"
     restart: unless-stopped
 
+  # A public address for the CAPTCHA screen (scripts/igremote.py), so the link
+  # opens from a phone on mobile data and not only at home.
+  #
+  # It lives in tun2socks's network namespace on purpose. Run from this
+  # machine's own connection, a Cloudflare quick tunnel registered and then
+  # carried nothing - every request came back 530 - which is what a long-lived
+  # connection being strangled by the line looks like. Carried through the VPN,
+  # the same tunnel served the page from two different networks. Between
+  # sessions nothing listens behind it, so it answers 502; during one, the page
+  # sits under a random path and the screen behind a password.
+  igtunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: igtunnel
+    network_mode: "service:tun2socks"
+    depends_on:
+      - tun2socks
+    command: >
+      tunnel --no-autoupdate --protocol http2
+      --metrics 0.0.0.0:20241
+      --url http://iglogin:6080
+    restart: unless-stopped
+
   # Routes the Bot API server's traffic to Telegram through a tunnel. Telegram's
   # MTProto is often DPI-throttled even where HTTPS works, so the self-hosted Bot
   # API needs one to reach Telegram at all. Which tunnel is TUN2SOCKS_PROXY's

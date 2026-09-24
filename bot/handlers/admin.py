@@ -451,23 +451,20 @@ def create_router(admin_id: int) -> Router:
                 head + NEWLINE + NEWLINE + "<pre>" + html.escape(report) + "</pre>"
             )
 
-    @router.message(Command("igcaptcha"))
-    async def handle_igcaptcha(message: Message, ig_session=None) -> None:
-        if not _IGREMOTE_URL:
-            await message.answer(
-                "\u26a0 Не настроено: в <code>.env</code> нужен "
-                "<code>IG_REMOTE_URL</code>, например "
-                "<code>http://192.168.1.107:6080</code>."
-            )
-            return
+    async def _igcaptcha_flow(target: Message, ig_session) -> None:
+        """Open the server's browser for a person and hand them the link.
+
+        Reached from /igcaptcha and from the button under the CAPTCHA notice,
+        so the link always arrives in this chat rather than anywhere else.
+        """
         with suppress(FileNotFoundError):
             _IGREMOTE_STATUS.unlink()
         _IGREMOTE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
         _IGREMOTE_REQUEST.write_text(str(int(time.time())), encoding="utf-8")
-        notice = await message.answer("\U0001f5a5 Поднимаю браузер сервера…")
+        notice = await target.answer("\U0001f5a5 Поднимаю браузер сервера…")
 
         status: dict = {}
-        for _ in range(40):
+        for _ in range(60):
             await asyncio.sleep(1.5)
             status = _igremote_status()
             if status.get("state") in ("open", "failed", "signed_in"):
@@ -482,49 +479,72 @@ def create_router(admin_id: int) -> Router:
             )
             return
 
-        link = (f"{_IGREMOTE_URL}/vnc.html?autoconnect=1&resize=scale"
-                f"&password={status['password']}")
+        query = f"autoconnect=1&resize=scale&password={status['password']}"
+        path = f"/{status['token']}/vnc.html?{query}"
+        links = []
+        if status.get("public"):
+            links.append(f'<a href="{html.escape(status["public"] + path)}">'
+                         "Открыть браузер сервера</a>")
+        if _IGREMOTE_URL:
+            links.append(f'<a href="{html.escape(_IGREMOTE_URL + path)}">'
+                         "Из домашней сети</a>")
+        if not links:
+            await notice.edit_text("\u26a0 Нет ни публичного адреса, ни "
+                                   "<code>IG_REMOTE_URL</code> — ссылку дать некуда.")
+            return
+
         lead = ("Instagram показывает капчу." if status.get("challenged")
                 else "Капчи сейчас нет — можно просто проверить, что всё в порядке.")
         await notice.edit_text(
             f"\U0001f5a5 {lead}" + NEWLINE + NEWLINE
-            + f'<a href="{html.escape(link)}">Открыть браузер сервера</a>'
-            + NEWLINE + NEWLINE
+            + NEWLINE.join(links) + NEWLINE + NEWLINE
             + "Пройди капчу сам — как только Instagram её уберёт, бот сохранит "
-            "сессию и закроет доступ. Работает из домашней сети; ссылка живёт "
-            f"{_IGREMOTE_LIFETIME // 60} минут."
+            "сессию и закроет доступ. Ссылка одноразовая и живёт "
+            f"{_IGREMOTE_LIFETIME // 60} минут.",
+            disable_web_page_preview=True,
         )
 
-        # Wait for the person, then say how it ended.
         deadline = time.monotonic() + _IGREMOTE_LIFETIME + 60
+        state = "expired"
         while time.monotonic() < deadline:
             await asyncio.sleep(5)
-            state = _igremote_status().get("state")
+            state = _igremote_status().get("state") or state
             if state in ("signed_in", "cleared_not_signed_in", "expired", "failed"):
                 break
-        else:
-            state = "expired"
 
         from bot import igbrowser
 
         if state == "signed_in":
             igbrowser._captcha_until = 0.0
-            await message.answer("\u2705 Капча пройдена, сессия сохранена. "
-                                 "Посты 18+ снова качаются.")
+            await target.answer("\u2705 Капча пройдена, сессия сохранена. "
+                                "Посты 18+ снова качаются.")
         elif state == "cleared_not_signed_in":
             igbrowser._captcha_until = 0.0
-            await message.answer("\u2705 Капча пройдена. Вхожу в аккаунт…")
+            await target.answer("\u2705 Капча пройдена. Вхожу в аккаунт…")
             if ig_session is not None and getattr(ig_session, "enabled", False):
                 ok, report = await ig_session.login_now()
-                await message.answer(
-                    ("\u2705 Вошёл." if ok else "\u26a0 Войти не вышло: ")
-                    + ("" if ok else "<pre>" + html.escape(report[-600:]) + "</pre>")
-                )
+                if ok:
+                    await target.answer("\u2705 Вошёл.")
+                else:
+                    await target.answer("\u26a0 Войти не вышло: <pre>"
+                                        + html.escape(report[-600:]) + "</pre>")
         elif state == "expired":
-            await message.answer("\u231b Время вышло, браузер закрыт. "
-                                 "Можно запустить /igcaptcha ещё раз.")
+            await target.answer("\u231b Время вышло, браузер закрыт. "
+                                "Можно запустить /igcaptcha ещё раз.")
         else:
-            await message.answer("\u26a0 Сессия с браузером оборвалась.")
+            await target.answer("\u26a0 Сессия с браузером оборвалась.")
+
+    @router.message(Command("igcaptcha"))
+    async def handle_igcaptcha(message: Message, ig_session=None) -> None:
+        await _igcaptcha_flow(message, ig_session)
+
+    @router.callback_query(F.data == "igcaptcha")
+    async def handle_igcaptcha_button(callback: CallbackQuery, ig_session=None) -> None:
+        await callback.answer()
+        if callback.message is not None:
+            with suppress(TelegramBadRequest):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            await _igcaptcha_flow(callback.message, ig_session)
 
     @router.message(Command("control"))
     async def handle_control(message: Message) -> None:
