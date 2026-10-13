@@ -26,6 +26,59 @@ def _probe(transfer: str | None = None):
 
 
 class TikTokCompatibilityTests(unittest.TestCase):
+    def test_conversion_budget_accounts_for_actual_4k60_and_stays_bounded(self) -> None:
+        low = {"width": 960, "height": 1920, "pix_fmt": "yuv420p10le",
+               "avg_frame_rate": "30/1"}
+        high = {**low, "width": 2160, "height": 3840, "avg_frame_rate": "60/1"}
+        self.assertAlmostEqual(downloader._tiktok_conversion_budget(low, 32.5), 390)
+        self.assertAlmostEqual(downloader._tiktok_conversion_budget(high, 11.96425), 1292.139)
+        self.assertEqual(downloader._tiktok_conversion_budget(high, 3600), 1800)
+        self.assertEqual(downloader._tiktok_conversion_budget({}, 2), 120)
+        high["avg_frame_rate"] = "0/0"
+        high["r_frame_rate"] = "60/1"
+        self.assertAlmostEqual(downloader._tiktok_conversion_budget(high, 11.96425), 1292.139)
+        high["pix_fmt"] = "yuv420p12le"
+        self.assertAlmostEqual(downloader._tiktok_conversion_budget(high, 11.96425), 1550.5668)
+        self.assertEqual(downloader._tiktok_validation_budget([high] * 2, 3600), 600)
+        self.assertEqual(downloader._tiktok_validation_budget([{}], 2), 90)
+        self.assertEqual(downloader._tiktok_validation_budget([{}], 2, floor=120), 120)
+
+    def test_faster_preset_requires_room_without_changing_crf_or_geometry(self) -> None:
+        for limit, preset in ((900, "veryfast"), (1000, "ultrafast")):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "source.mp4"
+                source.write_bytes(b"x" * 100)
+
+                def encode(command, *_args):
+                    Path(command[-1]).write_bytes(b"compatible")
+
+                with patch.object(downloader.subprocess, "run", side_effect=[
+                    _probe("arib-std-b67"),
+                    MagicMock(returncode=0, stdout='{"format":{"duration":"2"}}'),
+                ]), patch.object(downloader, "_run_ffmpeg", side_effect=encode) as run:
+                    result = downloader._transcode_tiktok_compatible(source, limit, None)
+                    self.assertIsNotNone(result)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("-preset") + 1], preset)
+                self.assertEqual(command[command.index("-crf") + 1], "18")
+                self.assertNotIn("-r", command)
+                self.assertIn("trunc(iw/2)*2", command[command.index("-vf") + 1])
+
+    def test_media_hdr_known_state_does_not_mislabel_lower_sdr_preview(self) -> None:
+        cases = ((True, False, True, True), (False, False, False, True),
+                 (None, False, False, False), (None, True, False, True))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.mp4"
+            path.write_bytes(b"SDR preview")
+            for native, matches, hdr, verified in cases:
+                with self.subTest(native=native, matches=matches), \
+                     patch.object(downloader, "_ffprobe_dimensions", return_value=(540, 960)), \
+                     patch.object(downloader, "_source_hdr_state", return_value=False):
+                    media = downloader._build_media(path, {"source_hdr": native,
+                        "original_matches_preview": matches})
+                self.assertEqual(media.source_hdr, hdr)
+                self.assertEqual(media.source_hdr_verified, verified)
+
     def test_playable_document_requires_duration_and_dimensions(self) -> None:
         for duration, width, height, codec in (
             ("0", 960, 1920, "h264"),

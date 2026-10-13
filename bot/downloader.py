@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
@@ -254,6 +255,7 @@ class Media:
     description: str | None = None
     original_path: Path | None = None
     source_hdr: bool = False
+    source_hdr_verified: bool = False
     original_matches_preview: bool = False
 
 
@@ -1368,6 +1370,12 @@ def _build_media(path: Path, info: dict) -> Media:
     width, height = _ffprobe_dimensions(path)
     if not width or not height:
         width, height = info.get("width"), info.get("height")
+    actual_hdr = _source_hdr_state(info.get("original_path") or path)
+    native_hdr = info.get("source_hdr")
+    source_hdr = native_hdr is True or actual_hdr is True
+    source_hdr_verified = source_hdr or isinstance(native_hdr, bool) or (
+        bool(info.get("original_matches_preview")) and isinstance(actual_hdr, bool)
+    )
     return Media(
         path=path,
         title=info.get("title") or "media",
@@ -1377,7 +1385,8 @@ def _build_media(path: Path, info: dict) -> Media:
         height=height,
         description=info.get("description"),
         original_path=info.get("original_path"),
-        source_hdr=_source_hdr(info.get("original_path") or path),
+        source_hdr=source_hdr,
+        source_hdr_verified=source_hdr_verified,
         original_matches_preview=bool(info.get("original_matches_preview")),
     )
 
@@ -2084,7 +2093,8 @@ def _tiktok_playable(path: Path) -> bool:
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height:"
+             "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height,"
+             "avg_frame_rate,r_frame_rate:"
              "format=format_name,duration",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=20, check=False,
@@ -2125,7 +2135,7 @@ def _tiktok_playable(path: Path) -> bool:
             ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-threads", "2",
              "-i", str(path),
              "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
-            capture_output=True, timeout=90, check=False,
+            capture_output=True, timeout=_tiktok_validation_budget([video], duration), check=False,
         )
         if decode.returncode:
             stderr = decode.stderr.decode(errors="replace").lower()
@@ -2203,6 +2213,36 @@ def _repair_tiktok_sei(
             repaired.unlink(missing_ok=True)
 
 
+def _tiktok_conversion_budget(video: dict, duration: float) -> float:
+    """Bound work by decoded pixels/frames instead of the clip's duration alone."""
+    try:
+        pixels = int(video.get("width") or 0) * int(video.get("height") or 0)
+    except (TypeError, ValueError):
+        pixels = 0
+    fps = 30.0
+    for field in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            candidate = float(Fraction(str(video.get(field) or "0")))
+        except (ValueError, ZeroDivisionError):
+            continue
+        if candidate > 0:
+            fps = candidate
+            break
+    depth_match = re.search(r"(\d+)(?:le|be)$", str(video.get("pix_fmt") or ""))
+    bit_depth = int(depth_match.group(1)) if depth_match else 10
+    # Scale the existing 12 s/s allowance from a 960x1920/30 fps/10-bit reference.
+    # Full 4K/60 contains nine times as many pixels per second. Retain its
+    # geometry, frame rate and CRF rather than timing out or lowering quality.
+    work = max(1, pixels / (960 * 1920)) * max(1, fps / 30) * max(1, bit_depth / 10)
+    return min(1800, max(120, duration * 12 * work))
+
+
+def _tiktok_validation_budget(
+    videos: list[dict], duration: float, *, floor: float = 90,
+) -> float:
+    return min(600, max(floor, sum(_tiktok_conversion_budget(v, duration) / 3 for v in videos)))
+
+
 def _transcode_tiktok_compatible(
     source: Path, max_bytes: int, cancel_event: threading.Event | None,
 ) -> Path | None:
@@ -2212,7 +2252,8 @@ def _transcode_tiktok_compatible(
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,codec_name,pix_fmt,color_transfer:format=duration",
+             "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height,"
+             "avg_frame_rate,r_frame_rate:format=duration",
              "-of", "json", str(source)],
             capture_output=True, text=True, timeout=10, check=False,
         )
@@ -2238,6 +2279,9 @@ def _transcode_tiktok_compatible(
             logger.warning("TikTok conversion skipped: insufficient disk space")
             return None
         output_limit = min(max_bytes, available)
+        # Ultrafast preserves CRF, resolution and frames, but costs more bytes.
+        # The real 4K/60 sample used 7.5x its source size; reserve 10x headroom.
+        preset = "ultrafast" if output_limit >= source.stat().st_size * 10 else "veryfast"
     except (OSError, ValueError, subprocess.SubprocessError):
         logger.warning("TikTok conversion skipped: media probe failed")
         return None
@@ -2270,13 +2314,13 @@ def _transcode_tiktok_compatible(
         _run_ffmpeg(
             ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-y", "-threads", "2",
              "-filter_threads", "1", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
-             "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
+             "-vf", ",".join(filters), "-c:v", "libx264", "-preset", preset,
              "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
              "-crf", "18", "-threads", "2", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "192k", "-color_primaries", "bt709",
              "-color_trc", "bt709", "-colorspace", "bt709",
              "-fs", str(output_limit + 1), "-movflags", "+faststart", str(converted)],
-            min(600, max(120, duration * 12)), cancel_event,
+            _tiktok_conversion_budget(video, duration), cancel_event,
         )
         if not converted.is_file() or not 0 < converted.stat().st_size <= output_limit:
             return None
@@ -2304,7 +2348,7 @@ def _transcode_tiktok_compatible(
             converted.unlink(missing_ok=True)
 
 
-def _source_hdr(path: Path) -> bool:
+def _source_hdr_state(path: Path) -> bool | None:
     """10-bit SDR alone is not HDR; require the HLG or PQ transfer function."""
     try:
         result = subprocess.run(
@@ -2313,9 +2357,21 @@ def _source_hdr(path: Path) -> bool:
             capture_output=True, text=True, timeout=10, check=False,
         )
         streams = json.loads(result.stdout).get("streams", []) if result.returncode == 0 else []
-        return bool(streams and streams[0].get("color_transfer") in ("arib-std-b67", "smpte2084"))
+        transfer = streams[0].get("color_transfer") if streams else None
+        if transfer in ("arib-std-b67", "smpte2084"):
+            return True
+        if transfer in (
+            "bt709", "gamma22", "gamma28", "smpte170m", "smpte240m",
+            "iec61966-2-1", "bt2020-10", "bt2020-12",
+        ):
+            return False
+        return None
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+        return None
+
+
+def _source_hdr(path: Path) -> bool:
+    return _source_hdr_state(path) is True
 
 
 def _source_document_probe(path: Path) -> tuple[dict, dict, float]:
@@ -2323,7 +2379,8 @@ def _source_document_probe(path: Path) -> tuple[dict, dict, float]:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
              "stream=codec_type,codec_name,pix_fmt,width,height,color_transfer,color_primaries,"
-             "color_space:format=duration,format_name", "-of", "json", str(path)],
+             "color_space,avg_frame_rate,r_frame_rate:format=duration,format_name",
+             "-of", "json", str(path)],
             capture_output=True, text=True, timeout=20, check=False,
         )
         data = json.loads(result.stdout)
@@ -2375,10 +2432,14 @@ def _source_document_faststart(path: Path) -> bool:
 
 def _source_document_decode(path: Path, cancel: threading.Event | None,
                             *, primary_only: bool = False) -> None:
+    data, _, duration = _source_document_probe(path)
+    videos = [s for s in data["streams"] if s.get("codec_type") == "video"]
+    if primary_only:
+        videos = videos[:1]
     command = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-threads", "2",
                "-i", str(path), "-map", "0:v:0" if primary_only else "0:v",
                "-map", "0:a:0?" if primary_only else "0:a?", "-f", "null", "-"]
-    _run_ffmpeg(command, 120, cancel)
+    _run_ffmpeg(command, _tiktok_validation_budget(videos, duration, floor=120), cancel)
 
 
 def _source_document_audio_decode(
@@ -2589,6 +2650,11 @@ def _fetch_tiktok_media(
                                         converted.unlink(missing_ok=True)
                     if selected is not None:
                         video = item.get("video") or {}
+                        native_hdr = None
+                        if variant != native_variants[0]:
+                            from bot.tiktok_hdr import probe_tiktok_item_hdr
+
+                            native_hdr = probe_tiktok_item_hdr(item, session)
                         return selected, {
                             "id": item.get("id"),
                             "title": (item.get("desc") or "").strip() or "TikTok",
@@ -2598,6 +2664,7 @@ def _fetch_tiktok_media(
                             "height": variant.get("height") or video.get("height"),
                             "original_path": original,
                             "original_matches_preview": variant == native_variants[0],
+                            "source_hdr": native_hdr,
                         }
                     last_reason = (
                         "полученный файл не удалось подготовить для Telegram"
