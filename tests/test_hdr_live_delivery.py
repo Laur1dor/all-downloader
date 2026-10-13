@@ -36,7 +36,7 @@ class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(sent)
         self.assertIn('Источник HDR', message.answer_video.await_args.kwargs['caption'])
-        self.assertIn('SDR-превью', message.answer_video.await_args.kwargs['caption'])
+        self.assertIn('нажмите «Файл»', message.answer_video.await_args.kwargs['caption'])
         self.assertEqual(handler._album_descriptions.pop('hdr-token'), 'post text')
         self.assertNotIn('HDR', handler._video_caption(False))
 

@@ -549,17 +549,15 @@ def _video_caption(source_hdr: bool = False, *, preview_sdr: bool = True) -> str
     if not source_hdr:
         return _CAPTION
     if not preview_sdr:
-        return _CAPTION + "\n\n🌈 HDR — воспроизведение зависит от плеера и устройства."
-    return (_CAPTION + "\n\n🌈 Источник HDR. Здесь SDR-превью для совместимости. "
-            "Кнопка «Файл» сохраняет исходное HDR; воспроизведение зависит от плеера и устройства.")
+        return _CAPTION + "\n\nВидео в HDR."
+    return (_CAPTION + "\n\nИсточник HDR. Чтобы получить исходное качество с HDR, "
+            "нажмите «Файл».")
 
 
 def _source_document_caption(metadata: dict) -> str:
     caption = _CAPTION
     if metadata.get("source_hdr") is True:
-        caption += "\n\n🌈 HDR — исходный видеопоток, без преобразования в SDR."
-    if metadata.get("structure_modified") is True:
-        caption += "\nКонтейнер подготовлен без перекодирования видео."
+        caption += "\n\nИсходное качество, включая HDR."
     return caption
 
 
