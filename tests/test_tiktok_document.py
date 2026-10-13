@@ -116,7 +116,7 @@ class TikTokDocumentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(message.answer_document.await_count, 31)
                 db.store_cached_file.assert_awaited_once()
                 saved = db.store_cached_file.await_args
-                self.assertEqual(saved.args[1], "tiktok_photo_documents_v1")
+                self.assertEqual(saved.args[1], "tiktok_photo_documents_v2")
                 self.assertEqual(saved.args[2:4], ("doc-id-1", sum(range(1, 32))))
                 manifest = json.loads(saved.kwargs["description"])
                 self.assertEqual(manifest, [
@@ -213,7 +213,7 @@ class TikTokDocumentTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await handler.handle_tiktok_file_request(callback, db, settings, cache)
                 db.delete_cached_file.assert_awaited_once_with(
-                    handler.hash_url(cache.get.return_value), "tiktok_photo_documents_v1",
+                    handler.hash_url(cache.get.return_value), "tiktok_photo_documents_v2",
                 )
                 download.assert_called_once()
                 self.assertEqual(record.await_args.args[2], handler.STATUS_DONE)
@@ -256,7 +256,7 @@ class TikTokDocumentTests(unittest.IsolatedAsyncioTestCase):
         ):
             await handler.handle_tiktok_file_request(callback, db, settings, cache)
         db.delete_cached_file.assert_awaited_once_with(
-            handler.hash_url(cache.get.return_value), "tiktok_photo_documents_v1",
+            handler.hash_url(cache.get.return_value), "tiktok_photo_documents_v2",
         )
         download.assert_not_called()
         self.assertEqual(message.answer_document.await_count, 2)

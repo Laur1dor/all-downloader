@@ -60,6 +60,7 @@ from bot.downloader import (
     is_youtube_music,
     is_youtube_shorts,
     photo_needs_document,
+    prepare_source_document,
     probe_quality_options,
     quality_selector,
     request_tiktok_reprobe,
@@ -90,6 +91,7 @@ from bot.progress import (
 from bot.proxy import forced_proxy, proxy_for
 from bot.runtime import config
 from bot.telegram_outbound import progress_call
+from bot.tiktok_live_photo import PreparedLivePhoto
 from bot.urlcache import UrlCache
 from bot.urlguard import BlockedAddressError, ensure_public_url
 from bot.yandex_preview import (
@@ -111,8 +113,8 @@ _YT_AUDIO_PREFIX = "yta:"
 _QUALITY_PREFIX = "qh:"
 _DESCRIPTION_PREFIX = "desc:"
 _TIKTOK_FILE_PREFIX = "ttfile:"
-_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_mp4_v3"
-_TIKTOK_PHOTO_DOCUMENT_CACHE_KEY = "tiktok_photo_documents_v1"
+_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_original_v4"
+_TIKTOK_PHOTO_DOCUMENT_CACHE_KEY = "tiktok_photo_documents_v2"
 # How long interactive questions (compress? video-or-audio?) stay active.
 _COMPRESS_CHOICE_TIMEOUT = 10.0
 _MEDIA_CHOICE_TIMEOUT = 10.0
@@ -149,6 +151,7 @@ _pending_choices: dict[str, tuple[asyncio.Event, dict]] = {}
 # token -> post caption, for album description buttons (albums carry no inline
 # keyboard, and a photo post's caption can't be re-fetched via yt-dlp).
 _album_descriptions: OrderedDict[str, str] = OrderedDict()
+_tiktok_photo_posts: OrderedDict[str, None] = OrderedDict()
 
 # Telegram file_ids preserve a video as a video, so sendDocument cannot reuse
 # one. Keep a short-lived hard link to the already validated TikTok MP4 for the
@@ -169,7 +172,7 @@ def _prune_tiktok_originals(now: float, needed: int = 0) -> None:
 
 
 def _remember_tiktok_original(url: str, source: Path) -> None:
-    """Retain the validated playback MP4 with a hard link for document delivery."""
+    """Retain the source bytes with a hard link for original document delivery."""
     global _tiktok_original_dir
     size = source.stat().st_size
     if size > _TIKTOK_ORIGINAL_MAX_BYTES:
@@ -540,6 +543,41 @@ _CAPTION = (
     "Скачано с помощью:\n"
     '<a href="https://t.me/TikTokDownloaderFF_bot">@TikTokDownloaderFF_bot</a>'
 )
+
+
+def _video_caption(source_hdr: bool = False, *, preview_sdr: bool = True) -> str:
+    if not source_hdr:
+        return _CAPTION
+    if not preview_sdr:
+        return _CAPTION + "\n\n🌈 HDR — воспроизведение зависит от плеера и устройства."
+    return (_CAPTION + "\n\n🌈 Источник HDR. Здесь SDR-превью для совместимости. "
+            "Кнопка «Файл» сохраняет исходное HDR; воспроизведение зависит от плеера и устройства.")
+
+
+def _source_document_caption(metadata: dict) -> str:
+    caption = _CAPTION
+    if metadata.get("source_hdr") is True:
+        caption += "\n\n🌈 HDR — исходный видеопоток, без преобразования в SDR."
+    if metadata.get("structure_modified") is True:
+        caption += "\nКонтейнер подготовлен без перекодирования видео."
+    return caption
+
+
+def _tiktok_video_cache_description(description: str | None, source_hdr: bool) -> str:
+    return json.dumps({"tiktok_source_v1": True, "description": description,
+                       "source_hdr": source_hdr})
+
+
+def _tiktok_cached_video_metadata(value: str | None) -> tuple[str | None, bool]:
+    try:
+        data = json.loads(value or "")
+        if isinstance(data, dict) and data.get("tiktok_source_v1") is True:
+            description = data.get("description")
+            return (description if isinstance(description, str) else None,
+                    data.get("source_hdr") is True)
+    except (ValueError, TypeError):
+        pass
+    return value, False
 
 
 def _description_capable(url: str, platform: str) -> bool:
@@ -1076,7 +1114,8 @@ async def _run_link(
                         if cancel_event.is_set():
                             raise DownloadCancelledError
                         part_size = upload_path.stat().st_size
-                        part_caption = _CAPTION
+                        part_caption = _video_caption(media.source_hdr,
+                                                      preview_sdr=platform == "tiktok")
                         part_width, part_height = media.width, media.height
                         if time_range is not None:
                             part_width, part_height, _ = await asyncio.to_thread(
@@ -1134,14 +1173,17 @@ async def _run_link(
                             stored_key,
                             sent_media.file_id,
                             file_size,
-                            description=media.description,
+                            description=_tiktok_video_cache_description(
+                                media.description, media.source_hdr,
+                            ) if platform == "tiktok" else media.description,
                         )
                     if (
                         platform == "tiktok" and sent_media is not None
                         and len(upload_paths) == 1 and time_range is None
+                        and media.original_matches_preview
                     ):
                         try:
-                            _remember_tiktok_original(url, media.path)
+                            _remember_tiktok_original(url, media.original_path or media.path)
                         except OSError:
                             logger.warning("Could not retain TikTok original for file button")
                 break
@@ -1497,6 +1539,27 @@ async def _deliver_single_video(
     return True
 
 
+def _album_media_batches(items: list, sizes: list[int]):
+    """Preserve source order around native Live Photos and ten-item groups."""
+    batch, total = [], 0
+    for item, size in zip(items, sizes, strict=True):
+        if isinstance(item, PreparedLivePhoto):
+            if batch:
+                yield batch, total
+                batch, total = [], 0
+            # aiogram 3.31 accepts uploaded pairs with sendLivePhoto; its album
+            # model only accepts string references for the two media fields.
+            yield [item], size
+        else:
+            batch.append(item)
+            total += size
+            if len(batch) == 10:
+                yield batch, total
+                batch, total = [], 0
+    if batch:
+        yield batch, total
+
+
 async def _deliver_album(
     message: Message,
     db: Database,
@@ -1544,10 +1607,18 @@ async def _deliver_album(
                 )
 
             group = []
+            if platform == "tiktok":
+                _tiktok_photo_posts[hash_url(url)] = None
+                while len(_tiktok_photo_posts) > 500:
+                    _tiktok_photo_posts.popitem(last=False)
             group_sizes = []
             documents = []  # photos above Telegram's 10 MB photo limit go as files
-            for path in album.items:
-                if path.suffix.lower() in (".mp4", ".webm", ".mov"):
+            for index, path in enumerate(album.items):
+                pair = (album.live_photos or {}).get(index)
+                if pair is not None:
+                    group.append(pair)
+                    group_sizes.append(pair.motion.stat().st_size + pair.photo.stat().st_size)
+                elif path.suffix.lower() in (".mp4", ".webm", ".mov"):
                     if platform == "twitter":
                         path = await prepare_streaming_mp4(path)
                     # Without explicit dimensions Telegram guesses from the
@@ -1574,7 +1645,7 @@ async def _deliver_album(
             # aiogram models are frozen — the caption must be set at construction,
             # so it goes on whichever item is sent first.
             caption_left = True
-            if group:
+            if group and not isinstance(group[0], PreparedLivePhoto):
                 first = group[0]
                 group[0] = first.model_copy(update={"caption": _CAPTION})
                 caption_left = False
@@ -1590,15 +1661,25 @@ async def _deliver_album(
                 album.total_size + (album.music.stat().st_size if album.music else 0),
                 is_admin, db, platform,
             ):
-                for offset in range(0, len(group), 10):
-                    batch = group[offset:offset + 10]
-                    batch_size = sum(group_sizes[offset:offset + len(batch)])
+                for batch, batch_size in _album_media_batches(group, group_sizes):
                     send_started = True
                     if len(batch) > 1:
                         await _send_paced(
                             lambda batch=batch: message.answer_media_group(batch),
                             _upload_timeout(batch_size),
                         )
+                    elif isinstance(batch[0], PreparedLivePhoto):
+                        item = batch[0]
+                        live_caption = _CAPTION if caption_left else None
+                        await _send_paced(
+                            lambda item=item, caption=live_caption: message.bot.send_live_photo(
+                                chat_id=message.chat.id,
+                                message_thread_id=message.message_thread_id,
+                                live_photo=FSInputFile(item.motion), photo=FSInputFile(item.photo),
+                                caption=caption,
+                            ), _upload_timeout(batch_size),
+                        )
+                        caption_left = False
                     elif isinstance(batch[0], InputMediaVideo):
                         item = batch[0]
                         await _send_paced(
@@ -1676,7 +1757,7 @@ async def _deliver_album(
 def _video_cache_key(platform: str, *, height: int | None = None, capped: bool = False) -> str:
     # Old Twitter file_ids can contain Matroska sent as sendVideo. Never reuse
     # those uploads after switching to validated streaming MP4s.
-    base = {"tiktok": "video_validated", "twitter": "video_mp4_v1"}.get(platform, "video")
+    base = {"tiktok": "video_hdr_metadata_v1", "twitter": "video_mp4_v1"}.get(platform, "video")
     if height is not None:
         return f"{base}:{height}"
     return f"{base}_capped" if capped else base
@@ -1704,17 +1785,26 @@ async def _send_cached_video(
             continue
         if cached["file_size"] and cached["file_size"] > limit:
             continue
-        with_description = _description_capable(url, platform) and bool(
-            cached["description"] and cached["description"].strip()
+        description, source_hdr = (
+            _tiktok_cached_video_metadata(cached["description"]) if platform == "tiktok"
+            else (cached["description"], False)
         )
+        with_description = _description_capable(url, platform) and bool(
+            description and description.strip()
+        )
+        token = url_cache.store(url)
+        if with_description:
+            _remember_description(token, description.strip())
         file_id = cached["file_id"]
         keyboard = _video_keyboard(
-            url_cache.store(url), with_description, platform == "tiktok"
+            token, with_description, platform == "tiktok"
         )
+        caption = _video_caption(source_hdr)
         try:
-            await _send_paced(lambda file_id=file_id, keyboard=keyboard: message.answer_video(
+            await _send_paced(lambda file_id=file_id, keyboard=keyboard,
+                             caption=caption: message.answer_video(
                 file_id,
-                caption=_CAPTION,
+                caption=caption,
                 reply_markup=keyboard,
             ), 90)
         except TelegramBadRequest:
@@ -1835,7 +1925,7 @@ async def handle_audio_request(
 async def handle_tiktok_file_request(
     callback: CallbackQuery, db: Database, settings: Settings, url_cache: UrlCache,
 ) -> None:
-    """Send a compatible video file or full-quality photos, caching document IDs."""
+    """Send source video without HDR conversion or full-quality photo documents."""
     token = callback.data.removeprefix(_TIKTOK_FILE_PREFIX)
     url = url_cache.get(token)
     if url is None or detect_platform(url) != "tiktok" or not isinstance(callback.message, Message):
@@ -1847,11 +1937,12 @@ async def handle_tiktok_file_request(
     async with _user_gate(user_id, is_admin, callback.message) as allowed:
         if not allowed:
             return
-        photo_post = is_photo_post_url(url)
+        photo_post = is_photo_post_url(url) or hash_url(url) in _tiktok_photo_posts
         cache_key = (_TIKTOK_PHOTO_DOCUMENT_CACHE_KEY if photo_post
                      else _TIKTOK_DOCUMENT_CACHE_KEY)
         cached = await db.get_cached_file(hash_url(url), cache_key)
         cached_items = []
+        source_metadata = {}
         if cached is not None:
             if photo_post:
                 try:
@@ -1868,6 +1959,12 @@ async def handle_tiktok_file_request(
                     cached_items = []
             else:
                 cached_items = [cached]
+                try:
+                    source_metadata = json.loads(cached.get("description") or "{}")
+                    if not isinstance(source_metadata, dict):
+                        source_metadata = {}
+                except (ValueError, TypeError):
+                    source_metadata = {}
         if cached_items and all(not item["file_size"] or item["file_size"] <=
                                 _user_limit(settings, user_id) for item in cached_items):
             delivered = 0
@@ -1875,7 +1972,8 @@ async def handle_tiktok_file_request(
                 for item in cached_items:
                     sent = await _send_paced(
                         lambda item=item: callback.message.answer_document(
-                            item["file_id"], caption=_CAPTION,
+                            item["file_id"], caption=_source_document_caption(
+                                item if photo_post else source_metadata),
                             disable_content_type_detection=True,
                         ), 90,
                     )
@@ -1913,13 +2011,20 @@ async def handle_tiktok_file_request(
                     with tempfile.TemporaryDirectory(prefix="tg-tiktok-document-") as tmpdir:
                         document = Path(tmpdir) / "tiktok.mp4"
                         os.link(original_path, document)
+                        prepared = await prepare_source_document(
+                            document, max_bytes=_user_limit(settings, user_id),
+                        )
+                        document = prepared.path
+                        source_metadata = {"source_hdr": prepared.source_hdr,
+                                           "structure_modified": prepared.structure_modified}
                         total = document.stat().st_size
                         if total > _user_limit(settings, user_id):
                             raise FileTooLargeError(total, _user_limit(settings, user_id))
                         async with _upload_capacity.slot(total, is_admin, db, "tiktok"):
                             sent = await _send_with_retries(
                                 lambda: callback.message.answer_document(
-                                    FSInputFile(document), caption=_CAPTION,
+                                    FSInputFile(document),
+                                    caption=_source_document_caption(source_metadata),
                                     disable_content_type_detection=True,
                                 ), callback.message.bot, _upload_timeout(total),
                             )
@@ -1927,26 +2032,43 @@ async def handle_tiktok_file_request(
                             raise DownloadFailedError("Telegram не принял видео как файл.")
                         await db.store_cached_file(
                             hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY, sent.document.file_id, total,
+                            description=json.dumps(source_metadata),
                         )
                 elif photo_post:
                     async with download_album(url, settings.cookies_file) as album:
+                        source_files = []
+                        source_metadata_by_path = {}
+                        for index, path in enumerate(album.items):
+                            pair = (album.live_photos or {}).get(index)
+                            source_files.append(pair.original_photo if pair else path)
+                            if pair:
+                                prepared_motion = await prepare_source_document(
+                                    pair.original_motion, max_bytes=_user_limit(settings, user_id),
+                                )
+                                source_files.append(prepared_motion.path)
+                                source_metadata_by_path[prepared_motion.path] = {
+                                    "source_hdr": prepared_motion.source_hdr,
+                                    "structure_modified": prepared_motion.structure_modified,
+                                }
                         if any(p.stat().st_size > _user_limit(settings, user_id)
-                               for p in album.items):
+                               for p in source_files):
                             raise DownloadFailedError("Один из файлов превышает лимит отправки.")
-                        total = album.total_size
+                        total = sum(path.stat().st_size for path in source_files)
                         documents = []
                         async with _upload_capacity.slot(total, is_admin, db, "tiktok"):
-                            for path in album.items:
+                            for path in source_files:
                                 sent = await _send_paced(
                                     lambda p=path: callback.message.answer_document(
-                                        FSInputFile(p), caption=_CAPTION,
+                                        FSInputFile(p), caption=_source_document_caption(
+                                            source_metadata_by_path.get(p, {})),
                                         disable_content_type_detection=True,
                                     ), _upload_timeout(path.stat().st_size),
                                 )
                                 if sent.document is None:
                                     raise DownloadFailedError("Telegram не принял фото как файл.")
                                 documents.append({"file_id": sent.document.file_id,
-                                                  "file_size": path.stat().st_size})
+                                                  "file_size": path.stat().st_size,
+                                                  **source_metadata_by_path.get(path, {})})
                         await db.store_cached_file(
                             hash_url(url), cache_key, documents[0]["file_id"], total,
                             description=json.dumps(documents),
@@ -1955,15 +2077,23 @@ async def handle_tiktok_file_request(
                     async with download_video(
                         url, settings.cookies_file,
                         max_bytes=_user_limit(settings, user_id),
+                        original_only=True,
                     ) as media:
-                        source = media.path
+                        prepared = await prepare_source_document(
+                            media.original_path or media.path,
+                            max_bytes=_user_limit(settings, user_id),
+                        )
+                        source = prepared.path
+                        source_metadata = {"source_hdr": prepared.source_hdr,
+                                           "structure_modified": prepared.structure_modified}
                         total = source.stat().st_size
                         if total > _user_limit(settings, user_id):
                             raise FileTooLargeError(total, _user_limit(settings, user_id))
                         async with _upload_capacity.slot(total, is_admin, db, "tiktok"):
                             sent = await _send_with_retries(
                                 lambda: callback.message.answer_document(
-                                    FSInputFile(source), caption=_CAPTION,
+                                    FSInputFile(source),
+                                    caption=_source_document_caption(source_metadata),
                                     disable_content_type_detection=True,
                                 ), callback.message.bot, _upload_timeout(total),
                             )
@@ -1971,6 +2101,7 @@ async def handle_tiktok_file_request(
                             raise DownloadFailedError("Telegram не принял видео как файл.")
                         await db.store_cached_file(
                             hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY, sent.document.file_id, total,
+                            description=json.dumps(source_metadata),
                         )
             await _record(db, user_id, STATUS_DONE, "tiktok", "document", started, total)
             await _delete_silently(status)

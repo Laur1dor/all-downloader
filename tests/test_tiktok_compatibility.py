@@ -76,6 +76,21 @@ class TikTokCompatibilityTests(unittest.TestCase):
             self.assertIs(downloader.download_video(url, None, original_only=True), marker)
         self.assertTrue(source.call_args.kwargs["original_only"])
 
+    def test_original_variants_prefer_native_geometry_then_bitrate(self) -> None:
+        item = {"video": {"bitrateInfo": [
+            {"CodecType": "h264", "Bitrate": 9_000_000, "PlayAddr": {
+                "UrlList": ["sdr"], "Width": 540, "Height": 960,
+            }},
+            {"CodecType": "h265", "Bitrate": 5_000_000, "PlayAddr": {
+                "UrlList": ["hdr"], "Width": 960, "Height": 1920,
+            }},
+            {"CodecType": "h265", "Bitrate": 4_000_000, "PlayAddr": {
+                "UrlList": ["lower-bitrate"], "Width": 960, "Height": 1920,
+            }},
+        ]}}
+        self.assertEqual(downloader._tiktok_variants(item)[0]["urls"], ["sdr"])
+        self.assertEqual(downloader._tiktok_variants(item, original_only=True)[0]["urls"], ["hdr"])
+
     def test_original_only_requires_complete_body_and_valid_media_structure(self) -> None:
         probe = MagicMock(returncode=0, stdout=json.dumps({
             "streams": [{"codec_type": "video", "codec_name": "hevc"}],

@@ -22,6 +22,12 @@ from bot.downloader import (
 
 
 class TikwmFallbackTests(unittest.TestCase):
+    def setUp(self):
+        # Resolver assets are fixtures; URL guards have their own DNS/security tests.
+        guard = patch("bot.tiktok_live_photo.ensure_public_url")
+        guard.start()
+        self.addCleanup(guard.stop)
+
     @patch("curl_cffi.requests.Session")
     def test_forced_retry_really_uses_alternate_before_primary(self, session_class):
         session = session_class.return_value
@@ -382,7 +388,8 @@ class TikwmFallbackTests(unittest.TestCase):
             self.assertEqual([p.name for p in album.items], ["photo-1.jpg", "photo-2.jpg"])
             self.assertEqual(album.description, "photos")
             self.assertEqual(stream.call_count, 2)
-            self.assertTrue(all(not call.kwargs["allow_redirects"] for call in stream.call_args_list))
+            self.assertTrue(all(not call.kwargs["allow_redirects"]
+                                for call in stream.call_args_list))
         session.close.assert_called_once()
 
     def test_31_photo_post_keeps_every_slide_with_bounded_downloads(self):

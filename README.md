@@ -48,7 +48,7 @@
 - **Наилучшее доступное совместимое качество.** Обычно видео перепаковывается
   без перекодирования; для плеера Telegram предпочтительны **H.264/AAC**.
   Подрезка и несовместимые исходники требуют подготовки совместимой MP4-копии.
-  Кнопка TikTok «Файл» отправляет совместимую MP4-копию документом; повторная
+  Кнопка TikTok «Файл» сохраняет исходные видеопоток и HDR; повторная
   отправка файлов и фото-документов использует кэш Telegram без новой загрузки.
 - **Меню качества с размерами.** Для платформ с несколькими разрешениями бот
   показывает инлайн-меню (напр. *1080p · 320 МБ*, *720p · 140 МБ*), чтобы выбрать
@@ -57,9 +57,12 @@
   не удалось, меню явно показывает «размер неизвестен».
 - **Особые форматы TikTok.** HDR-исходник при необходимости преобразуется в SDR
   для совместимого просмотра с корректным отображением цветов. Кнопка «Файл»
-  также отправляет SDR-копию, без повреждённых дополнительных дорожек.
-  Live Photo сейчас отправляются как фотографии,
-  без сохранения движения. Музыкальные альбомы, плейлисты и прямая загрузка
+  сохраняет HDR исходника. Повреждённые дополнительные аудиодорожки удаляются,
+  контейнер при необходимости пересобирается без перекодирования видео.
+  HDR отмечается в подписи; просмотр исходного файла зависит от устройства и плеера.
+  Live Photo отправляются нативно с фотографией и движением, если источник
+  предоставляет эту пару; «Файл» сохраняет оба исходных компонента.
+  Музыкальные альбомы, плейлисты и прямая загрузка
   защищённых DRM-потоков не поддерживаются.
 - **Извлечение аудио.** У каждого видео есть кнопка *«Скачать аудио»*; ссылки
   YouTube Music / SoundCloud / Spotify / Yandex Music сразу отдаются аудиофайлом.
@@ -547,13 +550,16 @@ Dockerfile*         образы бота, xray-прокси и своего Bot
   splitting re-encode to produce independently playable H.264/AAC MP4 parts.
   Among equal-quality formats it prefers **H.264/AAC**, because mobile
   Telegram plays other codecs (VP9/AV1) as a frozen frame with sound.
-  Incompatible TikTok sources may also require a compatible MP4 copy; the File
-  button sends the compatible MP4 as a document. Repeated document and photo-file
+  Incompatible TikTok sources may require a compatible preview; the File
+  button preserves the source video stream and HDR. Repeated document and photo-file
   requests reuse cached Telegram file IDs without another download.
   HDR sources are converted to SDR when needed for compatible playback, with
-  tone mapping; File also sends this SDR copy without broken extra tracks.
-  TikTok Live Photos currently arrive as still
-  images. Music albums, playlists and direct downloads of DRM-protected streams
+  tone mapping. File retains HDR, repairs the container without video encoding
+  when needed, and removes proven broken extra audio tracks. HDR is identified
+  in the caption; source playback depends on the device and player.
+  TikTok Live Photos are sent natively with their photo and motion when the
+  source exposes the pair; File preserves both original components.
+  Music albums, playlists and direct downloads of DRM-protected streams
   are not supported.
 - **Quality menu with sizes.** For platforms exposing multiple resolutions, an
   inline menu (e.g. *1080p · 320 MB*) lets the user pick before downloading.

@@ -41,6 +41,13 @@ from bot.media_parts import MediaPreparationError, _run_ffmpeg, prepare_streamin
 from bot.progress import PHASE_DOWNLOAD, PHASE_PREPARE, PHASE_RESOLVE, ProgressState
 from bot.proxy import forced_proxy, proxy_for, proxy_ladder
 from bot.rule34video import Rule34VideoIE
+from bot.tiktok_live_photo import (
+    LivePhotoError,
+    PreparedLivePhoto,
+    extract_embedded_motion,
+    extract_live_photo_sources,
+    prepare_live_photo,
+)
 from bot.urlkey import is_short_link
 
 logger = logging.getLogger(__name__)
@@ -246,6 +253,18 @@ class Media:
     height: int | None
     description: str | None = None
     original_path: Path | None = None
+    source_hdr: bool = False
+    original_matches_preview: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDocument:
+    path: Path
+    width: int
+    height: int
+    duration: float
+    source_hdr: bool
+    structure_modified: bool
 
 
 def detect_platform(url: str) -> str:
@@ -1358,6 +1377,8 @@ def _build_media(path: Path, info: dict) -> Media:
         height=height,
         description=info.get("description"),
         original_path=info.get("original_path"),
+        source_hdr=_source_hdr(info.get("original_path") or path),
+        original_matches_preview=bool(info.get("original_matches_preview")),
     )
 
 
@@ -1738,7 +1759,8 @@ def _remember_responsive(
     )
 
 
-def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = None):
+def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = None,
+                 *, photo_source: bool = False):
     """The post's data block, plus the session that fetched it.
 
     The session is handed back because the media host expects the same client: a
@@ -1769,7 +1791,7 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
     # saying so is better than continuing to spend someone's wait.
     walk_began = time.monotonic()
     while attempts:
-        if time.monotonic() - walk_began > _TIKTOK_WALK_SECONDS:
+        if time.monotonic() - walk_began > (15 if photo_source else _TIKTOK_WALK_SECONDS):
             last_reason = f"{last_reason} (перебор выходов занял слишком долго)"
             break
         exit_proxy, target = attempts.pop(0)
@@ -1799,7 +1821,10 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             last_reason = f"unexpected data block: {exc}"
             session.close()
             continue
-        if "webapp.video-detail" not in scope:
+        detail_key = "webapp.video-detail"
+        if photo_source and detail_key not in scope and "webapp.photo-detail" in scope:
+            detail_key = "webapp.photo-detail"
+        if detail_key not in scope:
             # Measured on a /photo/ post: the page is served whole and simply
             # carries no video node, while a refusal carries the node with a
             # status inside it. So this is a carousel, and the photo path is
@@ -1808,7 +1833,7 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
             raise NotAVideoPostError(
                 "Это фото-пост, видео в нём нет."
             )
-        detail = scope["webapp.video-detail"]
+        detail = scope[detail_key]
         blocked = _tiktok_geo_block(detail)
         if blocked:
             # The refusal is about where the request left from, not how it
@@ -1912,7 +1937,7 @@ def _tikwm_data(url: str, proxy: str | None = None) -> tuple[dict, object]:
     raise DownloadFailedError("Резервный сервис TikTok недоступен.") from last_error
 
 
-def _tiktok_variants(item: dict) -> list[dict]:
+def _tiktok_variants(item: dict, *, original_only: bool = False) -> list[dict]:
     """Playable files for the post, best first.
 
     h264 leads: TikTok offers the same clip as h264 beside a larger h265, and
@@ -1942,7 +1967,12 @@ def _tiktok_variants(item: dict) -> list[dict]:
             "width": video.get("width"), "height": video.get("height"),
             "size": video.get("dataSize"),
         })
-    variants.sort(key=lambda v: (not v["codec"].startswith("h264"), -v["bitrate"]))
+    if original_only:
+        variants.sort(key=lambda v: (
+            -(v["width"] or 0) * (v["height"] or 0), -v["bitrate"],
+        ))
+    else:
+        variants.sort(key=lambda v: (not v["codec"].startswith("h264"), -v["bitrate"]))
     return variants
 
 
@@ -2274,6 +2304,180 @@ def _transcode_tiktok_compatible(
             converted.unlink(missing_ok=True)
 
 
+def _source_hdr(path: Path) -> bool:
+    """10-bit SDR alone is not HDR; require the HLG or PQ transfer function."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=color_transfer,pix_fmt", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        streams = json.loads(result.stdout).get("streams", []) if result.returncode == 0 else []
+        return bool(streams and streams[0].get("color_transfer") in ("arib-std-b67", "smpte2084"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _source_document_probe(path: Path) -> tuple[dict, dict, float]:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,pix_fmt,width,height,color_transfer,color_primaries,"
+             "color_space:format=duration,format_name", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        data = json.loads(result.stdout)
+        video = next(stream for stream in data["streams"] if stream["codec_type"] == "video")
+        duration = float(data["format"]["duration"])
+        if (
+            result.returncode or not 0 < duration <= 4 * 3600
+            or not (video.get("width", 0) > 0 and video.get("height", 0) > 0)
+        ):
+            raise ValueError("invalid media metadata")
+        return data, video, duration
+    except (OSError, ValueError, KeyError, StopIteration, subprocess.SubprocessError) as exc:
+        raise DownloadFailedError("Не удалось проверить параметры исходного видео.") from exc
+
+
+def _source_document_faststart(path: Path) -> bool:
+    """Read only top-level MP4 box headers, never scan the large mdat payload."""
+    try:
+        import struct
+
+        with path.open("rb") as stream:
+            length = path.stat().st_size
+            positions = {}
+            while stream.tell() < length:
+                position = stream.tell()
+                header = stream.read(8)
+                if len(header) != 8:
+                    return False
+                size, kind = struct.unpack(">I4s", header)
+                minimum = 8
+                if size == 1:
+                    extended = stream.read(8)
+                    if len(extended) != 8:
+                        return False
+                    size = struct.unpack(">Q", extended)[0]
+                    minimum = 16
+                if size == 0:
+                    size = length - position
+                if size < minimum or position + size > length:
+                    return False
+                positions.setdefault(kind, position)
+                stream.seek(position + size)
+            return b"moov" in positions and b"mdat" in positions and (
+                positions[b"moov"] < positions[b"mdat"]
+            )
+    except OSError:
+        return False
+
+
+def _source_document_decode(path: Path, cancel: threading.Event | None,
+                            *, primary_only: bool = False) -> None:
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-threads", "2",
+               "-i", str(path), "-map", "0:v:0" if primary_only else "0:v",
+               "-map", "0:a:0?" if primary_only else "0:a?", "-f", "null", "-"]
+    _run_ffmpeg(command, 120, cancel)
+
+
+def _source_document_audio_decode(
+    path: Path, audio_index: int, cancel: threading.Event | None,
+) -> None:
+    _run_ffmpeg([
+        "ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
+        "-map", f"0:a:{audio_index}", "-vn", "-f", "null", "-",
+    ], 60, cancel)
+
+
+def _source_video_packet_hash(path: Path) -> str:
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
+         "-c", "copy", "-f", "hash", "-hash", "sha256", "-"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if result.returncode or not result.stdout.strip().startswith("SHA256="):
+        raise DownloadFailedError("Не удалось проверить сохранность исходного видеопотока.")
+    return result.stdout.strip()
+
+
+def _prepare_source_document(
+    path: Path, max_bytes: int, cancel: threading.Event | None,
+) -> SourceDocument:
+    if cancel is not None and cancel.is_set():
+        raise DownloadCancelledError
+    if path.stat().st_size > max_bytes:
+        raise FileTooLargeError(path.stat().st_size, max_bytes)
+    data, video, duration = _source_document_probe(path)
+    hdr = video.get("color_transfer") in ("arib-std-b67", "smpte2084")
+    output = path.with_name(f"{path.stem}-source.mp4")
+    output.unlink(missing_ok=True)
+    complete = False
+    try:
+        bad_audio = []
+        audio = [stream for stream in data.get("streams", [])
+                 if stream.get("codec_type") == "audio"]
+        for index in range(len(audio)):
+            try:
+                _source_document_audio_decode(path, index, cancel)
+            except MediaPreparationError:
+                if cancel is not None and cancel.is_set():
+                    raise DownloadCancelledError from None
+                if index == 0:
+                    raise
+                bad_audio.append(index)
+        if not bad_audio and _source_document_faststart(path):
+            _source_document_decode(path, cancel)
+            complete = True
+            return SourceDocument(path, video["width"], video["height"], duration, hdr, False)
+        if shutil.disk_usage(path.parent).free < path.stat().st_size + _DOWNLOAD_DISK_FLOOR_BYTES:
+            raise DownloadFailedError("Недостаточно места для подготовки исходного файла.")
+        command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path)]
+        command.extend(["-map", "0"])
+        for index in bad_audio:
+            command.extend(["-map", f"-0:a:{index}"])
+        command.extend(["-map_metadata", "0", "-c", "copy"])
+        if video.get("codec_name") == "hevc":
+            command.extend(["-tag:v", "hvc1"])
+        command.extend(["-movflags", "+faststart", str(output)])
+        _run_ffmpeg(command, 60, cancel)
+        if not output.is_file() or not 0 < output.stat().st_size <= max_bytes:
+            raise DownloadFailedError("Подготовленный исходный файл превышает лимит отправки.")
+        _, prepared, actual = _source_document_probe(output)
+        properties = ("codec_name", "pix_fmt", "width", "height", "color_transfer",
+                      "color_primaries", "color_space")
+        if (
+            any(video.get(key) != prepared.get(key) for key in properties)
+            or abs(actual - duration) > 1
+        ):
+            raise DownloadFailedError("Подготовка изменила параметры исходного видео.")
+        if _source_video_packet_hash(path) != _source_video_packet_hash(output):
+            raise DownloadFailedError("Подготовка изменила исходный видеопоток.")
+        _source_document_decode(output, cancel)
+        if not _source_document_faststart(output):
+            raise DownloadFailedError("Не удалось подготовить потоковый исходный MP4.")
+        complete = True
+        return SourceDocument(output, prepared["width"], prepared["height"], actual, hdr, True)
+    except MediaPreparationError as exc:
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelledError from None
+        raise DownloadFailedError(
+            "Исходный файл повреждён; сохранить видео и звук не удалось."
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DownloadFailedError("Не удалось подготовить исходный видеофайл.") from exc
+    finally:
+        if not complete:
+            output.unlink(missing_ok=True)
+
+
+async def prepare_source_document(
+    path: Path, max_bytes: int, cancel: threading.Event | None = None,
+) -> SourceDocument:
+    """Keep video/HDR packets; repair only packaging and broken auxiliary audio."""
+    return await asyncio.to_thread(_prepare_source_document, path, max_bytes, cancel)
+
+
 def _tiktok_original_valid(path: Path) -> bool:
     """Confirm a complete source is media without requiring Telegram preview codecs."""
     try:
@@ -2305,7 +2509,8 @@ def _fetch_tiktok_media(
     """Try complete variants with bounded, independent CDN exits."""
     from curl_cffi import requests as cffi_requests
 
-    variants = _tiktok_variants(item)
+    variants = _tiktok_variants(item, original_only=original_only)
+    native_variants = _tiktok_variants(item, original_only=True)
     if not variants:
         raise DownloadFailedError("В этом посте TikTok нет видео.")
     destination = Path(tmpdir) / f"{item.get('id') or 'tiktok'}.mp4"
@@ -2392,6 +2597,7 @@ def _fetch_tiktok_media(
                             "width": variant.get("width") or video.get("width"),
                             "height": variant.get("height") or video.get("height"),
                             "original_path": original,
+                            "original_matches_preview": variant == native_variants[0],
                         }
                     last_reason = (
                         "полученный файл не удалось подготовить для Telegram"
@@ -2511,10 +2717,13 @@ class AlbumMedia:
     items: list[Path]  # photos and videos in post order
     music: Path | None
     description: str | None = None
+    live_photos: dict[int, PreparedLivePhoto] | None = None
 
     @property
     def total_size(self) -> int:
-        return sum(p.stat().st_size for p in self.items)
+        return sum(p.stat().st_size for p in self.items) + sum(
+            pair.motion.stat().st_size for pair in (self.live_photos or {}).values()
+        )
 
 
 _DESCRIPTION_KEYS = ("description", "content", "caption", "title")
@@ -2914,11 +3123,25 @@ async def download_album(
     # them, so the carousel gets the same walk the video path has.
     exits = _album_exits(_plat, proxy)
     try:
-        if _plat == "tiktok" and is_photo_post_url(url):
+        if _plat == "tiktok":
+            try:
+                native = await asyncio.to_thread(
+                    _tiktok_native_photo_album, url, tmpdir, proxy, _tiktok_cookies(cookies_file),
+                )
+            except LivePhotoError as exc:
+                raise DownloadFailedError(str(exc)) from exc
+            except (DownloadFailedError, NotAVideoPostError) as exc:
+                logger.info("TikTok native photo metadata unavailable: %s", exc)
+                native = None
+            if native is not None:
+                yield native
+                return
             # Tikwm reports every slide. gallery-dl's ordinary result was
             # silently truncated to one Telegram group of ten images.
             try:
                 album = await asyncio.to_thread(_tikwm_photo_album, url, tmpdir, proxy)
+            except LivePhotoError as exc:
+                raise DownloadFailedError(str(exc)) from exc
             except AlbumLimitError:
                 raise
             except Exception as exc:  # noqa: BLE001 - fall back to gallery-dl
@@ -3022,6 +3245,8 @@ async def download_album(
             await asyncio.to_thread(_clear_directory, tmpdir)
             try:
                 album = await asyncio.to_thread(_tikwm_photo_album, url, tmpdir, proxy)
+            except LivePhotoError as exc:
+                raise DownloadFailedError(str(exc)) from exc
             except Exception as exc:  # noqa: BLE001 - gallery-dl's error is more useful
                 logger.warning("TikTok photo fallback failed: %s", exc)
         if album is None or not album.items:
@@ -3075,6 +3300,61 @@ def _tikwm_photo_extension(path: Path) -> str | None:
     return extension if result.returncode == 0 else None
 
 
+def _tiktok_native_photo_album(
+    url: str, tmpdir: str, proxy: str | None, cookies: dict[str, str],
+) -> AlbumMedia | None:
+    """Fetch explicitly paired native photo/motion assets in their source order."""
+    item, session = _tiktok_item(url.replace("/photo/", "/video/", 1), proxy, cookies,
+                                 photo_source=True)
+    try:
+        sources = extract_live_photo_sources(item)
+        if not any(source.motion_urls for source in sources):
+            return None
+        if len(sources) > _TIKWM_ALBUM_MAX_ITEMS:
+            raise LivePhotoError("В посте больше 40 фото; отправка ограничена.")
+        paths = []
+        pairs = {}
+        total = 0
+        deadline = time.monotonic() + _TIKWM_ALBUM_SECONDS
+
+        def fetch(urls: tuple[str, ...], destination: Path, limit: int) -> None:
+            for media_url in urls:
+                if time.monotonic() >= deadline:
+                    raise LivePhotoError("Превышено время загрузки Live Photo.")
+                try:
+                    if _stream_to_file(session, media_url, destination, limit,
+                                       None, None, {}, None, allow_redirects=False):
+                        return
+                except (OSError, StalledTransferError):
+                    continue
+            raise LivePhotoError("TikTok не отдал один из файлов Live Photo.")
+
+        for source in sources:
+            photo = Path(tmpdir) / f"native-photo-{source.index}"
+            fetch(source.photo_urls, photo, _TIKWM_PHOTO_MAX_BYTES)
+            extension = _tikwm_photo_extension(photo)
+            if extension is None:
+                raise LivePhotoError("TikTok отдал повреждённое фото.")
+            renamed = photo.with_suffix(extension)
+            photo.rename(renamed)
+            paths.append(renamed)
+            total += renamed.stat().st_size
+            if source.motion_urls:
+                motion = Path(tmpdir) / f"native-motion-{source.index}.mp4"
+                fetch(source.motion_urls, motion, _TIKWM_ALBUM_MAX_BYTES)
+                total += motion.stat().st_size
+                pairs[source.index] = prepare_live_photo(renamed, motion, Path(tmpdir))
+            if total > _TIKWM_ALBUM_MAX_BYTES:
+                raise LivePhotoError("Фото-пост TikTok превышает лимит 80 МБ.")
+        return AlbumMedia(paths, None, item.get("desc") or None, pairs)
+    except LivePhotoError:
+        raise
+    except Exception as exc:
+        raise LivePhotoError("Не удалось получить полную пару фото и движения TikTok.") from exc
+    finally:
+        session.close()
+
+
 def _tikwm_photo_album(url: str, tmpdir: str, proxy: str | None = None) -> AlbumMedia:
     from curl_cffi import requests as cffi_requests
 
@@ -3100,8 +3380,35 @@ def _tikwm_photo_album(url: str, tmpdir: str, proxy: str | None = None) -> Album
         if len(images) > _TIKWM_ALBUM_MAX_ITEMS:
             raise AlbumLimitError("В посте больше 40 фото; отправка ограничена.")
         urls = [_tikwm_media_url(image) for image in images]
+        sources = extract_live_photo_sources(data)
         paths: list[Path] = []
+        live_photos = {}
         total_bytes = 0
+
+        def fetch_with_routes(media_url: str, path: Path, limit: int) -> None:
+            nonlocal active_session, fallback_index
+            while True:
+                try:
+                    fetched = _stream_to_file(
+                        active_session, media_url, path, limit, None, None, {}, None,
+                        referer="https://www.tikwm.com/", allow_redirects=False,
+                    )
+                except (cffi_requests.exceptions.RequestException, StalledTransferError):
+                    fetched = False
+                if fetched:
+                    return
+                if fallback_index >= len(fallbacks) or time.monotonic() >= deadline:
+                    raise DownloadFailedError(
+                        "Резервный сервис не отдал медиа через доступные маршруты."
+                    )
+                media_proxy = fallbacks[fallback_index]
+                fallback_index += 1
+                active_session = cffi_requests.Session(
+                    impersonate="firefox133",
+                    proxies={"http": media_proxy, "https": media_proxy}, timeout=10,
+                )
+                fallback_sessions.append(active_session)
+
         for index, media_url in enumerate(urls, 1):
             if time.monotonic() >= deadline:
                 raise AlbumLimitError("Превышено время загрузки фото-поста TikTok.")
@@ -3112,40 +3419,28 @@ def _tikwm_photo_album(url: str, tmpdir: str, proxy: str | None = None) -> Album
                 _TIKWM_ALBUM_MAX_BYTES - total_bytes + 1,
             )
 
-            def fetch_image(
-                current_session, image_url=media_url, destination=path,
-                limit=image_limit,
-            ):
-                return _stream_to_file(
-                    current_session, image_url, destination, limit,
-                    None, None, {}, None, referer="https://www.tikwm.com/",
-                    allow_redirects=False,
-                )
-
-            while True:
-                try:
-                    fetched = fetch_image(active_session)
-                except (cffi_requests.exceptions.RequestException, StalledTransferError):
-                    fetched = False
-                if fetched:
-                    break
-                if fallback_index >= len(fallbacks) or time.monotonic() >= deadline:
-                    raise DownloadFailedError(
-                        "Резервный сервис не отдал одно из фото через доступные маршруты."
-                    )
-                media_proxy = fallbacks[fallback_index]
-                fallback_index += 1
-                proxies = {"http": media_proxy, "https": media_proxy}
-                active_session = cffi_requests.Session(
-                    impersonate="firefox133", proxies=proxies, timeout=10,
-                )
-                fallback_sessions.append(active_session)
+            fetch_with_routes(media_url, path, image_limit)
             extension = _tikwm_photo_extension(path)
             if extension is None:
                 raise DownloadFailedError("Резервный сервис отдал повреждённое фото.")
             renamed = path.with_suffix(extension)
             path.rename(renamed)
             paths.append(renamed)
+            source = sources[index - 1]
+            if source.motion_urls:
+                motion = Path(tmpdir) / f"motion-{index}.mp4"
+                try:
+                    fetch_with_routes(_tikwm_media_url(source.motion_urls[0]), motion,
+                                      _TIKWM_ALBUM_MAX_BYTES - total_bytes)
+                except DownloadFailedError as exc:
+                    raise LivePhotoError("Не удалось получить движение Live Photo.") from exc
+            else:
+                motion = extract_embedded_motion(
+                    renamed, Path(tmpdir) / f"embedded-motion-{index}.mp4",
+                )
+            if motion is not None:
+                live_photos[index - 1] = prepare_live_photo(renamed, motion, Path(tmpdir))
+                total_bytes += motion.stat().st_size
             total_bytes += renamed.stat().st_size
             if total_bytes > _TIKWM_ALBUM_MAX_BYTES:
                 raise AlbumLimitError("Фото-пост TikTok превышает лимит 80 МБ.")
@@ -3171,6 +3466,7 @@ def _tikwm_photo_album(url: str, tmpdir: str, proxy: str | None = None) -> Album
                 logger.info("TikTok carousel music unavailable for %s", url)
         return AlbumMedia(
             items=paths, music=music, description=data.get("title") or None,
+            live_photos=live_photos,
         )
     finally:
         session.close()
