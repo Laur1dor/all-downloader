@@ -35,9 +35,11 @@ it is why this is allowed to act on its own where the embed reader was not.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 from html import escape as html_escape
 from pathlib import Path
@@ -78,6 +80,7 @@ _PROBE_TIMEOUT = 25
 LIVE = "live"
 DEAD = "dead"
 UNKNOWN = "unknown"
+CHECKPOINT = "checkpoint"
 
 # How often to ask when nothing is prompting it. The session dies on Instagram's
 # schedule rather than ours, so this only bounds how long a dead one goes
@@ -87,8 +90,8 @@ _INTERVAL = 900
 # out and back off when they do not work. The last value is the resting rate:
 # once a human is needed, asking every two hours is enough to catch the moment
 # they fix it, without filling the log.
-_BACKOFF = (0, 600, 1800, 3600, 7200)
-_LOGIN_TIMEOUT = 420
+_BACKOFF = (600, 1800, 3600, 7200)
+_LOGIN_TIMEOUT = 600
 # A ceiling on logins per day, independent of the backoff.
 #
 # Measured the hard way: a bug in the signed-in check reported every successful
@@ -102,13 +105,30 @@ _LOGIN_TIMEOUT = 420
 # the loop, and it does so without needing to know why the loop is happening.
 _LOGINS_PER_DAY = int(os.getenv("IG_LOGINS_PER_DAY", "4"))
 _DAY_SECONDS = 24 * 3600
+_NOTICE_TTL = 12 * 3600
 
 
-def _read_answer(status: int, body: str) -> tuple[str, str | None]:
+def _notice_fingerprint(report: str) -> str:
+    # Browser errors include changing durations and process IDs. Persist only
+    # a digest, never the browser's report, which may quote private page data.
+    normalized = re.sub(r"\d+", "#", (report or "no answer")[:500])
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_answer(status: int, body: str, url: str | None = None) -> tuple[str, str | None]:
     """What this reply says about the session, and nothing more."""
     if status != 200:
         return UNKNOWN, None
     if body.lstrip()[:1] != "{":
+        if isinstance(url, str):
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            if (parsed.scheme == "https" and parsed.hostname == "www.instagram.com"
+                    and parsed.path.startswith((
+                        "/challenge/", "/checkpoint/", "/auth_platform/", "/accounts/suspended/",
+                    ))):
+                return CHECKPOINT, None
         # The rendered page, which this serves to a browser it half-remembers.
         # It names the account whether or not anybody is signed in, so it is
         # not evidence either way.
@@ -166,7 +186,7 @@ def _probe_sync(cookies_file: Path, proxy: str | None) -> tuple[str, str | None]
     finally:
         session.close()
 
-    state, name = _read_answer(response.status_code, response.text)
+    state, name = _read_answer(response.status_code, response.text, getattr(response, "url", None))
     if state == UNKNOWN:
         logger.info(
             "Instagram probe was inconclusive (HTTP %s)", response.status_code
@@ -194,6 +214,8 @@ class InstagramSession:
         self._cookies = cookies_file
         self._request = request_file
         self._result = result_file
+        self._notice_file = request_file.with_name("igsession_dead_notice.json")
+        self._auto_file = request_file.with_name("igsession_auto_login.json")
         self._notify = notify
         self.enabled = bool(enabled and cookies_file is not None)
         self._task: asyncio.Task | None = None
@@ -203,10 +225,14 @@ class InstagramSession:
         self._wake = asyncio.Event()
         self._failures = 0
         self._next_attempt = 0.0
-        # Monotonic stamps of the logins asked for, newest last.
+        # Wall-clock stamps persist across bot restarts. Only automatic logins
+        # spend this budget; an operator can still use /iglogin at any time.
         self._logins: list[float] = []
+        self._auto_state_error = False
+        self._load_auto_state()
         self._state = UNKNOWN
         self._told_admin_dead = False
+        self._notice_digest: str | None = None
 
     # --- the outside world -------------------------------------------------
 
@@ -298,14 +324,61 @@ class InstagramSession:
                 await self._went_live(name)
                 return LIVE
 
-            self._state = DEAD
+            self._state = state
             await self._sign_in_again()
             return self._state
 
     # --- recovery ----------------------------------------------------------
 
+    def _load_auto_state(self) -> None:
+        try:
+            saved = json.loads(self._auto_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning("Instagram auto-login state unreadable: %s", exc)
+            self._auto_state_error = True
+            return
+        try:
+            now = time.time()
+            stamps = saved["logins"]
+            if not isinstance(stamps, list):
+                raise ValueError("logins must be a list")
+            self._logins = [
+                float(stamp) for stamp in stamps
+                if isinstance(stamp, (int, float))
+                and now - _DAY_SECONDS < stamp <= now + 300
+            ]
+            self._failures = max(0, min(int(saved["failures"]), len(_BACKOFF)))
+            self._next_attempt = max(0.0, float(saved["next_attempt"]))
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            logger.warning("Instagram auto-login state invalid: %s", exc)
+            self._auto_state_error = True
+
+    def _save_auto_state(self) -> bool:
+        if self._auto_state_error:
+            return False
+        try:
+            self._auto_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._auto_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "logins": self._logins,
+                "failures": self._failures,
+                "next_attempt": self._next_attempt,
+            }), encoding="utf-8")
+            tmp.replace(self._auto_file)
+            return True
+        except OSError as exc:
+            logger.warning("Could not persist Instagram auto-login state: %s", exc)
+            self._auto_state_error = True
+            return False
+
     async def _went_live(self, name: str | None) -> None:
-        recovered = self._state == DEAD or self._told_admin_dead
+        try:
+            self._request.with_name("ig_account_blocked.json").unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not clear Instagram manual-recovery marker")
+        recovered = self._state in (DEAD, CHECKPOINT) or self._told_admin_dead
         if self._state != LIVE:
             # Once per start and once per recovery, so the log says which
             # account the bot is actually working as - and stays quiet after.
@@ -313,6 +386,12 @@ class InstagramSession:
         self._state = LIVE
         self._failures = 0
         self._next_attempt = 0.0
+        self._save_auto_state()
+        self._notice_digest = None
+        try:
+            self._notice_file.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not clear Instagram warning marker")
         if recovered:
             self._told_admin_dead = False
             # Deliberately does not say who fixed it. The operator may have
@@ -324,13 +403,19 @@ class InstagramSession:
             )
 
     async def _sign_in_again(self) -> None:
-        now = time.monotonic()
+        if self._request.with_name("ig_account_blocked.json").exists():
+            logger.warning("Instagram account restricted; automatic login paused")
+            return
+        if self._auto_state_error:
+            logger.warning("Instagram auto-login paused: state could not be persisted")
+            return
+        now = time.time()
         if now < self._next_attempt:
             waiting = int((self._next_attempt - now) / 60)
             logger.info("Instagram signed out; next attempt in ~%d min", waiting)
             return
 
-        self._logins = [t for t in self._logins if now - t < _DAY_SECONDS]
+        self._logins = [t for t in self._logins if 0 <= now - t < _DAY_SECONDS]
         if len(self._logins) >= _LOGINS_PER_DAY:
             # Deliberately quiet: the operator has already been told once that a
             # login is needed, and repeating it every quarter of an hour would
@@ -341,6 +426,11 @@ class InstagramSession:
             )
             return
         self._logins.append(now)
+        # Reserve the attempt and its first cooldown before asking the browser.
+        # A bot crash mid-login must not erase the daily limit or retry at once.
+        self._next_attempt = now + _BACKOFF[0]
+        if not self._save_auto_state():
+            return
 
         logger.warning("Instagram is signed out; asking for a login")
         ok, report = await self._ask_for_login()
@@ -360,8 +450,9 @@ class InstagramSession:
         # Space the next attempt out either way. Without this a run of failed
         # Instagram downloads would nudge its way into a loop of logins.
         self._failures += 1
-        delay = _BACKOFF[min(self._failures, len(_BACKOFF) - 1)]
-        self._next_attempt = time.monotonic() + delay
+        delay = _BACKOFF[min(self._failures - 1, len(_BACKOFF) - 1)]
+        self._next_attempt = time.time() + delay
+        self._save_auto_state()
 
         if ok and confirmed == UNKNOWN:
             # The login said it worked and the confirming probe could not be
@@ -373,20 +464,40 @@ class InstagramSession:
             logger.info("Login reported success; could not confirm it yet")
             return
 
-        if self._told_admin_dead:
+        digest = _notice_fingerprint(report)
+        if self._told_admin_dead and self._notice_digest == digest:
             return
+        try:
+            saved = json.loads(self._notice_file.read_text(encoding="utf-8"))
+            if (saved.get("fingerprint") == digest
+                    and 0 <= time.time() - float(saved.get("at", 0)) < _NOTICE_TTL):
+                self._told_admin_dead = True
+                self._notice_digest = digest
+                return
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
         # Escaped: this is the login container's own output, and a Playwright
         # error routinely quotes the element it tripped over. Sent raw into an
         # HTML-parsed message it is rejected by Telegram, and the one warning
         # an outage ever gets would be the one that never arrives.
         detail = html_escape((report or "нет ответа")[:300])
-        self._told_admin_dead = await self._say(
-            "⚠️ Instagram разлогинился, и автоматический вход не прошёл." + chr(10) + chr(10)
+        told = await self._say(
+            "⚠️ Автоматическое восстановление Instagram не завершилось." + chr(10) + chr(10)
             + f"Что ответил вход: <code>{detail}</code>" + chr(10) + chr(10)
-            + "Скорее всего Instagram просит подтвердить вход с устройства, "
-            "где вы уже вошли. Подтвердите — бот войдёт сам на следующей "
-            "попытке. Либо запустите /iglogin вручную."
+            + "Для SMS, подтверждения с другого устройства или проверки "
+            "личности потребуется ваше участие. Экран сервера: /igcaptcha. "
+            "Повторить вход: /iglogin."
         )
+        if told:
+            self._told_admin_dead = True
+            self._notice_digest = digest
+            try:
+                tmp = self._notice_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"fingerprint": digest, "at": time.time()}),
+                               encoding="utf-8")
+                tmp.replace(self._notice_file)
+            except OSError:
+                logger.warning("Could not persist Instagram warning marker")
 
     async def _ask_for_login(self) -> tuple[bool, str]:
         """Drop the request file and wait for the container's verdict."""
@@ -412,7 +523,9 @@ class InstagramSession:
                 continue
             head, _, body = report.partition("\n")
             return head.strip() == "OK", (body.strip() or head.strip())
-        return False, "контейнер iglogin не ответил — он запущен?"
+        return False, (
+            "не дождались результата входа от iglogin за 10 минут; проверьте журнал контейнера"
+        )
 
     async def _say(self, text: str) -> bool:
         """True only if the message actually went out.

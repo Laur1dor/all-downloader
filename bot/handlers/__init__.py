@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from bot.handlers import admin, download, user
+from bot.handlers import admin, analytics, broadcasts, download, suggestions, support, user
+from bot.handlers.events import EventMiddleware
 from bot.handlers.flood import FloodMiddleware
 
 
 def create_root_router(admin_id: int) -> Router:
     root = Router(name="root")
+    events = EventMiddleware()
+    root.message.middleware(events)
+    root.callback_query.middleware(events)
     # In front of everything, so a message over the line never reaches a handler
     # and refusing it stays cheap. Callbacks are included: a button held down is
     # a flood like any other.
@@ -17,6 +21,10 @@ def create_root_router(admin_id: int) -> Router:
     root.message.middleware(flood)
     root.callback_query.middleware(flood)
     root.include_router(admin.create_router(admin_id))
+    root.include_router(suggestions.create_admin_router(admin_id))
+    root.include_router(analytics.create_router(admin_id))
+    root.include_router(broadcasts.create_router(admin_id))
+    root.include_router(support.create_router(admin_id))
     root.include_router(user.router)
     root.include_router(download.router)
     root.include_router(user.fallback_router)

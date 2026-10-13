@@ -29,12 +29,14 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 PROFILE_DIR = Path(os.getenv("IG_PROFILE_DIR", "/app/data/ig-profile"))
 COOKIE_FILE = Path(os.getenv("IG_COOKIE_FILE", "/app/data/cookies.txt"))
 RESULT_FILE = Path(os.getenv("IG_RESULT_FILE", "/app/data/iglogin_result.txt"))
+BLOCKED_FILE = RESULT_FILE.with_name("ig_account_blocked.json")
 
 _CODE_RE = re.compile(r"\b(\d{6})\b")
 _FROM_HINTS = ("instagram", "facebookmail", "mail.instagram.com")
@@ -52,7 +54,20 @@ def log(message: str) -> None:
 def report(ok: bool) -> None:
     RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
     body = ("OK" if ok else "FAIL") + "\n" + "\n".join(_lines[-15:])
-    RESULT_FILE.write_text(body, encoding="utf-8")
+    _atomic_write(RESULT_FILE, body)
+
+
+def _atomic_write(path: Path, text: str, *, shared: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                     dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        file.write(text)
+    try:
+        os.chmod(temporary, 0o666 if shared else 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # --- the verification code, out of the mailbox -------------------------------
@@ -84,7 +99,7 @@ def code_from_mail(since: float) -> str | None:
     deadline = time.time() + _CODE_WAIT_SECONDS
     while time.time() < deadline:
         try:
-            with imaplib.IMAP4_SSL(host) as box:
+            with imaplib.IMAP4_SSL(host, timeout=20) as box:
                 box.login(user, password)
                 box.select("INBOX")
                 day = time.strftime("%d-%b-%Y", time.gmtime(since))
@@ -150,9 +165,9 @@ def write_cookies(cookies: list[dict]) -> int:
                 kept.append(line)
 
     COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_FILE.write_text(
+    _atomic_write(COOKIE_FILE,
         "\n".join(["# Netscape HTTP Cookie File", *kept, *rows]) + "\n",
-        encoding="utf-8", newline="\n",
+        shared=True,
     )
     try:
         os.chmod(COOKIE_FILE, 0o666)
@@ -201,7 +216,7 @@ def _describe(page) -> None:
 # from it authenticated nothing - gallery-dl got 400 from the media API with it.
 # So the question is asked of the site, using an endpoint that answers only for
 # a session that is really signed in.
-def _logged_in(page) -> bool:
+def _authentication_state(page) -> bool | None:
     """Whether this browser is signed in, asked of Instagram rather than assumed.
 
     The cookie alone proves nothing: one was present here while the site kept
@@ -223,19 +238,57 @@ def _logged_in(page) -> bool:
         result = page.evaluate(
             """async () => {
                 const r = await fetch('/data/shared_data/',
-                                      {credentials: 'include'});
+                    {credentials: 'include', signal: AbortSignal.timeout(15000)});
                 if (r.status !== 200) return {status: r.status, user: null};
                 let data = null;
                 try { data = await r.json(); }
-                catch (e) { return {status: r.status, user: null}; }
+                catch (e) { return {status: r.status, unknown: true}; }
+                if (!data.config || !('viewer' in data.config))
+                    return {status: r.status, unknown: true};
                 const viewer = (data.config || {}).viewer;
                 return {status: r.status,
                         user: viewer && viewer.username ? viewer.username : null};
             }"""
         )
     except Exception:
+        return None
+    if not isinstance(result, dict) or result.get("unknown"):
+        return None
+    if result.get("status") != 200:
+        return None
+    return bool(result.get("user"))
+
+
+def _logged_in(page) -> bool:
+    return _authentication_state(page) is True
+
+
+def _restricted(page) -> bool:
+    from urllib.parse import urlsplit
+
+    if urlsplit(page.url).path not in ("/accounts/suspended/", "/accounts/disabled/"):
         return False
-    return bool((result or {}).get("user"))
+    human = page.get_by_text("Confirm you're human", exact=True)
+    if human.count() and human.first.is_visible():
+        return False
+    body = page.inner_text("body", timeout=3000).lower()
+    if not any(message in body for message in (
+        "we suspended your account", "your account has been disabled",
+        "we disabled your account",
+    )):
+        return False
+    log("Instagram account suspended; automatic login paused until account recovery")
+    _atomic_write(BLOCKED_FILE, json.dumps({"reason": "suspended", "detected_at": time.time()}))
+    return True
+
+
+def _needs_phone(page) -> bool:
+    phone = page.locator('input#phone[type="tel"]')
+    if phone.count() and phone.first.is_visible():
+        log("Instagram requires a mobile number and SMS/WhatsApp confirmation; email code is not applicable")
+        _atomic_write(BLOCKED_FILE, json.dumps({"reason": "phone_required", "detected_at": time.time()}))
+        return True
+    return False
 
 
 _CODE_FIELDS = (
@@ -300,14 +353,32 @@ def _settle(page, password: str) -> bool:
     looks at what the page offers - a password box, a one-button interstitial -
     deals with that, and asks again. It stops the moment the session answers.
     """
+    from igcaptcha import present
+
+    submitted = False
     for _ in range(_SETTLE_ROUNDS):
-        if _logged_in(page):
+        if _restricted(page):
+            return False
+        if present(page):
+            return False
+        state = _authentication_state(page)
+        if state is None:
+            log("authentication check inconclusive; no further password submission")
+            return False
+        if state:
             return True
 
         box = _first_visible(page, _PASS_FIELDS)
         if box is not None:
+            if submitted:
+                log("login form still present after one submission; stopping")
+                return False
+            user_box = _first_visible(page, _USER_FIELDS)
+            if user_box is not None:
+                user_box.fill(os.getenv("IG_USERNAME", ""))
             box.fill(password)
             box.press("Enter")
+            submitted = True
             page.wait_for_timeout(9000)
             continue
 
@@ -368,12 +439,34 @@ def _clear_checkpoint(page, since: float) -> None:
     confirm the login and can only be waited on; and a code by mail, which can
     be read and typed. A button that merely confirms is clicked when offered.
     """
-    deadline = time.time() + _CHECKPOINT_WAIT
+    from igcaptcha import present, solve
+
+    deadline = time.monotonic() + _CHECKPOINT_WAIT
     said_waiting = False
     tried_code = False
+    tried_captcha = False
 
-    while time.time() < deadline:
-        if _logged_in(page):
+    while time.monotonic() < deadline:
+        if _restricted(page):
+            return
+        if _needs_phone(page):
+            return
+        state = _authentication_state(page)
+        if state:
+            return
+        if present(page):
+            if tried_captcha:
+                log("CAPTCHA still present after bounded automatic attempt")
+                return
+            tried_captcha = True
+            if not solve(page, log, deadline=deadline):
+                return
+            _click_named(page, _CONFIRM_LABELS)
+            page.wait_for_timeout(3000)
+            continue
+
+        if _first_visible(page, _PASS_FIELDS) is not None:
+            log("ordinary login form remains; no checkpoint to answer")
             return
 
         try:
@@ -443,7 +536,28 @@ def clear_stale_profile_lock(profile: Path) -> None:
     log(f"cleared a stale browser lock left by {target}")
 
 
-def run() -> int:
+def browser_proxy() -> dict[str, str] | None:
+    """Use the same dedicated Instagram exit as the bot's routing policy.
+
+    The browser container has no access to the bot's in-memory router, but both
+    share data/routing.toml.  An explicit environment override is useful when
+    the browser needs a different exit.  Chromium uses SOCKS5 remote DNS.
+    """
+    import tomllib
+
+    url = os.getenv("IG_BROWSER_PROXY", "").strip()
+    if not url:
+        try:
+            with Path(os.getenv("ROUTING_FILE", "/app/data/routing.toml")).open("rb") as fh:
+                url = str(tomllib.load(fh).get("services", {}).get("instagram", ""))
+        except (OSError, tomllib.TOMLDecodeError):
+            return None
+    if url.startswith("socks5h://"):
+        url = "socks5://" + url.removeprefix("socks5h://")
+    return {"server": url} if url.startswith(("socks5://", "http://", "https://")) else None
+
+
+def _run_browser() -> int:
     username = os.getenv("IG_USERNAME", "")
     password = os.getenv("IG_PASSWORD", "")
     if not (username and password):
@@ -454,6 +568,9 @@ def run() -> int:
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     clear_stale_profile_lock(PROFILE_DIR)
+    proxy = browser_proxy()
+    if proxy:
+        log("Instagram browser using configured proxy")
     with sync_playwright() as driver:
         context = driver.chromium.launch_persistent_context(
             str(PROFILE_DIR),
@@ -466,13 +583,30 @@ def run() -> int:
             ],
             viewport={"width": 1280, "height": 900},
             locale="en-US",
+            **({"proxy": proxy} if proxy else {}),
         )
         page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto("https://www.instagram.com/", timeout=60000)
             page.wait_for_timeout(3000)
 
-            if _logged_in(page):
+            if _restricted(page):
+                return 4
+            if _needs_phone(page):
+                return 4
+
+            from igcaptcha import present
+
+            if present(page) or any(part in page.url for part in (
+                "/challenge/", "/checkpoint/", "/auth_platform/",
+            )):
+                log("stored profile has an Instagram checkpoint; handling it before login")
+                _clear_checkpoint(page, time.time() - 60)
+            auth_state = _authentication_state(page)
+            if auth_state is None:
+                log("authentication check inconclusive; keeping profile and cookies unchanged")
+                return 3
+            if auth_state:
                 log("the stored profile is still signed in")
             else:
                 log("signing in")
@@ -484,7 +618,7 @@ def run() -> int:
                 started = time.time() - 60
                 if _one_tap(page, password):
                     log("signed in")
-                elif not _settle(page, password):
+                else:
                     log("could not get past what Instagram is showing")
 
                 # Only a checkpoint - a mailed code, an approval from another
@@ -502,9 +636,21 @@ def run() -> int:
                 log("signed in but no cookies to store")
                 return 1
             log(f"signed in, {written} cookie(s) written to the jar")
+            BLOCKED_FILE.unlink(missing_ok=True)
             return 0
         finally:
             context.close()
+
+
+def run() -> int:
+    from ig_profile import ProfileBusy, profile_lock
+
+    try:
+        with profile_lock(timeout=20):
+            return _run_browser()
+    except ProfileBusy:
+        log("Instagram browser profile is busy; login deferred")
+        return 3
 
 
 if __name__ == "__main__":

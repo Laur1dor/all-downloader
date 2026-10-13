@@ -95,6 +95,9 @@ TIKTOK_PROBE_INTERVAL = os.getenv("TIKTOK_PROBE_INTERVAL", "45s")
 # How many rungs the retry ladder gets: ports TIKTOK_SOCKS_PORT down to
 # TIKTOK_SOCKS_PORT - N + 1, one node each.
 TIKTOK_MAX_INBOUNDS = int(os.getenv("TIKTOK_MAX_INBOUNDS", "8"))
+WARP_FALLBACK = os.getenv("XRAY_WARP_FALLBACK", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 def collect_tiktok_links() -> list[str]:
@@ -145,6 +148,16 @@ _FETCH_UAS = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "v2rayN/6.0",
 )
+_MAX_SUBSCRIPTION_BYTES = int(os.getenv("MAX_SUBSCRIPTION_BYTES", "8388608"))
+_SUBSCRIPTION_FETCH_TIMEOUT = float(os.getenv("SUBSCRIPTION_FETCH_TIMEOUT", "12"))
+
+
+def _read_subscription(response: object) -> str:
+    """Bound a public feed before decoding; some feeds grow without limit."""
+    data = response.read(_MAX_SUBSCRIPTION_BYTES + 1)
+    if len(data) > _MAX_SUBSCRIPTION_BYTES:
+        raise ValueError(f"subscription exceeds {_MAX_SUBSCRIPTION_BYTES} bytes")
+    return data.decode("utf-8", "ignore")
 
 
 def _expired_but_genuine(url: str) -> ssl.SSLContext | None:
@@ -206,8 +219,8 @@ def _fetch(url: str) -> str:
     for ua in _FETCH_UAS:
         request = urllib.request.Request(url, headers={"User-Agent": ua})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read().decode("utf-8", "ignore")
+            with urllib.request.urlopen(request, timeout=_SUBSCRIPTION_FETCH_TIMEOUT) as response:
+                return _read_subscription(response)
         except urllib.error.URLError as exc:
             last_exc = exc
             if "certificate has expired" not in str(exc):
@@ -218,10 +231,12 @@ def _fetch(url: str) -> str:
             print(f"WARN: {url} has an expired certificate for the right host — "
                   "accepting it", file=sys.stderr)
             try:
-                with urllib.request.urlopen(request, timeout=30, context=context) as response:
-                    return response.read().decode("utf-8", "ignore")
+                with urllib.request.urlopen(request, timeout=_SUBSCRIPTION_FETCH_TIMEOUT, context=context) as response:
+                    return _read_subscription(response)
             except Exception as retry_exc:
                 last_exc = retry_exc
+        except ValueError:
+            raise  # oversized feed cannot become smaller with another User-Agent
         except Exception as exc:
             last_exc = exc
     raise last_exc  # type: ignore[misc]
@@ -300,7 +315,7 @@ def collect_links() -> list[str]:
     subscriptions += _read_lines(os.path.join(VPN_DIR, "subs.txt"))
     for sub in subscriptions:
         try:
-            links += [ln.strip() for ln in _b64_maybe(_fetch(sub)).splitlines() if "://" in ln]
+            links += [ln.strip() for ln in _fetch_first(sub).splitlines() if "://" in ln]
         except Exception as exc:
             print(f"WARN: subscription {sub!r} failed: {exc}", file=sys.stderr)
     inline = os.getenv("VLESS_CONFIGS", "").replace(",", chr(10))
@@ -359,8 +374,12 @@ def collect_goida_links() -> list[str]:
     # verified set whenever it is fresh.
     live = _read_probed_live()
     if live:
-        print(f"goida: {len(live)} verified node(s) from the prober", file=sys.stderr)
-        return live
+        selected = live[:GOIDA_POOL_SIZE]
+        print(
+            f"goida: {len(selected)}/{len(live)} verified node(s) from the prober",
+            file=sys.stderr,
+        )
+        return selected
 
     urls = [s.strip() for s in os.getenv("GOIDA_SUBSCRIPTIONS", "").split(",") if s.strip()]
     per_source: list[list[str]] = []
@@ -629,6 +648,18 @@ def build_config(
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"},
     ]
+    if WARP_FALLBACK:
+        outbounds.append({
+            "tag": "warp-fallback",
+            "protocol": "socks",
+            "settings": {"servers": [{"address": "warp", "port": 1080}]},
+        })
+
+    def balancer(tag: str, selector: list[str], strategy: dict) -> dict:
+        result = {"tag": tag, "selector": selector, "strategy": strategy}
+        if WARP_FALLBACK:
+            result["fallbackTag"] = "warp-fallback"
+        return result
 
     inbounds = [
         {
@@ -653,7 +684,7 @@ def build_config(
     rules = []
     if proxy_tags:
         balancers.append(
-            {"tag": "proxy", "selector": ["vless-"], "strategy": {"type": "leastPing"}}
+            balancer("proxy", ["vless-"], {"type": "leastPing"})
         )
         rules.append({"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"})
     elif goida_tags or bypass_tags:
@@ -664,7 +695,7 @@ def build_config(
             strategy: dict = {"type": "leastLoad", "settings": {"expected": 8, "maxRTT": "4s"}}
         else:
             fallback, strategy = ["byp-"], {"type": "leastPing"}
-        balancers.append({"tag": "proxy", "selector": fallback, "strategy": strategy})
+        balancers.append(balancer("proxy", fallback, strategy))
         rules.append({"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "proxy"})
         print("WARN: no main VLESS nodes — main socks/http served by the "
               f"{'goida' if goida_tags else 'bypass'} pool", file=sys.stderr)
@@ -712,11 +743,10 @@ def build_config(
             "protocol": "socks",
             "settings": {"udp": True, "auth": "noauth"},
         })
-        balancers.append({
-            "tag": "goida",
-            "selector": ["gvless-"],
-            "strategy": {"type": "leastLoad", "settings": {"expected": 8, "maxRTT": "4s"}},
-        })
+        balancers.append(balancer(
+            "goida", ["gvless-"],
+            {"type": "leastLoad", "settings": {"expected": 8, "maxRTT": "4s"}},
+        ))
         rules.insert(
             0, {"type": "field", "inboundTag": ["goida-socks"], "balancerTag": "goida"}
         )
@@ -764,7 +794,7 @@ def build_config(
             "settings": {"udp": True, "auth": "noauth"},
         })
         balancers.append(
-            {"tag": "bypass", "selector": ["byp-"], "strategy": {"type": "leastPing"}}
+            balancer("bypass", ["byp-"], {"type": "leastPing"})
         )
         rules.insert(
             0, {"type": "field", "inboundTag": ["bypass-socks"], "balancerTag": "bypass"}
@@ -775,13 +805,6 @@ def build_config(
         "log": {"loglevel": "warning"},
         "inbounds": inbounds,
         "outbounds": outbounds,
-        # Observatory continuously pings the main + bypass pools; dead nodes drop
-        # from their leastPing balancers automatically (no stale pick survives).
-        "observatory": {
-            "subjectSelector": observatory_subjects,
-            "probeUrl": PROBE_URL,
-            "probeInterval": TIKTOK_PROBE_INTERVAL if tiktok_tags else "60s",
-        },
         "routing": {
             "domainStrategy": "AsIs",
             "balancers": balancers,
@@ -789,7 +812,17 @@ def build_config(
         },
     }
     if burst is not None:
+        # Both implementations register the same Observatory feature. When
+        # configured together, balancers can bind to the plain observer, whose
+        # report has no gvless- entries, and send all Goida traffic to fallback.
+        burst["subjectSelector"] = ["gvless-", *observatory_subjects]
         config["burstObservatory"] = burst
+    else:
+        config["observatory"] = {
+            "subjectSelector": observatory_subjects,
+            "probeUrl": PROBE_URL,
+            "probeInterval": TIKTOK_PROBE_INTERVAL if tiktok_tags else "60s",
+        }
     return config
 
 

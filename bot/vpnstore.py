@@ -185,7 +185,9 @@ def apply_payload(payload: Payload, replace: bool = True) -> list[str]:
         # setup reads these fields with plain text tools.
         _write(conf, payload.awg.replace("\r\n", "\n"))
         _touch(RELOAD_AWG)
-        report.append(f"🔐 AmneziaWG: <code>{payload.awg_name}.conf</code> — туннель поднимется заново")
+        report.append(
+            f"🔐 AmneziaWG: <code>{payload.awg_name}.conf</code> — туннель поднимется заново"
+        )
 
     if payload.xray_json:
         _write(VPN_DIR / "xray-custom.json", payload.xray_json)
@@ -205,7 +207,9 @@ def apply_payload(payload: Payload, replace: bool = True) -> list[str]:
     if payload.singbox:
         merged = _merge(SINGBOX_LINKS, payload.singbox, replace)
         _touch(RELOAD_SINGBOX)
-        report.append(f"⚡ sing-box (hysteria2/tuic): {len(payload.singbox)} шт., всего {len(merged)}")
+        report.append(
+            f"⚡ sing-box (hysteria2/tuic): {len(payload.singbox)} шт., всего {len(merged)}"
+        )
 
     return report
 

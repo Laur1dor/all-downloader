@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily PostgreSQL backup to the private GitHub repo
+
+[Timer]
+# Daily at 04:30, catching up if the machine was off (Persistent).
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

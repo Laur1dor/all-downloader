@@ -29,6 +29,10 @@ STATUS_FILE = Path(os.getenv("IG_REMOTE_STATUS", "/app/data/igremote_status.json
 # While this exists the browser profile belongs to a person; the resolver and
 # the login leave it alone rather than fight over the profile lock.
 ACTIVE_FILE = Path(os.getenv("IG_REMOTE_ACTIVE", "/app/data/igremote.active"))
+# One-shot operator request: a file already transferred into the shared data
+# directory. Never upload merely because an old selfie is still on disk.
+UPLOAD_REQUEST = Path('/app/data/igremote_upload_request')
+UPLOAD_FILE = Path('/app/data/ig-recovery-selfie.jpg')
 PROFILE_DIR = Path(os.getenv("IG_PROFILE_DIR", "/app/data/ig-profile"))
 WEB_PORT = int(os.getenv("IG_REMOTE_PORT", "6080"))
 VNC_PORT = 5900
@@ -36,7 +40,10 @@ DISPLAY = ":99"
 # Portrait-ish, because the screen it will be looked at on is a phone.
 SCREEN = os.getenv("IG_REMOTE_SCREEN", "900x1200")
 LIFETIME = int(os.getenv("IG_REMOTE_LIFETIME", "1200"))
-_CHALLENGE_MARKS = ("/auth_platform/", "/challenge/")
+_CHALLENGE_MARKS = (
+    "/auth_platform/", "/challenge/", "/checkpoint/",
+    "/accounts/suspended/", "/accounts/disabled/", "/accounts/login/",
+)
 # A public address, so the link works from a phone that is not on the home
 # network. It comes from the igtunnel service, which runs a Cloudflare quick
 # tunnel through the VPN - run from this machine's own line, the tunnel
@@ -76,10 +83,9 @@ def _challenged(url: str) -> bool:
     return any(mark in (url or "") for mark in _CHALLENGE_MARKS)
 
 
-def session() -> None:
+def _session_with_browser() -> None:
+    from iglogin_browser import BLOCKED_FILE, _logged_in, browser_proxy, clear_stale_profile_lock, write_cookies
     from playwright.sync_api import sync_playwright
-
-    from iglogin_browser import _logged_in, clear_stale_profile_lock, write_cookies
 
     # With the tunnel the page can be reached from the internet for the life of
     # the session. A VNC password is at most eight characters, so the length an
@@ -124,6 +130,7 @@ def session() -> None:
 
         env_display = {"DISPLAY": DISPLAY}
         clear_stale_profile_lock(PROFILE_DIR)
+        proxy = browser_proxy()
         with sync_playwright() as driver:
             context = driver.chromium.launch_persistent_context(
                 str(PROFILE_DIR),
@@ -137,6 +144,7 @@ def session() -> None:
                 ],
                 no_viewport=True,
                 locale="en-US",
+                **({"proxy": proxy} if proxy else {}),
             )
             page = context.pages[0] if context.pages else context.new_page()
             try:
@@ -148,9 +156,21 @@ def session() -> None:
                         challenged=was_challenged, url=page.url.split("?")[0])
                 log(f"open on :{WEB_PORT}, challenged={was_challenged}")
 
-                deadline = time.time() + LIFETIME
-                while time.time() < deadline:
+                deadline = time.monotonic() + LIFETIME
+                while time.monotonic() < deadline:
                     page.wait_for_timeout(3000)
+                    if UPLOAD_REQUEST.exists():
+                        UPLOAD_REQUEST.unlink()
+                        try:
+                            if not page.url.startswith('https://www.instagram.com/accounts/suspended/'):
+                                raise ValueError('not on the Instagram recovery page')
+                            if not UPLOAD_FILE.is_file() or not 0 < UPLOAD_FILE.stat().st_size <= 10_000_000:
+                                raise ValueError('recovery photo missing or too large')
+                            field = page.locator('input[type="file"]').first
+                            field.set_input_files(str(UPLOAD_FILE), timeout=10000)
+                            log('operator recovery photo selected; submission remains manual')
+                        except Exception as exc:
+                            log(f'operator photo selection failed: {type(exc).__name__}')
                     try:
                         url = page.url
                     except Exception:
@@ -167,14 +187,12 @@ def session() -> None:
                         continue
                     if _logged_in(page):
                         written = write_cookies(context.cookies())
+                        BLOCKED_FILE.unlink(missing_ok=True)
                         _status(state="signed_in", cookies=written)
                         log(f"cleared and signed in, {written} cookie(s) stored")
                         return
-                    # Past the CAPTCHA but not signed in: the login can finish
-                    # it, and it needs this profile back to do so.
-                    _status(state="cleared_not_signed_in")
-                    log("cleared, but the session is not signed in")
-                    return
+                    # An unknown probe or another login step is not completion.
+                    # Keep the screen alive for phone, SMS and identity checks.
 
                 _status(state="expired")
                 log("nobody finished it in time; closing")
@@ -197,6 +215,17 @@ def session() -> None:
             ACTIVE_FILE.unlink()
         except OSError:
             pass
+
+
+def session() -> None:
+    from ig_profile import ProfileBusy, profile_lock
+
+    try:
+        with profile_lock(timeout=20):
+            _session_with_browser()
+    except ProfileBusy:
+        _status(state="failed", error="Instagram browser profile is busy")
+        log("browser profile busy; remote screen not started")
 
 
 def main() -> int:

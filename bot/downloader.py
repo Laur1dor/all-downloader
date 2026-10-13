@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,16 +34,20 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
-from yt_dlp.utils import YoutubeDLError
+from yt_dlp.utils import YoutubeDLError, download_range_func
 
-from bot.progress import ProgressState
-from bot.urlkey import is_short_link
 from bot import instagram
+from bot.media_parts import MediaPreparationError, _run_ffmpeg, prepare_streaming_mp4
+from bot.progress import PHASE_DOWNLOAD, PHASE_PREPARE, PHASE_RESOLVE, ProgressState
 from bot.proxy import forced_proxy, proxy_for, proxy_ladder
+from bot.rule34video import Rule34VideoIE
+from bot.urlkey import is_short_link
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # Bot API hard limit for uploads
+_DOWNLOAD_DISK_FLOOR_BYTES = 512 * 1024 * 1024
+_RANGED_WORK_SECONDS = 30 * 60
 
 _VIDEO_FORMAT = "bestvideo*+bestaudio/best"
 # TikTok publishes the post's real sound only inside its ready-made files. Its
@@ -98,6 +104,8 @@ _PLATFORM_DOMAINS = {
     "tiktok.com": "tiktok",
     "instagram.com": "instagram",
     "instagr.am": "instagram",
+    "pinterest.com": "pinterest",
+    "pin.it": "pinterest",
     "pornhub.com": "pornhub",
     "rule34video.com": "rule34video",
     "rule34.xxx": "rule34",
@@ -143,7 +151,7 @@ def is_music_album(url: str) -> bool:
 _NOCHECKCERT_HOSTS = ("the-joi-database.com",)
 
 # Platforms whose links may be image/photo posts that yt-dlp cannot handle.
-PHOTO_CAPABLE_PLATFORMS = ("instagram", "tiktok", "rule34", "twitter")
+PHOTO_CAPABLE_PLATFORMS = ("instagram", "tiktok", "rule34", "twitter", "pinterest")
 
 
 # The prober watches for this file and re-verifies the TikTok pool at once
@@ -172,6 +180,10 @@ class DownloadFailedError(Exception):
         self.retry_via_proxy = retry_via_proxy
 
 
+class AlbumLimitError(DownloadFailedError):
+    """A TikTok photo post exceeds the bounded album download budget."""
+
+
 class AgeRestrictedError(DownloadFailedError):
     """Instagram said the post is age-restricted, so only the account can fetch it."""
 
@@ -183,6 +195,10 @@ class NotAVideoPostError(DownloadFailedError):
     post, and the generic "could not download" message sends the reader looking
     for a fault where there is none.
     """
+
+
+class ConfirmedVideoError(DownloadFailedError):
+    """The resolver identified a video, so an album retry cannot help."""
 
 
 class DownloadCancelledError(DownloadFailedError):
@@ -229,6 +245,7 @@ class Media:
     width: int | None
     height: int | None
     description: str | None = None
+    original_path: Path | None = None
 
 
 def detect_platform(url: str) -> str:
@@ -285,18 +302,22 @@ def _fetch_html(url: str, proxy: str | None = None, attempts: int = 3) -> str:
 
 
 def _resolve_joidb_sync(url: str, proxy: str | None) -> str:
-    html = _fetch_html(url, proxy=proxy)
-    # Preferred: the player's HLS API endpoint (data-hls-source="/api/stream/…"),
-    # resolved against the page URL since it is a site-relative path. Its response
-    # is a valid HLS master playlist that yt-dlp reads directly.
-    match = _JOIDB_HLS_RE.search(html)
-    if match:
-        return urljoin(url, match.group(1).replace("&amp;", "&"))
-    # Fallback: an embedded absolute .m3u8 URL (older page layout).
-    match = _M3U8_RE.search(html)
-    if not match:
-        raise DownloadFailedError("Не удалось найти видео на странице.")
-    return match.group(0).replace("&amp;", "&")
+    # The site occasionally answers 200 with a shell page missing the player.
+    # A second fresh fetch is enough; avoid retrying the HLS/CDN ladder here.
+    for attempt in range(2):
+        html = _fetch_html(url, proxy=proxy)
+        # Preferred: the player's HLS API endpoint (data-hls-source="/api/stream/…"),
+        # resolved against the page URL since it is a site-relative path.
+        match = _JOIDB_HLS_RE.search(html)
+        if match:
+            return urljoin(url, match.group(1).replace("&amp;", "&"))
+        # Fallback: an embedded absolute .m3u8 URL (older page layout).
+        match = _M3U8_RE.search(html)
+        if match:
+            return match.group(0).replace("&amp;", "&")
+        if attempt == 0:
+            time.sleep(0.5)
+    raise DownloadFailedError("Не удалось найти видео на странице.")
 
 
 def is_pornhub_shortie(url: str) -> bool:
@@ -321,7 +342,7 @@ def _yandex_to_ytsearch_sync(url: str) -> str:
     query = ""
     if match:
         query = re.split(r"\s+(?:Listen online|слушать онлайн)", match.group(1))[0].strip()
-    if not query:
+    if not query or query.lower().startswith(("яндекс музыка", "yandex music")):
         raise DownloadFailedError("Не удалось определить трек Yandex Music.")
     return f"ytsearch1:{query}"
 
@@ -367,6 +388,21 @@ async def expand_short_link(url: str) -> str:
     """
     if not is_short_link(url):
         return url
+    if (urlparse(url).hostname or "").lower().endswith("pin.it"):
+        from curl_cffi.requests.exceptions import RequestException
+
+        def _resolve_pin() -> str:
+            from curl_cffi import requests as cffi_requests
+            response = cffi_requests.get(url, impersonate="chrome124", timeout=12,
+                                         allow_redirects=True)
+            target = str(response.url)
+            host = (urlparse(target).hostname or "").lower()
+            return target if host == "pinterest.com" or host.endswith(".pinterest.com") else url
+        try:
+            return await asyncio.to_thread(_resolve_pin)
+        except (OSError, RequestException) as exc:
+            logger.info("Could not expand Pinterest short link %s: %s", url, exc)
+            return url
     proxy = proxy_for(detect_platform(url))
 
     def _resolve() -> str:
@@ -377,6 +413,8 @@ async def expand_short_link(url: str) -> str:
         # later as an SSL error against vt.tiktok.com. Exits are walked too,
         # because one of them may be the thing that is refusing.
         last_exc: Exception | None = None
+        platform = detect_platform(url)
+        deadline = time.monotonic() + 30
         for candidate in proxy_ladder(detect_platform(url)) or [proxy]:
             proxies = {"http": candidate, "https": candidate} if candidate else None
             # Two fingerprints, not five: a redirect barely depends on the
@@ -384,15 +422,59 @@ async def expand_short_link(url: str) -> str:
             # and the walk has to finish inside the patience of whoever sent the
             # link.
             for target in _TIKTOK_IMPERSONATE[:2]:
+                remaining = deadline - time.monotonic()
+                if remaining < 1:
+                    return url
                 try:
-                    response = cffi_requests.head(
-                        url, impersonate=target, timeout=_TIKTOK_HEAD_TIMEOUT,
-                        proxies=proxies, allow_redirects=True,
-                    )
+                    current = url
+                    for _ in range(4):
+                        remaining = deadline - time.monotonic()
+                        if remaining < 1:
+                            return url
+                        if platform == "tiktok":
+                            parsed = urlparse(current)
+                            host = (parsed.hostname or "").lower()
+                            if (parsed.scheme != "https" or parsed.username or parsed.password
+                                    or parsed.port not in (None, 443)
+                                    or not (host == "tiktok.com"
+                                            or host.endswith(".tiktok.com"))):
+                                break
+                            from bot.urlguard import ensure_public_url
+                            ensure_public_url(current)
+                        response = cffi_requests.head(
+                            current, impersonate=target,
+                            timeout=min(_TIKTOK_HEAD_TIMEOUT, remaining), proxies=proxies,
+                            allow_redirects=platform != "tiktok",
+                        )
+                        if platform != "tiktok":
+                            current = str(response.url or url)
+                            break
+                        if response.status_code not in (301, 302, 303, 307, 308):
+                            break
+                        location = response.headers.get("Location")
+                        if not location:
+                            break
+                        current = _unwrap_login_redirect(urljoin(current, location))
+                        if re.search(r"/(?:video|photo)/\d+(?:/|$)", urlparse(current).path):
+                            break
+                    else:
+                        continue
                 except Exception as exc:
                     last_exc = exc
                     continue
-                resolved = _unwrap_login_redirect(str(response.url or url))
+                resolved = _unwrap_login_redirect(current)
+                if platform == "tiktok":
+                    parsed = urlparse(resolved)
+                    host = (parsed.hostname or "").lower()
+                    # A redirect to a landing page or unrelated site is not a
+                    # resolved post. Keep walking exits without losing TikTok
+                    # routing, validation and its anonymous resolver fallback.
+                    if (parsed.scheme != "https"
+                            or parsed.username or parsed.password or parsed.port not in (None, 443)
+                            or not (host == "tiktok.com" or host.endswith(".tiktok.com"))
+                            or not re.search(r"/(?:video|photo)/\d+(?:/|$)", parsed.path)):
+                        continue
+                    ensure_public_url(resolved)
                 if resolved != url:
                     return resolved
         if last_exc is not None:
@@ -535,8 +617,18 @@ def _progress_hook(
     def hook(data: dict) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelledError
+        if size_guard is not None and time.monotonic() > size_guard.get("deadline", float("inf")):
+            size_guard["deadline_hit"] = True
+            raise DownloadFailedError("Превышено время загрузки видео (30 минут).")
         if data.get("status") != "downloading":
             return
+        if size_guard is not None:
+            now = time.monotonic()
+            if now - size_guard.get("disk_checked_at", 0) >= 2:
+                size_guard["disk_checked_at"] = now
+                if shutil.disk_usage(tempfile.gettempdir()).free < _DOWNLOAD_DISK_FLOOR_BYTES:
+                    size_guard["disk_low"] = True
+                    raise DownloadFailedError("Недостаточно свободного места для загрузки.")
         total = data.get("total_bytes") or data.get("total_bytes_estimate")
         if size_guard is not None and total and total > size_guard["limit"]:
             size_guard["tripped"] = int(total)
@@ -577,6 +669,8 @@ def _extract_info(options: dict, url: str, *, download: bool, attempts: int = 3)
     for attempt in range(attempts):
         try:
             with YoutubeDL(options) as ydl:
+                if detect_platform(url) == "rule34video":
+                    ydl.add_info_extractor(Rule34VideoIE())
                 info = ydl.extract_info(url, download=download)
             # A soft failure returns None instead of raising, and that path used
             # to give up at once while the raising one retried three times. Same
@@ -623,7 +717,7 @@ def _extract_info(options: dict, url: str, *, download: bool, attempts: int = 3)
             logger.exception("yt-dlp extractor crashed for %s", url)
             raise DownloadFailedError(
                 "Не удалось обработать ссылку — источник недоступен или блокирует запросы.",
-                retry_via_proxy=_is_block_error(exc),
+                retry_via_proxy=_retry_via_proxy(exc, url),
             ) from exc
     if last_exc is not None:
         raise last_exc
@@ -653,11 +747,29 @@ _BLOCK_MARKERS = (
     "geo restrict", "geo-restrict", "rate-limit", "too many requests",
     "http error 502", "http error 503", "http error 504",
     "bad gateway", "gateway timeout", "service unavailable",
+    "unexpected_eof_while_reading",
 )
 
 
 def _is_block_error(exc: YtdlpDownloadError) -> bool:
     return any(marker in str(exc).lower() for marker in _BLOCK_MARKERS)
+
+
+def _retry_via_proxy(exc: Exception, url: str) -> bool:
+    """A Rule34Video CDN transport failure can clear through another exit.
+
+    Its page can load through WARP while the media server times out or resets
+    that same connection. These failures need the alternate exit just like an
+    explicit IP block; invalid formats and removed videos still fail normally.
+    """
+    return _is_block_error(exc) or (
+        detect_platform(url) == "rule34video"
+        and any(marker in str(exc).lower() for marker in (
+            "ssl", "tls", "timed out", "timeout", "connection reset",
+            "connection aborted", "connection refused", "remote end closed",
+            "incomplete read", "incompleteread",
+        ))
+    )
 
 
 def _user_message(exc: YtdlpDownloadError) -> str:
@@ -684,7 +796,9 @@ class QualityOption:
     @property
     def label(self) -> str:
         if self.estimated_size is None:
-            return f"{self.height}p"
+            return f"{self.height}p · размер неизвестен"
+        if self.estimated_size < 1024 * 1024:
+            return f"{self.height}p · <1 МБ"
         return f"{self.height}p · ~{self.estimated_size / (1024 * 1024):.0f} МБ"
 
 
@@ -706,7 +820,8 @@ def quality_selector(option: QualityOption) -> str:
     """
     if option.format_id:
         return (
-            f"{option.format_id}+ba/{option.format_id}"
+            f"{option.format_id}+ba[ext=m4a]"
+            f"/{option.format_id}+ba/{option.format_id}"
             f"/{quality_format(option.height)}"
         )
     return quality_format(option.height)
@@ -856,12 +971,39 @@ def _hls_size(
     return int(sampled_bytes / sampled_seconds * total_duration)
 
 
+_QUALITY_SIZE_POOL = ThreadPoolExecutor(max_workers=8)
+_QUALITY_SIZE_PROBE_SECONDS = 4
+
+
 def _probe_quality_options_sync(
     url: str, options: dict, proxy: str | None = None
 ) -> list[QualityOption]:
     """List all available resolutions with their estimated sizes, best first."""
-    probe_options = {k: v for k, v in options.items() if k != "format"}
-    info = _extract_info(probe_options | {"skip_download": True}, url, download=False)
+    # Metadata is only for a menu. Avoid spending the retry budget of a real
+    # download when a YouTube endpoint or proxy stops answering.
+    probe_options = {k: v for k, v in options.items() if k != "format"} | {
+        "socket_timeout": 8,
+        "retries": 0,
+        "extractor_retries": 0,
+    }
+    deadline = time.monotonic() + 25
+    platform = detect_platform(url)
+    if platform == "rule34video":
+        try:
+            info = _extract_info(
+                probe_options | {"skip_download": True}, url, download=False, attempts=1,
+            )
+        except (YtdlpDownloadError, DownloadFailedError) as exc:
+            alternate = forced_proxy(platform)
+            retryable = _retry_via_proxy(exc, url) or getattr(exc, "retry_via_proxy", False)
+            if not retryable or not alternate or alternate == probe_options.get("proxy"):
+                raise
+            info = _extract_info(
+                probe_options | {"skip_download": True, "proxy": alternate},
+                url, download=False, attempts=1,
+            )
+    else:
+        info = _extract_info(probe_options | {"skip_download": True}, url, download=False)
     if info is None:
         return []
     if info.get("entries"):
@@ -869,18 +1011,33 @@ def _probe_quality_options_sync(
     formats = info.get("formats") or []
     duration = info.get("duration")
 
+    audio_formats = [
+        f for f in formats
+        if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
+    ]
+    # quality_selector first asks for AAC/m4a. Count only that audio track in
+    # the size estimate; a large Opus stream can incorrectly lock every tier.
+    m4a_formats = [f for f in audio_formats if f.get("ext") == "m4a"]
     audio_size = max(
-        (
-            _format_size(f, duration) or 0
-            for f in formats
-            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
-        ),
+        (_format_size(f, duration) or 0 for f in (m4a_formats or audio_formats)),
         default=0,
     )
 
-    # Keep the best (h264-preferred) video format per resolution. vcodec="none"
-    # is audio-only; vcodec=None (unknown, e.g. Rule34Video) is still a video.
+    # Keep the best (H264-preferred) video format per resolution. A direct HTTP
+    # MP4 wins over an HLS rendition of the same codec: the latter can be much
+    # larger and requires ffmpeg to fetch its segments. vcodec=None (unknown,
+    # e.g. Rule34Video) is still a video.
     best_per_height: dict[int, dict] = {}
+
+    def preference(fmt: dict) -> tuple[bool, bool, float, float]:
+        codec = str(fmt.get("vcodec") or "")
+        protocol = str(fmt.get("protocol") or "")
+        direct = protocol in ("https", "http")
+        return (
+            codec.startswith("avc1"), direct,
+            float(fmt.get("fps") or 0), float(fmt.get("tbr") or 0),
+        )
+
     for fmt in formats:
         if fmt.get("vcodec") == "none":
             continue
@@ -888,9 +1045,7 @@ def _probe_quality_options_sync(
         if height is None:
             continue
         current = best_per_height.get(height)
-        is_avc = str(fmt.get("vcodec", "")).startswith("avc1")
-        current_is_avc = current is not None and str(current.get("vcodec", "")).startswith("avc1")
-        if current is None or (is_avc and not current_is_avc):
+        if current is None or preference(fmt) > preference(current):
             best_per_height[height] = fmt
 
     heights = sorted(best_per_height, reverse=True)
@@ -898,6 +1053,12 @@ def _probe_quality_options_sync(
     def size_of(height: int) -> int | None:
         fmt = best_per_height[height]
         size = _format_size(fmt, duration)
+        if platform == "rule34video":
+            # The menu is known from the page. CDN size requests can stall long
+            # enough to discard every discovered resolution at the outer timeout.
+            return size
+        if time.monotonic() >= deadline:
+            return size
         is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
         if is_hls and fmt.get("url"):
             # For HLS the bitrate-derived estimate above is not just imprecise,
@@ -913,9 +1074,32 @@ def _probe_quality_options_sync(
         muxed = fmt.get("acodec") not in (None, "none")
         return size + (0 if muxed else audio_size)
 
-    # Probe sizes in parallel — sequential HEAD requests made the menu slow.
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        sizes = dict(zip(heights, pool.map(size_of, heights), strict=True))
+    # Optional CDN measurements must not discard resolutions already extracted
+    # from the page. A shared pool bounds workers still finishing a timed-out
+    # request, while metadata estimates remain usable for unfinished probes.
+    sizes = {}
+    futures = {}
+    for height in heights:
+        fmt = best_per_height[height]
+        size = _format_size(fmt, duration)
+        muxed = fmt.get("acodec") not in (None, "none")
+        sizes[height] = None if size is None else size + (0 if muxed else audio_size)
+        is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
+        if platform != "rule34video" and fmt.get("url") and (size is None or is_hls):
+            futures[_QUALITY_SIZE_POOL.submit(size_of, height)] = height
+    if futures:
+        budget = max(0, min(_QUALITY_SIZE_PROBE_SECONDS, deadline - time.monotonic()))
+        done, unfinished = wait(futures, timeout=budget)
+        for future in done:
+            try:
+                measured = future.result()
+            except Exception as exc:
+                logger.debug("Optional quality size probe failed for %s: %s", url, exc)
+                continue
+            if measured is not None:
+                sizes[futures[future]] = measured
+        for future in unfinished:
+            future.cancel()
 
     # Include the resolution even when size is unknown (some HLS streams) —
     # the in-download size guard still enforces the limit.
@@ -929,20 +1113,38 @@ def _probe_quality_options_sync(
     ]
 
 
+_QUALITY_PROBE_SLOT = threading.Lock()
+_QUALITY_PROBE_TIMEOUT = 35
+
+
+def _limited_quality_probe(url: str, options: dict, proxy: str | None) -> list[QualityOption]:
+    # asyncio can stop waiting for a thread, but cannot terminate it. At most
+    # one timed-out yt-dlp metadata request may keep working in the background.
+    if not _QUALITY_PROBE_SLOT.acquire(blocking=False):
+        return []
+    try:
+        return _probe_quality_options_sync(url, options, proxy)
+    finally:
+        _QUALITY_PROBE_SLOT.release()
+
+
 async def probe_quality_options(
     url: str, cookies_file: Path | None
 ) -> list[QualityOption]:
     """Async wrapper: every resolution the source offers, with sizes, best first.
 
-    Returns [] when the site does not report per-format sizes (then the caller
-    should fall back to a plain best-quality download).
+    Resolutions remain selectable when the source does not report file sizes.
+    Returns [] only when metadata is unavailable or no resolutions are found.
     """
     try:
-        return await asyncio.to_thread(
-            _probe_quality_options_sync, url, _base_options(cookies_file, url),
-            proxy_for(detect_platform(url)),
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _limited_quality_probe, url, _base_options(cookies_file, url),
+                proxy_for(detect_platform(url)),
+            ), _QUALITY_PROBE_TIMEOUT,
         )
-    except YtdlpDownloadError:
+    except (TimeoutError, YtdlpDownloadError, DownloadFailedError):
+        logger.info("Quality probe timed out or failed for %s; using default format", url)
         return []
 
 
@@ -1001,7 +1203,11 @@ async def _download_best(
     Raises OversizedError as early as possible: from the metadata probe, from
     the in-download size guard, or from the final size check.
     """
-    estimated = await asyncio.to_thread(_probe_filesize, url, options)
+    # A requested section is fetched with ffmpeg range requests.  The format
+    # metadata describes the whole source and must not reject a small excerpt.
+    estimated = None if options.get("download_ranges") else await asyncio.to_thread(
+        _probe_filesize, url, options
+    )
     if estimated is not None and estimated > max_bytes:
         logger.info("Estimated size %d bytes exceeds the %d limit", estimated, max_bytes)
         raise OversizedError(estimated, max_bytes)
@@ -1023,8 +1229,11 @@ async def _download_capped(
             _download_sync, url, options | {"format": capped_format}
         )
     except YtdlpDownloadError as exc:
-        # Either no fitting format exists or the size guard tripped mid-download.
-        raise FileTooLargeError(size_guard.get("tripped") or 0, max_bytes) from exc
+        # A network/extractor failure is not evidence that the file is too big.
+        # Let the caller retry a blocked exit with the original yt-dlp error.
+        if size_guard.get("tripped"):
+            raise FileTooLargeError(size_guard["tripped"], max_bytes) from exc
+        raise
     size = path.stat().st_size
     if size > max_bytes:
         raise FileTooLargeError(size, max_bytes)
@@ -1148,6 +1357,7 @@ def _build_media(path: Path, info: dict) -> Media:
         width=width,
         height=height,
         description=info.get("description"),
+        original_path=info.get("original_path"),
     )
 
 
@@ -1185,13 +1395,165 @@ async def _temporary_download(
                 raise
             if size_guard.get("tripped"):
                 raise OversizedError(size_guard["tripped"], max_bytes) from exc
+            if size_guard.get("deadline_hit"):
+                raise DownloadFailedError("Превышено время загрузки видео (30 минут).") from exc
+            if size_guard.get("disk_low"):
+                raise DownloadFailedError("Недостаточно свободного места для загрузки.") from exc
             logger.warning("yt-dlp failed for %s: %s", url, exc)
             raise DownloadFailedError(
-                _user_message(exc), retry_via_proxy=_is_block_error(exc)
+                _user_message(exc), retry_via_proxy=_retry_via_proxy(exc, url)
             ) from exc
+        if detect_platform(url) == "twitter":
+            try:
+                path = await prepare_streaming_mp4(path, cancel_event)
+            except MediaPreparationError as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError from exc
+                raise DownloadFailedError(str(exc)) from exc
+            if path.stat().st_size > max_bytes:
+                raise OversizedError(path.stat().st_size, max_bytes)
+            info = dict(info, duration=_ffprobe_duration(path) or info.get("duration"))
         yield _build_media(path, info)
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
+
+
+def _ranged_temp_bytes(directory: Path) -> int:
+    """Count files being written by yt-dlp/ffmpeg, including partial streams."""
+    total = 0
+    for path in directory.rglob("*"):
+        if path.suffix in (".json", ".log"):
+            continue
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            # yt-dlp atomically renames and removes partial files.
+            continue
+    return total
+
+
+async def _stop_ranged_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    if os.name == "posix":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    else:
+        process.kill()
+    await process.wait()
+
+
+@asynccontextmanager
+async def _ranged_download(
+    url: str, cookies_file: Path | None, max_bytes: int,
+    progress: ProgressState | None, cancel_event: threading.Event | None,
+    capped: bool, format_override: str | None, force_proxy: bool,
+    ratelimit: int | None, time_range: tuple[int, int],
+) -> AsyncIterator[Media]:
+    """Isolate external ffmpeg so wall time, disk and cancellation can kill it."""
+    directory = Path(tempfile.mkdtemp(prefix="tg-ranged-"))
+    process = None
+    try:
+        environment = dict(os.environ, TMPDIR=str(directory), BOT_RANGED_WORKER="1")
+        config = {
+            "url": url, "cookies_file": str(cookies_file) if cookies_file else None,
+            "max_bytes": max_bytes, "capped": capped,
+            "format_override": format_override, "force_proxy": force_proxy,
+            "ratelimit": ratelimit, "time_range": time_range,
+            "directory": str(directory),
+        }
+        with (directory / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "bot.ranged_worker",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                stderr=log, env=environment, start_new_session=os.name == "posix",
+            )
+            assert process.stdin is not None
+            try:
+                process.stdin.write(json.dumps(config).encode())
+                await process.stdin.drain()
+                process.stdin.close()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise DownloadFailedError("Не удалось запустить загрузку фрагмента.") from exc
+            deadline = time.monotonic() + _RANGED_WORK_SECONDS
+            while process.returncode is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError
+                if time.monotonic() >= deadline:
+                    raise DownloadFailedError("Превышено время загрузки видео (30 минут).")
+                written = _ranged_temp_bytes(directory)
+                if progress is not None:
+                    progress.downloaded = max(progress.downloaded, written)
+                if written > max_bytes:
+                    error = FileTooLargeError if capped else OversizedError
+                    raise error(written, max_bytes)
+                if shutil.disk_usage(directory).free < _DOWNLOAD_DISK_FLOOR_BYTES:
+                    raise DownloadFailedError("Недостаточно свободного места для загрузки.")
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=1)
+                except TimeoutError:
+                    pass
+        result_file = directory / "result.json"
+        try:
+            result = (
+                json.loads(result_file.read_text(encoding="utf-8"))
+                if result_file.exists() else {}
+            )
+        except (OSError, ValueError):
+            result = {}
+        if process.returncode != 0 or "error" in result or "filename" not in result:
+            kind = result.get("error_class")
+            if kind == "OversizedError":
+                raise OversizedError(int(result["size_bytes"]), max_bytes)
+            if kind == "FileTooLargeError":
+                raise FileTooLargeError(int(result["size_bytes"]), max_bytes)
+            if kind == "DownloadCancelledError":
+                raise DownloadCancelledError
+            logger.warning(
+                "Ranged worker failed for %s: %s", url,
+                (directory / "worker.log").read_text(errors="replace")[-300:],
+            )
+            raise DownloadFailedError(
+                str(result.get("error") or "Не удалось скачать фрагмент видео."),
+                retry_via_proxy=bool(result.get("retry_via_proxy")),
+            )
+        media_file = directory / str(result["filename"])
+        if not media_file.is_file():
+            raise DownloadFailedError("Не удалось скачать фрагмент видео.")
+        yield Media(
+            path=media_file, title=str(result["title"]),
+            file_size=media_file.stat().st_size,
+            duration=result.get("duration"), width=result.get("width"),
+            height=result.get("height"), description=result.get("description"),
+        )
+    finally:
+        if process is not None:
+            await _stop_ranged_process(process)
+        await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
+
+
+@asynccontextmanager
+async def _rule34_video_download(
+    url: str, cookies_file: Path | None, max_bytes: int,
+    cancel_event: threading.Event | None, force_proxy: bool,
+) -> AsyncIterator[Media]:
+    """Use the post scraper for excerpts: yt-dlp cannot extract rule34.xxx."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError
+    async with download_album(url, cookies_file, force_proxy) as album:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError
+        if len(album.items) != 1 or album.items[0].suffix.lower() not in _ALBUM_VIDEO_EXTENSIONS:
+            raise DownloadFailedError(
+                "По этой ссылке фото. Интервал можно указать только для видео."
+            )
+        path = album.items[0]
+        size = path.stat().st_size
+        if size > max_bytes:
+            raise OversizedError(size, max_bytes)
+        width, height, duration = await asyncio.to_thread(video_metadata, path)
+        yield Media(path, "rule34", size, duration, width, height, album.description)
 
 
 def download_video(
@@ -1204,6 +1566,8 @@ def download_video(
     format_override: str | None = None,
     force_proxy: bool = False,
     ratelimit: int | None = None,
+    time_range: tuple[int, int] | None = None,
+    original_only: bool = False,
 ) -> AbstractAsyncContextManager[Media]:
     """Async context manager yielding the downloaded video; temp files are always removed.
 
@@ -1212,9 +1576,15 @@ def download_video(
     format_override (e.g. a user-chosen resolution) implies a final capped attempt.
     force_proxy routes through the VLESS proxy even if direct looks reachable.
     ratelimit caps the download speed in bytes/s (None = unlimited).
+    original_only keeps TikTok source bytes for document delivery, including HDR.
     """
     platform = detect_platform(url)
-    size_guard = {"limit": max_bytes, "tripped": None}
+    if platform == "rule34" and time_range is not None:
+        return _rule34_video_download(
+            url, cookies_file, max_bytes, cancel_event, force_proxy,
+        )
+    size_guard = {"limit": max_bytes, "tripped": None,
+                  "deadline": time.monotonic() + 30 * 60}
     options = _base_options(cookies_file, url, force_proxy) | {
         "format": video_format(platform),
         "format_sort": video_format_sort(platform),
@@ -1226,10 +1596,28 @@ def download_video(
     }
     if ratelimit:
         options["ratelimit"] = ratelimit
+    if time_range is not None and platform == "youtube":
+        if os.getenv("BOT_RANGED_WORKER") != "1":
+            return _ranged_download(
+                url, cookies_file, max_bytes, progress, cancel_event, capped,
+                format_override, force_proxy, ratelimit, time_range,
+            )
+        options["download_ranges"] = download_range_func(None, [time_range])
+        options["force_keyframes_at_cuts"] = True
+        # yt-dlp uses ffmpeg for ranged inputs; its network reads bypass our
+        # progress hook, so bound each stalled input read to 30 seconds.
+        options["external_downloader_args"] = {
+            "ffmpeg_i": ["-rw_timeout", "30000000"],
+        }
+        options["socket_timeout"] = 15
+        options["retries"] = 1
+        options["fragment_retries"] = 1
+        options["extractor_retries"] = 1
     if platform == "tiktok":
         # yt-dlp cannot fetch a TikTok page at all here; see _tiktok_item.
         return _tiktok_download(
             url, cookies_file, max_bytes, progress, cancel_event, force_proxy, size_guard,
+            original_only=original_only,
         )
     if platform == "instagram" and instagram.shortcode(url):
         # The embed page needs no session, so it is tried before the tools that
@@ -1363,7 +1751,9 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
     # page with no data block, while a refused exit does not complete the TLS
     # handshake at all. Walking one without the other leaves half the failures
     # unrecoverable.
-    exits = [proxy] if proxy in (None, "") else (proxy_ladder("tiktok") or [proxy])
+    exits = [proxy] if proxy in (None, "") else list(dict.fromkeys([
+        proxy, *proxy_ladder("tiktok"),
+    ]))
     # One fingerprint per exit on the first pass. The extra fingerprints are
     # worth spending only on an exit that answered at all, and that is what the
     # second pass over `responsive` does — otherwise a ladder of dead nodes
@@ -1457,6 +1847,71 @@ def _tiktok_item(url: str, proxy: str | None, cookies: dict[str, str] | None = N
     )
 
 
+_TIKWM_API = "https://www.tikwm.com/api/"
+_TIKWM_MEDIA_SUFFIXES = (
+    "tikwm.com", "tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com",
+)
+
+
+def _tikwm_media_url(raw: str) -> str:
+    """Accept only public CDN URLs from the untrusted resolver response."""
+    if not isinstance(raw, str) or not raw:
+        raise DownloadFailedError("Резервный сервис не вернул адрес медиа.")
+    candidate = urljoin("https://www.tikwm.com/", raw)
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").lower()
+    try:
+        valid_port = parsed.port in (None, 443)
+    except ValueError:
+        valid_port = False
+    if (parsed.scheme != "https" or not valid_port or parsed.username or parsed.password
+            or not any(host == suffix or host.endswith("." + suffix)
+                       for suffix in _TIKWM_MEDIA_SUFFIXES)):
+        raise DownloadFailedError("Резервный сервис вернул недопустимый адрес медиа.")
+    return candidate
+
+
+def _tikwm_data(url: str, proxy: str | None = None) -> tuple[dict, object]:
+    """Anonymous fallback: send only the public post URL, never TikTok cookies."""
+    from curl_cffi import requests as cffi_requests
+
+    if detect_platform(url) != "tiktok":
+        raise DownloadFailedError("Резервный сервис принимает только ссылки TikTok.")
+    last_error: Exception | None = None
+    # Independent exits avoid repeating the same dead primary. The entire
+    # resolver walk is bounded; sessions remain fresh and cookie-free.
+    exits = list(dict.fromkeys([None, proxy, *proxy_ladder("tiktok")]))
+    deadline = time.monotonic() + 45
+    for exit_proxy in exits:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            break
+        proxies = {"http": exit_proxy, "https": exit_proxy} if exit_proxy else None
+        session = cffi_requests.Session(
+            impersonate="firefox133", proxies=proxies, timeout=min(15, remaining),
+        )
+        try:
+            response = session.get(_TIKWM_API, params={"url": url})
+            if response.status_code != 200:
+                raise DownloadFailedError("Резервный сервис TikTok недоступен.")
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if (not isinstance(payload, dict) or payload.get("code") != 0
+                    or not isinstance(data, dict)):
+                raise DownloadFailedError("Резервный сервис не нашёл пост TikTok.")
+            post_id = str(data.get("id") or "")
+            if not post_id.isdigit():
+                raise DownloadFailedError("Резервный сервис вернул неверный пост.")
+            path_id = re.search(r"/(?:video|photo)/(\d+)", urlparse(url).path)
+            if path_id and post_id != path_id.group(1):
+                raise DownloadFailedError("Резервный сервис вернул другой пост.")
+            return data, session
+        except Exception as exc:
+            last_error = exc
+            session.close()
+    raise DownloadFailedError("Резервный сервис TikTok недоступен.") from last_error
+
+
 def _tiktok_variants(item: dict) -> list[dict]:
     """Playable files for the post, best first.
 
@@ -1484,7 +1939,8 @@ def _tiktok_variants(item: dict) -> list[dict]:
     if not variants and fallback:
         variants.append({
             "urls": [fallback], "codec": "", "bitrate": 0,
-            "width": video.get("width"), "height": video.get("height"), "size": None,
+            "width": video.get("width"), "height": video.get("height"),
+            "size": video.get("dataSize"),
         })
     variants.sort(key=lambda v: (not v["codec"].startswith("h264"), -v["bitrate"]))
     return variants
@@ -1531,21 +1987,29 @@ def _stream_to_file(
     size_guard: dict,
     declared_size: int | None,
     referer: str = _TIKTOK_REFERER,
+    allow_redirects: bool = True,
 ) -> bool:
     """Stream one URL to disk, honouring the size limit and the cancel button.
 
     The referer travels with the request because media hosts check it: the CDN
     serves a file to the site it belongs to and refuses it to everybody else.
     """
+    # A full HTTP body that fails media validation will be identical on every
+    # exit. Tell the caller when Content-Length proved that the body is whole.
+    size_guard["_last_complete_body"] = False
     if declared_size and declared_size > max_bytes:
         size_guard["tripped"] = declared_size
         raise OversizedError(declared_size, max_bytes)
 
-    response = session.get(media_url, headers={"Referer": referer}, stream=True)
+    response = session.get(
+        media_url, headers={"Referer": referer}, stream=True,
+        allow_redirects=allow_redirects,
+    )
     try:
         if response.status_code != 200:
             return False
-        total = int(response.headers.get("Content-Length") or 0) or declared_size
+        response_size = int(response.headers.get("Content-Length") or 0)
+        total = response_size or declared_size
         if total and total > max_bytes:
             size_guard["tripped"] = total
             raise OversizedError(total, max_bytes)
@@ -1575,9 +2039,369 @@ def _stream_to_file(
                     raise OversizedError(written, max_bytes)
                 if progress is not None:
                     progress.downloaded = written
+        # A CDN can close a 200 response early without raising from iter_content.
+        # Such an MP4 can still have a readable header but show a black frame.
+        if total and written != total:
+            raise StalledTransferError(f"incomplete media: {written}/{total} bytes")
+        size_guard["_last_complete_body"] = bool(response_size and written == response_size)
         return written > 0
     finally:
         response.close()
+
+
+def _tiktok_playable(path: Path) -> bool:
+    """Reject error pages, broken MP4s and streams Telegram cannot play."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,pix_fmt,color_transfer:format=format_name",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if probe.returncode or not probe.stdout:
+            logger.warning("TikTok media rejected: ffprobe failed")
+            return False
+        data = json.loads(probe.stdout)
+        if not any(name in (data.get("format") or {}).get("format_name", "")
+                   for name in ("mp4", "mov")):
+            logger.warning("TikTok media rejected: unsupported container")
+            return False
+        streams = data.get("streams") or []
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if video is None or video.get("codec_name") != "h264":
+            logger.warning("TikTok media rejected: video codec is not H.264")
+            return False
+        if (
+            video.get("pix_fmt", "yuv420p") not in ("yuv420p", "yuvj420p")
+            or video.get("color_transfer") in ("smpte2084", "arib-std-b67")
+        ):
+            logger.warning("TikTok media rejected: HDR or unsupported pixel format")
+            return False
+        if any(s.get("codec_type") == "audio" and s.get("codec_name") != "aac"
+               for s in streams):
+            logger.warning("TikTok media rejected: audio codec is not AAC")
+            return False
+        # Probe reads metadata, whereas this reads every packet. A truncated
+        # mdat commonly passes ffprobe and fails here.
+        decode = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-threads", "2",
+             "-i", str(path),
+             "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"],
+            capture_output=True, timeout=90, check=False,
+        )
+        if decode.returncode:
+            stderr = decode.stderr.decode(errors="replace").lower()
+            reason = (
+                "invalid H.264 access unit" if "missing picture in access unit" in stderr
+                else "decoder rejected packets"
+            )
+            logger.warning("TikTok media rejected: %s", reason)
+        return decode.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.warning("TikTok media rejected: validation process failed")
+        return False
+
+
+def _repair_tiktok_sei(
+    source: Path, max_bytes: int, cancel_event: threading.Event | None,
+) -> Path | None:
+    """Strip broken H.264 SEI metadata without re-encoding video or audio.
+
+    Some complete TikTok MP4s contain malformed SEI access units that make
+    strict decoders abort. This bitstream filter removes only SEI (NAL type 6);
+    picture NAL units and audio packets are copied. The caller validates the
+    entire result before any upload, and keeps the raw file for the file button.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name:format=format_name", "-of", "json",
+             str(source)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+        streams = data.get("streams") or []
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if (video is None or video.get("codec_name") != "h264"
+                or any(s.get("codec_type") == "audio" and s.get("codec_name") != "aac"
+                       for s in streams)
+                or not any(name in (data.get("format") or {}).get("format_name", "")
+                           for name in ("mp4", "mov"))):
+            return None
+        if shutil.disk_usage(source.parent).free < (
+            source.stat().st_size + _DOWNLOAD_DISK_FLOOR_BYTES
+        ):
+            logger.warning("TikTok SEI repair skipped: insufficient disk space")
+            return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.warning("TikTok SEI repair skipped: media probe failed")
+        return None
+
+    repaired = source.with_name(f"{source.stem}-compatible.mp4")
+    repaired.unlink(missing_ok=True)
+    completed = False
+    try:
+        _run_ffmpeg(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-threads", "2",
+             "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+             "-bsf:v", "filter_units=remove_types=6", "-movflags", "+faststart",
+             str(repaired)],
+            30, cancel_event,
+        )
+        if not repaired.is_file() or not 0 < repaired.stat().st_size <= max_bytes:
+            logger.warning("TikTok SEI repair failed: output size invalid")
+            return None
+        completed = True
+        return repaired
+    except MediaPreparationError:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError from None
+        logger.warning("TikTok SEI repair failed: ffmpeg copy step")
+        return None
+    finally:
+        if not completed:
+            repaired.unlink(missing_ok=True)
+
+
+def _transcode_tiktok_compatible(
+    source: Path, max_bytes: int, cancel_event: threading.Event | None,
+) -> Path | None:
+    """Convert a complete unsupported stream; retain its original bytes separately."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,pix_fmt,color_transfer:format=duration",
+             "-of", "json", str(source)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+        streams = data.get("streams") or []
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if video is None or video.get("codec_name") not in ("h264", "hevc", "av1", "vp9", "mpeg4"):
+            return None
+        hdr = video.get("color_transfer") in ("smpte2084", "arib-std-b67")
+        if (
+            video["codec_name"] == "h264" and not hdr
+            and video.get("pix_fmt", "yuv420p") in ("yuv420p", "yuvj420p")
+            and all(s.get("codec_name") == "aac" for s in streams if s.get("codec_type") == "audio")
+        ):
+            # Corrupt H.264 is handled by the lossless SEI repair, never concealed
+            # by re-encoding a decoder's incomplete output.
+            return None
+        duration = float(data.get("format", {}).get("duration") or 0)
+        if not 0 < duration <= 4 * 3600:
+            return None
+        available = shutil.disk_usage(source.parent).free - _DOWNLOAD_DISK_FLOOR_BYTES
+        if available <= source.stat().st_size:
+            logger.warning("TikTok conversion skipped: insufficient disk space")
+            return None
+        output_limit = min(max_bytes, available)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.warning("TikTok conversion skipped: media probe failed")
+        return None
+
+    converted = source.with_name(f"{source.stem}-telegram.mp4")
+    converted.unlink(missing_ok=True)
+    completed = False
+    try:
+        if any(stream.get("codec_type") == "audio" for stream in streams):
+            # TikTok can attach an auxiliary AAC track with invalid packets.
+            # Telegram plays the first original track; check it before spending
+            # minutes converting HDR video, and leave auxiliary tracks in File.
+            _run_ffmpeg(
+                ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-threads", "2",
+                 "-i", str(source), "-map", "0:a:0", "-f", "null", "-"],
+                min(60, max(30, duration * 2)), cancel_event,
+            )
+        filters = []
+        if hdr:
+            # Convert HDR light into SDR before reducing to 8-bit: a pixel-format
+            # conversion alone produces washed-out colors on Telegram clients.
+            filters.extend([
+                "zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
+                "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv",
+            ])
+        filters.extend([
+            "scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'",
+            "format=yuv420p",
+        ])
+        _run_ffmpeg(
+            ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-y", "-threads", "2",
+             "-filter_threads", "1", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
+             "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast",
+             "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+             "-crf", "18", "-threads", "2", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "192k", "-color_primaries", "bt709",
+             "-color_trc", "bt709", "-colorspace", "bt709",
+             "-fs", str(output_limit + 1), "-movflags", "+faststart", str(converted)],
+            min(600, max(120, duration * 12)), cancel_event,
+        )
+        if not converted.is_file() or not 0 < converted.stat().st_size <= output_limit:
+            return None
+        # -fs can terminate before the full timeline. Check duration as well as
+        # codec compatibility so a size limit never becomes a successful clip.
+        check = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(converted)],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        actual = float(json.loads(check.stdout)["format"]["duration"])
+        if check.returncode or abs(actual - duration) > 1:
+            return None
+        completed = True
+        return converted
+    except (
+        OSError, ValueError, KeyError, subprocess.SubprocessError, MediaPreparationError,
+    ) as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError from None
+        logger.warning("TikTok compatibility conversion failed: %s", exc)
+        return None
+    finally:
+        if not completed:
+            converted.unlink(missing_ok=True)
+
+
+def _tiktok_original_valid(path: Path) -> bool:
+    """Confirm a complete source is media without requiring Telegram preview codecs."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name:format=format_name,duration", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        data = json.loads(result.stdout)
+        duration = float(data.get("format", {}).get("duration") or 0)
+        video = next((stream for stream in data.get("streams", [])
+                      if stream.get("codec_type") == "video"), None)
+        return (
+            result.returncode == 0 and 0 < duration <= 4 * 3600
+            and video is not None
+            and video.get("codec_name") in ("h264", "hevc", "av1", "vp9", "mpeg4")
+            and any(container in data.get("format", {}).get("format_name", "")
+                    for container in ("mp4", "mov", "matroska", "webm"))
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _fetch_tiktok_media(
+    item: dict, session, tmpdir: str, proxy: str | None, max_bytes: int,
+    progress: ProgressState | None, cancel_event: threading.Event | None,
+    size_guard: dict, *, resolver: bool, original_only: bool = False,
+) -> tuple[Path, dict]:
+    """Try complete variants with bounded, independent CDN exits."""
+    from curl_cffi import requests as cffi_requests
+
+    variants = _tiktok_variants(item)
+    if not variants:
+        raise DownloadFailedError("В этом посте TikTok нет видео.")
+    destination = Path(tmpdir) / f"{item.get('id') or 'tiktok'}.mp4"
+    last_reason = "no response"
+    origin_proxy = getattr(session, "proxies", {}).get("https")
+    routes = list(dict.fromkeys([origin_proxy, proxy, *proxy_ladder("tiktok"), None]))[:4]
+    sessions = {origin_proxy: session}
+    deadline = time.monotonic() + 180
+    attempts = 0
+    error_class = ConfirmedVideoError if resolver else DownloadFailedError
+    try:
+        for variant in variants:
+            for media_url in variant["urls"]:
+                for route in routes:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise DownloadCancelledError
+                    if attempts >= 12 or time.monotonic() >= deadline:
+                        raise error_class("Исчерпан лимит попыток загрузки TikTok.")
+                    attempts += 1
+                    if route not in sessions:
+                        proxies = {"http": route, "https": route} if route else None
+                        sessions[route] = cffi_requests.Session(
+                            impersonate="firefox133", proxies=proxies, timeout=15,
+                        )
+                    media_session = sessions[route]
+                    if progress is not None:
+                        progress.phase = PHASE_DOWNLOAD
+                    try:
+                        written = _stream_to_file(
+                            media_session, media_url, destination, max_bytes,
+                            progress, cancel_event, size_guard, variant.get("size"),
+                            referer="https://www.tikwm.com/" if resolver else _TIKTOK_REFERER,
+                            allow_redirects=not resolver,
+                        )
+                    except (DownloadCancelledError, OversizedError):
+                        raise
+                    except (StalledTransferError, cffi_requests.exceptions.RequestException) as exc:
+                        last_reason = f"{type(exc).__name__}: {exc}"
+                        continue
+                    selected = None
+                    original = None
+                    if written:
+                        if original_only:
+                            complete = size_guard.get("_last_complete_body") or (
+                                variant.get("size")
+                                and destination.stat().st_size == variant["size"]
+                            )
+                            if complete and _tiktok_original_valid(destination):
+                                selected = destination
+                        elif _tiktok_playable(destination):
+                            selected = destination
+                        else:
+                            repaired = _repair_tiktok_sei(
+                                destination, max_bytes, cancel_event,
+                            )
+                            if repaired is not None:
+                                if _tiktok_playable(repaired):
+                                    selected = repaired
+                                    original = destination
+                                    logger.info("TikTok media repaired by removing invalid SEI")
+                                else:
+                                    repaired.unlink(missing_ok=True)
+                            if selected is None:
+                                if progress is not None:
+                                    progress.phase = PHASE_PREPARE
+                                    progress.started_at = time.monotonic()
+                                converted = _transcode_tiktok_compatible(
+                                    destination, max_bytes, cancel_event,
+                                )
+                                if converted is not None:
+                                    if _tiktok_playable(converted):
+                                        selected = converted
+                                        original = destination
+                                        logger.info("TikTok media converted to H.264/AAC")
+                                    else:
+                                        converted.unlink(missing_ok=True)
+                    if selected is not None:
+                        video = item.get("video") or {}
+                        return selected, {
+                            "id": item.get("id"),
+                            "title": (item.get("desc") or "").strip() or "TikTok",
+                            "description": (item.get("desc") or "").strip() or None,
+                            "duration": video.get("duration"),
+                            "width": variant.get("width") or video.get("width"),
+                            "height": variant.get("height") or video.get("height"),
+                            "original_path": original,
+                        }
+                    last_reason = (
+                        "полученный файл не удалось подготовить для Telegram"
+                        if written and size_guard.get("_last_complete_body")
+                        else "сервер не передал видео полностью"
+                    )
+                    if written and size_guard.get("_last_complete_body"):
+                        # The entire body was received. Repeating this URL on
+                        # another exit would deliver the same damaged bytes.
+                        break
+        raise error_class(
+            f"Не удалось скачать видео TikTok ({last_reason}).",
+            retry_via_proxy=not resolver,
+        )
+    finally:
+        for extra_session in sessions.values():
+            if extra_session is not session:
+                extra_session.close()
 
 
 def _download_tiktok_sync(
@@ -1589,47 +2413,56 @@ def _download_tiktok_sync(
     cancel_event: threading.Event | None,
     size_guard: dict,
     cookies: dict[str, str] | None = None,
+    original_only: bool = False,
 ) -> tuple[Path, dict]:
-    """Fetch a TikTok post without yt-dlp; returns the file and its metadata."""
-    item, session = _tiktok_item(url, proxy, cookies)
+    """Fetch directly, then use anonymous resolver for page or CDN failures."""
+    direct_error: DownloadFailedError | None = None
     try:
-        variants = _tiktok_variants(item)
-        if not variants:
-            raise DownloadFailedError("В этом посте TikTok нет видео.")
+        item, session = _tiktok_item(url, proxy, cookies)
+    except DownloadFailedError as exc:
+        direct_error = exc
+    else:
+        try:
+            return _fetch_tiktok_media(
+                item, session, tmpdir, proxy, max_bytes, progress,
+                cancel_event, size_guard, resolver=False, original_only=original_only,
+            )
+        except (DownloadCancelledError, OversizedError):
+            raise
+        except DownloadFailedError as exc:
+            direct_error = exc
+        finally:
+            session.close()
 
-        destination = Path(tmpdir) / f"{item.get('id') or 'tiktok'}.mp4"
-        last_reason = "no response"
-        for variant in variants:
-            for media_url in variant["urls"]:
-                try:
-                    written = _stream_to_file(
-                        session, media_url, destination, max_bytes,
-                        progress, cancel_event, size_guard, variant.get("size"),
-                    )
-                except (DownloadCancelledError, OversizedError):
-                    raise
-                except StalledTransferError as exc:
-                    raise DownloadFailedError(
-                        f"Загрузка встала ({exc}).", retry_via_proxy=True
-                    ) from exc
-                except Exception as exc:
-                    last_reason = f"{type(exc).__name__}: {exc}"
-                    continue
-                if written:
-                    video = item.get("video") or {}
-                    return destination, {
-                        "id": item.get("id"),
-                        "title": (item.get("desc") or "").strip() or "TikTok",
-                        "description": (item.get("desc") or "").strip() or None,
-                        "duration": video.get("duration"),
-                        "width": variant.get("width") or video.get("width"),
-                        "height": variant.get("height") or video.get("height"),
-                    }
-        raise DownloadFailedError(
-            f"Не удалось скачать видео TikTok ({last_reason}).", retry_via_proxy=True
+    # TikTok may serve a hollow page, or a working page with an unreachable
+    # CDN. Both cases can still succeed through the anonymous resolver.
+    resolver_session = None
+    try:
+        data, resolver_session = _tikwm_data(url, proxy)
+        if is_photo_post_url(url) or data.get("images"):
+            raise NotAVideoPostError("Это фото-пост, видео в нём нет.")
+        play = _tikwm_media_url(data.get("play"))
+        item = {
+            "id": data["id"], "desc": data.get("title") or "",
+            "video": {"playAddr": play, "duration": data.get("duration"),
+                      "dataSize": data.get("size")},
+        }
+        return _fetch_tiktok_media(
+            item, resolver_session, tmpdir, proxy, max_bytes, progress,
+            cancel_event, size_guard, resolver=True, original_only=original_only,
         )
+    except NotAVideoPostError:
+        raise
+    except ConfirmedVideoError:
+        raise
+    except (DownloadCancelledError, OversizedError):
+        raise
+    except Exception as exc:
+        logger.warning("TikTok anonymous fallback failed: %s", exc)
+        raise direct_error or DownloadFailedError("Не удалось скачать видео TikTok.") from exc
     finally:
-        session.close()
+        if resolver_session is not None:
+            resolver_session.close()
 
 
 @asynccontextmanager
@@ -1641,6 +2474,7 @@ async def _tiktok_download(
     cancel_event: threading.Event | None,
     force_proxy: bool,
     size_guard: dict,
+    original_only: bool = False,
 ) -> AsyncIterator[Media]:
     tmpdir = tempfile.mkdtemp(prefix="tg-tiktok-")
     proxy = forced_proxy("tiktok") if force_proxy else proxy_for("tiktok")
@@ -1649,6 +2483,7 @@ async def _tiktok_download(
         path, info = await asyncio.to_thread(
             _download_tiktok_sync, url, tmpdir, proxy, max_bytes,
             progress, cancel_event, size_guard, cookies,
+            original_only=original_only,
         )
         yield _build_media(path, info)
     finally:
@@ -1817,6 +2652,8 @@ def _download_album_sync(
         sys.executable, "-m", "gallery_dl",
         "--quiet", "--write-metadata", "--directory", tmpdir, "-o", "tiktok.audio=true",
     ]
+    if is_photo_post_url(url) and detect_platform(url) == "tiktok":
+        command += ["--range", "1-41", "--filesize-max", "20M"]
     if proxy:
         command += ["--proxy", proxy]
     if cookies_file is not None:
@@ -1842,9 +2679,13 @@ def _download_album_sync(
         if p.suffix.lower() in _PHOTO_EXTENSIONS | _ALBUM_VIDEO_EXTENSIONS
     ]
     music = next((p for p in files if p.suffix.lower() in _MUSIC_EXTENSIONS), None)
-    return AlbumMedia(
-        items=items[:MAX_ALBUM_ITEMS], music=music, description=_album_description(tmpdir)
-    )
+    tiktok_photo = is_photo_post_url(url) and detect_platform(url) == "tiktok"
+    limit = _TIKWM_ALBUM_MAX_ITEMS if tiktok_photo else MAX_ALBUM_ITEMS
+    if len(items) > limit:
+        raise AlbumLimitError("В посте слишком много файлов для одной загрузки.")
+    if tiktok_photo and sum(p.stat().st_size for p in items) > _TIKWM_ALBUM_MAX_BYTES:
+        raise AlbumLimitError("Фото-пост TikTok превышает лимит 80 МБ.")
+    return AlbumMedia(items=items, music=music, description=_album_description(tmpdir))
 
 
 _BROWSER_HEADERS = {
@@ -1942,6 +2783,8 @@ def _scrape_rule34_sync(url: str, tmpdir: str, proxy: str | None = None) -> Albu
         key=lambda m: "wimg." in m.lower(),
     )
     media_url = videos[0] if videos else seen[0]
+    from bot.urlguard import ensure_public_url
+    ensure_public_url(media_url)
     ext = Path(urlparse(media_url).path).suffix.lower() or ".jpg"
     dest = Path(tmpdir) / f"rule34{ext}"
     # The media CDN returns 403 without a Referer pointing back to the post page,
@@ -2063,6 +2906,19 @@ async def download_album(
     # them, so the carousel gets the same walk the video path has.
     exits = _album_exits(_plat, proxy)
     try:
+        if _plat == "tiktok" and is_photo_post_url(url):
+            # Tikwm reports every slide. gallery-dl's ordinary result was
+            # silently truncated to one Telegram group of ten images.
+            try:
+                album = await asyncio.to_thread(_tikwm_photo_album, url, tmpdir, proxy)
+            except AlbumLimitError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - fall back to gallery-dl
+                logger.info("TikTok photo resolver unavailable: %s", exc)
+                await asyncio.to_thread(_clear_directory, tmpdir)
+            else:
+                yield album
+                return
         album = None
         last_error: DownloadFailedError | None = None
         # The browser has its own network in its own container, so walking the
@@ -2154,6 +3010,12 @@ async def download_album(
             # Reading .items off it crashed instead of saying "not found".
             if album is not None and album.items:
                 break
+        if (album is None or not album.items) and _plat == "tiktok":
+            await asyncio.to_thread(_clear_directory, tmpdir)
+            try:
+                album = await asyncio.to_thread(_tikwm_photo_album, url, tmpdir, proxy)
+            except Exception as exc:  # noqa: BLE001 - gallery-dl's error is more useful
+                logger.warning("TikTok photo fallback failed: %s", exc)
         if album is None or not album.items:
             if last_error is not None:
                 raise last_error
@@ -2171,6 +3033,141 @@ _ALBUM_MAX_EXITS = 4
 # in the reading, not a real post.
 _ALBUM_ITEM_MAX_BYTES = 512 * 1024 * 1024
 _ALBUM_RETRY_TIMEOUT = 60
+_TIKWM_PHOTO_MAX_BYTES = 20 * 1024 * 1024
+_TIKWM_ALBUM_MAX_ITEMS = 40
+_TIKWM_ALBUM_MAX_BYTES = 80 * 1024 * 1024
+_TIKWM_ALBUM_SECONDS = 150
+_TIKWM_MUSIC_MAX_BYTES = 10 * 1024 * 1024
+_TIKWM_MEDIA_PROXY = os.getenv("TIKWM_MEDIA_PROXY", "socks5h://warp:1080")
+_TIKWM_CDN_XRAY_EXITS = (
+    "socks5h://xray:2075", "socks5h://xray:2074", "socks5h://xray:2073",
+)
+
+
+def _tikwm_photo_extension(path: Path) -> str | None:
+    """Decode one whole image before accepting a resolver-provided carousel."""
+    with path.open("rb") as handle:
+        prefix = handle.read(16)
+    if prefix.startswith(b"\xff\xd8\xff"):
+        extension = ".jpg"
+    elif prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = ".png"
+    elif prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
+        extension = ".webp"
+    else:
+        return None
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
+             "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return extension if result.returncode == 0 else None
+
+
+def _tikwm_photo_album(url: str, tmpdir: str, proxy: str | None = None) -> AlbumMedia:
+    from curl_cffi import requests as cffi_requests
+
+    data, session = _tikwm_data(url, proxy)
+    active_session = session
+    fallback_sessions = []
+    # The API and signed image CDN take different network paths. WARP can
+    # reach some image hosts while a healthy TikTok xray exit reaches others.
+    # A successful exit is reused for subsequent slides, so a 31-photo post
+    # does not retry the full ladder 31 times.
+    ladder = proxy_ladder("tiktok")
+    fallbacks = list(dict.fromkeys(
+        p for p in (_TIKWM_MEDIA_PROXY, *_TIKWM_CDN_XRAY_EXITS, proxy, *ladder) if p
+    ))
+    current_proxy = getattr(session, "proxies", {}).get("https")
+    fallbacks = [p for p in fallbacks if p != current_proxy]
+    fallback_index = 0
+    deadline = time.monotonic() + _TIKWM_ALBUM_SECONDS
+    try:
+        images = data.get("images")
+        if not isinstance(images, list) or not images:
+            raise DownloadFailedError("Резервный сервис не вернул фото.")
+        if len(images) > _TIKWM_ALBUM_MAX_ITEMS:
+            raise AlbumLimitError("В посте больше 40 фото; отправка ограничена.")
+        urls = [_tikwm_media_url(image) for image in images]
+        paths: list[Path] = []
+        total_bytes = 0
+        for index, media_url in enumerate(urls, 1):
+            if time.monotonic() >= deadline:
+                raise AlbumLimitError("Превышено время загрузки фото-поста TikTok.")
+            path = Path(tmpdir) / f"photo-{index}"
+
+            image_limit = min(
+                _TIKWM_PHOTO_MAX_BYTES,
+                _TIKWM_ALBUM_MAX_BYTES - total_bytes + 1,
+            )
+
+            def fetch_image(
+                current_session, image_url=media_url, destination=path,
+                limit=image_limit,
+            ):
+                return _stream_to_file(
+                    current_session, image_url, destination, limit,
+                    None, None, {}, None, referer="https://www.tikwm.com/",
+                    allow_redirects=False,
+                )
+
+            while True:
+                try:
+                    fetched = fetch_image(active_session)
+                except (cffi_requests.exceptions.RequestException, StalledTransferError):
+                    fetched = False
+                if fetched:
+                    break
+                if fallback_index >= len(fallbacks) or time.monotonic() >= deadline:
+                    raise DownloadFailedError(
+                        "Резервный сервис не отдал одно из фото через доступные маршруты."
+                    )
+                media_proxy = fallbacks[fallback_index]
+                fallback_index += 1
+                proxies = {"http": media_proxy, "https": media_proxy}
+                active_session = cffi_requests.Session(
+                    impersonate="firefox133", proxies=proxies, timeout=10,
+                )
+                fallback_sessions.append(active_session)
+            extension = _tikwm_photo_extension(path)
+            if extension is None:
+                raise DownloadFailedError("Резервный сервис отдал повреждённое фото.")
+            renamed = path.with_suffix(extension)
+            path.rename(renamed)
+            paths.append(renamed)
+            total_bytes += renamed.stat().st_size
+            if total_bytes > _TIKWM_ALBUM_MAX_BYTES:
+                raise AlbumLimitError("Фото-пост TikTok превышает лимит 80 МБ.")
+        music = None
+        raw_music = data.get("music")
+        if isinstance(raw_music, str) and raw_music and time.monotonic() < deadline:
+            try:
+                music_url = _tikwm_media_url(raw_music)
+                candidate = Path(tmpdir) / "music.mp3"
+                if _stream_to_file(
+                    active_session, music_url, candidate, _TIKWM_MUSIC_MAX_BYTES,
+                    None, None, {}, None, referer="https://www.tikwm.com/",
+                    allow_redirects=False,
+                ):
+                    with candidate.open("rb") as handle:
+                        prefix = handle.read(12)
+                    if prefix.startswith(b"ID3") or (
+                        len(prefix) >= 2 and prefix[0] == 0xFF and prefix[1] & 0xE0 == 0xE0
+                    ):
+                        music = candidate
+            except (DownloadFailedError, cffi_requests.exceptions.RequestException,
+                    StalledTransferError, OSError):
+                logger.info("TikTok carousel music unavailable for %s", url)
+        return AlbumMedia(
+            items=paths, music=music, description=data.get("title") or None,
+        )
+    finally:
+        session.close()
+        for fallback_session in fallback_sessions:
+            fallback_session.close()
 
 
 def _clear_directory(path: str) -> None:
@@ -2208,6 +3205,8 @@ def is_photo_post_url(url: str) -> bool:
     path = urlparse(url).path
     if host.endswith("rule34.xxx"):
         return True
+    if host == "pinterest.com" or host.endswith(".pinterest.com") or host == "pin.it":
+        return True
     if host.endswith("instagram.com") and path.startswith("/p/"):
         return True
     return host.endswith("tiktok.com") and "/photo/" in path
@@ -2220,9 +3219,159 @@ _SPOTDL_BIN = os.getenv("SPOTDL_BIN", "/opt/spotdl/bin/spotdl")
 # Spotify's API is geo-blocked in Russia, so spotdl's metadata + YouTube fetch
 # are routed through an HTTP proxy (the VLESS node) when configured.
 _SPOTDL_HTTP_PROXY = os.getenv("SPOTDL_HTTP_PROXY", "")
+_SPOTIFY_METADATA_DEADLINE = 24.0
+_SPOTIFY_METADATA_PROXY_BASE = os.getenv(
+    "SPOTIFY_METADATA_PROXY_BASE", "socks5h://xray"
+)
+_SPOTIFY_METADATA_PROXY_PORTS = os.getenv(
+    "SPOTIFY_METADATA_PROXY_PORTS", "2077,2076,2075,2074,2073"
+)
+_SPOTIFY_AUDIO_PROXY = os.getenv(
+    "SPOTIFY_AUDIO_PROXY", "socks5h://warp:1080"
+)
 
 
-def _download_spotify_sync(url: str, tmpdir: str) -> Path:
+def _spotify_metadata_proxies() -> list[str | None]:
+    """A small fixed exit ladder; no arbitrary pool scan for one track."""
+    proxies: list[str | None] = [None]
+    for raw_port in _SPOTIFY_METADATA_PROXY_PORTS.split(",")[:5]:
+        try:
+            port = int(raw_port.strip())
+        except ValueError:
+            continue
+        if 1 <= port <= 65535:
+            proxies.append(f"{_SPOTIFY_METADATA_PROXY_BASE}:{port}")
+    return proxies
+
+
+def _spotify_page_metadata(
+    page_text: str, title: str | None
+) -> tuple[str, str, int] | None:
+    description_match = re.search(
+        r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', page_text
+    )
+    duration_match = re.search(
+        r'<meta[^>]+name="music:duration"[^>]+content="(\d+)"', page_text
+    )
+    page_title_match = re.search(
+        r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', page_text
+    )
+    if not (description_match and duration_match and page_title_match):
+        return None
+    page_title = html.unescape(page_title_match.group(1)).strip()
+    if title and page_title.casefold() != title.casefold():
+        return None
+    description_parts = html.unescape(description_match.group(1)).split(" · ")
+    if not title and page_title.casefold() not in {
+        part.strip().casefold() for part in description_parts[1:]
+    }:
+        return None
+    artists = description_parts[0].strip()
+    duration = int(duration_match.group(1))
+    return (page_title, artists, duration) if artists and duration > 0 else None
+
+
+def _spotify_stream_metadata(
+    url: str, title: str | None, proxy: str | None, timeout: float, headers: dict
+) -> tuple[str, str, int] | None:
+    """Stop reading once the head contains the track's verified meta tags."""
+    page = _curl_get(
+        url, proxy=proxy, impersonate="chrome", timeout=timeout,
+        headers=headers, stream=True,
+    )
+    try:
+        page.raise_for_status()
+        body = bytearray()
+        for chunk in page.iter_content(chunk_size=16384):
+            body.extend(chunk)
+            if len(body) > 128 * 1024:
+                break
+            parsed = _spotify_page_metadata(body.decode("utf-8", errors="replace"), title)
+            if parsed:
+                return parsed
+    finally:
+        page.close()
+    return None
+
+
+def _spotify_fallback_metadata(url: str) -> tuple[str, str, int]:
+    """Read public Spotify metadata without relying on spotdl's web parser."""
+    deadline = time.monotonic() + _SPOTIFY_METADATA_DEADLINE
+    title = None
+    try:
+        embed = _curl_get(
+            "https://open.spotify.com/oembed", params={"url": url},
+            impersonate="chrome", timeout=3,
+        )
+        embed.raise_for_status()
+        title = str(embed.json().get("title") or "").strip() or None
+    except Exception as exc:  # noqa: BLE001 - page metadata can supply title
+        logger.info("Spotify oEmbed unavailable: %s", exc)
+    # Spotify serves a generic desktop shell with no track metadata to Chrome.
+    # In some regions even the mobile page is a generic 451 page. A few
+    # dedicated xray exits can reach the public Open Graph metadata.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+    }
+    for proxy in _spotify_metadata_proxies():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            break
+        try:
+            parsed = _spotify_stream_metadata(
+                url, title, proxy, min(4.0, remaining), headers,
+            )
+        except Exception as exc:  # noqa: BLE001 - exit failures are expected
+            logger.info("Spotify metadata exit failed (%s): %s", proxy, exc)
+            continue
+        if parsed:
+            return parsed
+    raise DownloadFailedError(
+        "Spotify: не удалось проверить название и исполнителя трека."
+    )
+
+
+def _spotify_fallback_video(url: str) -> tuple[str, str]:
+    title, artists, duration = _spotify_fallback_metadata(url)
+    query = f"ytsearch5:{artists} {title}"
+    options = _base_options(None, "https://www.youtube.com/") | {
+        "skip_download": True, "retries": 0, "extractor_retries": 0,
+        "socket_timeout": 12,
+    }
+    info = _extract_info(options, query, download=False, attempts=1) or {}
+    first_artist = re.sub(r"[^\w]+", "", artists.split(",", 1)[0]).casefold()
+    title_words = [
+        word for word in re.findall(r"\w+", title.casefold()) if len(word) > 1
+    ]
+    for entry in info.get("entries") or []:
+        if not entry:
+            continue
+        candidate_title = str(entry.get("title") or "").casefold()
+        candidate_text = re.sub(
+            r"[^\w]+", "",
+            candidate_title + " " + str(entry.get("uploader") or "").casefold(),
+        )
+        candidate_words = set(re.findall(r"\w+", candidate_title))
+        candidate_duration = entry.get("duration") or 0
+        if (
+            first_artist in candidate_text
+            and all(word in candidate_words for word in title_words)
+            and abs(candidate_duration - duration) <= max(6, min(15, duration * 0.05))
+            and entry.get("webpage_url")
+        ):
+            return str(entry["webpage_url"]), title
+    raise DownloadFailedError(
+        "Spotify: не найдено точное совпадение трека по названию и длительности."
+    )
+
+
+def _download_spotify_sync(
+    url: str, tmpdir: str, max_bytes: int, progress: ProgressState | None = None,
+) -> tuple[Path, str]:
+    if progress is not None:
+        progress.phase = PHASE_RESOLVE
+        progress.started_at = time.monotonic()
     env = dict(os.environ)
     if _SPOTDL_HTTP_PROXY:
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = _SPOTDL_HTTP_PROXY
@@ -2233,28 +3382,65 @@ def _download_spotify_sync(url: str, tmpdir: str) -> Path:
     ]
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, timeout=600, env=env
+            command, capture_output=True, text=True, timeout=90, env=env, check=False
         )
     except subprocess.TimeoutExpired as exc:
         raise DownloadFailedError("Spotify: превышено время ожидания.") from exc
     files = sorted(p for p in Path(tmpdir).rglob("*.mp3") if p.is_file())
+    verified_title = ""
     if not files:
         detail = (result.stderr or result.stdout or "").strip()
-        logger.info("spotdl produced no file (rc=%d): %s", result.returncode, detail[:500])
-        raise DownloadFailedError("Не удалось скачать трек из Spotify.")
-    return max(files, key=lambda p: p.stat().st_size)
+        logger.info(
+            "spotdl produced no file (rc=%d): %s", result.returncode, detail[:500]
+        )
+        video_url, verified_title = _spotify_fallback_video(url)
+        if progress is not None:
+            progress.phase = PHASE_DOWNLOAD
+            progress.started_at = time.monotonic()
+        guard = {"limit": max_bytes, "tripped": None}
+        options = _base_options(None, video_url) | {
+            "format": _AUDIO_FORMAT,
+            "outtmpl": str(Path(tmpdir) / "fallback.%(ext)s"),
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+            "progress_hooks": [_progress_hook(progress, None, guard)],
+            "proxy": _SPOTIFY_AUDIO_PROXY,
+            "retries": 0,
+            "fragment_retries": 0,
+            "extractor_retries": 0,
+            "file_access_retries": 0,
+            "socket_timeout": 12,
+        }
+        try:
+            _extract_info(options, video_url, download=True, attempts=1)
+        except YtdlpDownloadError as exc:
+            if guard.get("disk_low"):
+                raise DownloadFailedError(
+                    "Spotify: недостаточно свободного места для загрузки."
+                ) from exc
+            raise DownloadFailedError(
+                "Spotify: не удалось скачать аудио — источник временно недоступен."
+            ) from exc
+        files = sorted(p for p in Path(tmpdir).rglob("*.mp3") if p.is_file())
+        if not files:
+            raise DownloadFailedError("Не удалось скачать трек из Spotify.")
+    path = max(files, key=lambda p: p.stat().st_size)
+    return path, verified_title or path.stem
 
 
 @asynccontextmanager
-async def _spotify_download(url: str, max_bytes: int) -> AsyncIterator[Media]:
+async def _spotify_download(
+    url: str, max_bytes: int, progress: ProgressState | None = None,
+) -> AsyncIterator[Media]:
     tmpdir = tempfile.mkdtemp(prefix="tg-spotify-")
     try:
-        path = await asyncio.to_thread(_download_spotify_sync, url, tmpdir)
+        path, title = await asyncio.to_thread(
+            _download_spotify_sync, url, tmpdir, max_bytes, progress
+        )
         size = path.stat().st_size
         if size > max_bytes:
             raise FileTooLargeError(size, max_bytes)
         yield Media(
-            path=path, title=path.stem, file_size=size,
+            path=path, title=title, file_size=size,
             duration=None, width=None, height=None,
         )
     finally:
@@ -2271,9 +3457,9 @@ def download_audio(
     force_proxy: bool = False,
     ratelimit: int | None = None,
 ) -> AbstractAsyncContextManager[Media]:
-    """Async context manager yielding the extracted audio; temp files are always removed."""
+    """Yield the extracted audio and remove its temporary files afterward."""
     if detect_platform(url) == "spotify":
-        return _spotify_download(url, max_bytes)
+        return _spotify_download(url, max_bytes, progress)
     size_guard = {"limit": max_bytes, "tripped": None}
     options = _base_options(cookies_file, url, force_proxy) | {
         "format": _AUDIO_FORMAT,

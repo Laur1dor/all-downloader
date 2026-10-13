@@ -10,11 +10,15 @@ FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    IG_CAPTCHA_MODEL_DIR=/opt/ig-captcha-model
 
-RUN pip install --no-cache-dir playwright==1.56.0 \
+RUN pip install --no-cache-dir playwright==1.56.0 faster-whisper==1.2.1 \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+
+# Installation only: runtime transcription is offline and uses this small model.
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny.en', revision='0d3d19a32d3338f10357c0889762bd8d64bbdeba', local_dir='/opt/ig-captcha-model', allow_patterns=['config.json', 'model.bin', 'tokenizer.json', 'vocabulary.txt'])"
 
 # A screen a person can reach, for the one thing only a person may answer: a
 # CAPTCHA on the account. Xvfb is already here for Chromium; these put that
@@ -26,6 +30,11 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY scripts/iglogin_browser.py /app/scripts/iglogin_browser.py
+COPY scripts/ig_profile.py /app/scripts/ig_profile.py
+COPY scripts/igcaptcha.py /app/scripts/igcaptcha.py
+COPY scripts/ig_native_captcha.py /app/scripts/ig_native_captcha.py
+COPY scripts/ig_captcha_budget.py /app/scripts/ig_captcha_budget.py
+COPY scripts/ig_audio_transcribe.py /app/scripts/ig_audio_transcribe.py
 # The same browser also answers "what is in this post"; see igresolve.py.
 COPY scripts/igresolve.py /app/scripts/igresolve.py
 COPY scripts/igremote.py /app/scripts/igremote.py

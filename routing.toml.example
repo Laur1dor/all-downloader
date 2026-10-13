@@ -27,3 +27,5 @@ main_fallback = "goida"
 tiktok      = "main"
 rule34      = "goida"
 rule34video = "socks5h://warp:1080"
+# The page and playlist may load directly while CDN segments stall.
+joidb       = "socks5h://warp:1080"

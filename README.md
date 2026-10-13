@@ -45,14 +45,20 @@
 - **Много платформ** — YouTube (включая Shorts и YouTube Music), TikTok,
   Instagram, Twitter/X, SoundCloud, Spotify, Yandex Music и другие. Просто
   пришлите ссылку — платформа определяется автоматически.
-- **Максимальное качество без перекодирования.** Видео всегда берётся в самом
-  высоком разрешении/FPS и только *ремуксится* (не перекодируется) — без потери
-  качества и без нагрузки на CPU. Среди форматов равного качества предпочитается
-  **H.264/AAC**, потому что мобильный Telegram проигрывает другие кодеки
-  (VP9/AV1) как застывший кадр со звуком.
+- **Наилучшее доступное совместимое качество.** Обычно видео перепаковывается
+  без перекодирования; для плеера Telegram предпочтительны **H.264/AAC**.
+  Подрезка и несовместимые исходники требуют подготовки совместимой MP4-копии.
+  Кнопка TikTok «Файл» позволяет получить сохранённый исходник, когда он доступен.
 - **Меню качества с размерами.** Для платформ с несколькими разрешениями бот
   показывает инлайн-меню (напр. *1080p · 320 МБ*, *720p · 140 МБ*), чтобы выбрать
   до скачивания.
+  Размер может быть приблизительным; если источник его не сообщает и проверить
+  не удалось, меню явно показывает «размер неизвестен».
+- **Особые форматы TikTok.** HDR-исходник при необходимости преобразуется в SDR
+  для совместимого просмотра с корректным отображением цветов; сохранённый
+  исходник доступен кнопкой «Файл». Live Photo сейчас отправляются как фотографии,
+  без сохранения движения. Музыкальные альбомы, плейлисты и прямая загрузка
+  защищённых DRM-потоков не поддерживаются.
 - **Извлечение аудио.** У каждого видео есть кнопка *«Скачать аудио»*; ссылки
   YouTube Music / SoundCloud / Spotify / Yandex Music сразу отдаются аудиофайлом.
   Spotify и Yandex подбираются к источнику автоматически (поток Spotify защищён
@@ -219,6 +225,9 @@ COMPOSE_PROFILES=vless,warp,local-api
 | `COOKIES_FILE` | — | Путь к файлу куки (по умолч. `data/cookies.txt`). |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | для 2 ГБ | С my.telegram.org; нужны своему Bot API. |
 | `TELEGRAM_API_URL` | для 2 ГБ | `http://telegram-bot-api:8081`. |
+| `SUGGESTIONS_CHAT_ID` | — | ID отдельной группы, куда бот пересылает предложения `/suggest`. |
+| `NEWS_CHANNEL_ID` | — | ID или `@username` новостного канала; боту нужны права публикации. |
+| `DNS_SERVER` | — | Адрес контейнера dns-pool; по умолчанию `172.30.53.53`. |
 | `PROXY_URL` | для прокси | `socks5h://xray:2080` — включает адаптивную маршрутизацию. |
 | `VLESS_SUBSCRIPTION` | для прокси | URL подписки, прокси сам обновляет. |
 | `VLESS_CONFIGS` | для прокси | Или вставьте `vless://...` напрямую через запятую. |
@@ -378,9 +387,15 @@ docker compose up -d --build
 `main_fallback = "goida"` — если основная нода умерла, всё уходит в бесплатный
 пул, чтобы один сбой не ронял бота.
 
-**Бесплатный резервный пул с проверкой нод.** Через `GOIDA_SUBSCRIPTIONS`
-(raw-ссылки на агрегаторы вроде AvenCores/goida-vpn-configs) поднимается второй
-пул на `socks :2079`. Ссылок в таких подписках сотни тысяч, но живых среди них
+**Бесплатный резервный пул с проверкой нод.** По умолчанию Compose берёт шесть
+рекомендованных списков из актуального GitLab-зеркала AvenCores. Старые URL
+`github.com/AvenCores/goida-vpn-configs` возвращают 404; если они остались в
+серверном `.env`, замените значение `GOIDA_SUBSCRIPTIONS` на GitLab raw URL или
+удалите эту переменную, чтобы заработал Compose default. Число параллельных
+загрузок списка ограничено `GOIDA_FETCH_WORKERS` (3), размер одного списка —
+`MAX_SUBSCRIPTION_BYTES` (8 MiB), время запроса —
+`SUBSCRIPTION_FETCH_TIMEOUT` (12 с). Пул доступен на `socks :2079`.
+Ссылок в таких подписках сотни тысяч, но живых среди них
 единицы процентов, поэтому набирать пул «первыми N подряд» бесполезно — этим
 занимается **пробер** `proxy/probe_goida.py`: он берёт случайную выборку из всех
 источников, отсеивает недоступные по TCP, а каждую выжившую реально прогоняет
@@ -420,6 +435,18 @@ PROXY_URL=socks5h://xray:2080
 Bot API сервера уходит в VLESS-туннель, чтобы достучаться до Telegram даже при
 DPI-троттлинге MTProto. Требует включённого профиля `vless`.
 
+Если файл больше лимита одного сообщения, бот отправляет видео частями: до 8
+частей и до 6 ГБ исходника суммарно. После ссылки можно указать интервал,
+например `https://youtu.be/ID 01:20-02:40`. Подготовка ограничена 12 минутами;
+каждая часть проверяется как воспроизводимый MP4 перед отправкой.
+
+`/suggest` принимает предложения о новых сервисах. Администратор видит их в
+отдельной группе и может ответить командой `/reply ID текст`.
+
+Для публичных постов TikTok при отказе прямой загрузки используется резервный
+Tikwm: ему передаётся только ссылка на пост, без куки и токенов. Полученные
+видео и фото проверяются перед отправкой.
+
 ### Ограничение полосы
 
 Хостовый systemd-юнит + таймер читают целевую скорость из
@@ -446,6 +473,11 @@ DPI-троттлинге MTProto. Требует включённого проф
   У каждой настройки есть пресеты и ✏️ ввод своего значения в безопасном
   диапазоне.
 - **`/restart`** — мягкий перезапуск; перечитывает `.env` и `data/cookies.txt`.
+- **`/suggestions`** — список предложений с номерами и шаблоном ответа.
+- **`/reply ID текст`** — отправить ответ автору предложения.
+- **`/events`** — краткая сводка действий пользователей за 24 часа без хранения
+  текстов сообщений и ссылок в журнале.
+- **`/post текст`** — опубликовать новость в `NEWS_CHANNEL_ID`.
 
 ### Структура проекта
 
@@ -508,12 +540,20 @@ Dockerfile*         образы бота, xray-прокси и своего Bot
 - **Many platforms** — YouTube (incl. Shorts and YouTube Music), TikTok,
   Instagram, Twitter/X, SoundCloud, Spotify, Yandex Music and more. Just send a
   link; the platform is detected automatically.
-- **Maximum quality, no re-encoding.** Video is always taken at the highest
-  resolution/FPS and only *remuxed* (never re-encoded) — no quality loss, no
-  wasted CPU. Among equal-quality formats it prefers **H.264/AAC**, because mobile
+- **Maximum quality for ordinary downloads.** Video is taken at the highest
+  resolution/FPS and normally *remuxed* without re-encoding. Trimming and
+  splitting re-encode to produce independently playable H.264/AAC MP4 parts.
+  Among equal-quality formats it prefers **H.264/AAC**, because mobile
   Telegram plays other codecs (VP9/AV1) as a frozen frame with sound.
+  Incompatible TikTok sources may also require a compatible MP4 copy; the File
+  button provides the retained source when available. HDR sources are converted
+  to SDR when needed for compatible playback, with tone mapping; the retained
+  source is available through File. TikTok Live Photos currently arrive as still
+  images. Music albums, playlists and direct downloads of DRM-protected streams
+  are not supported.
 - **Quality menu with sizes.** For platforms exposing multiple resolutions, an
   inline menu (e.g. *1080p · 320 MB*) lets the user pick before downloading.
+  Sizes may be estimates; unavailable sizes are explicitly marked as unknown.
 - **Audio extraction.** Every video offers a *"Download audio"* button; YouTube
   Music / SoundCloud / Spotify / Yandex Music links are delivered straight as
   audio. Spotify/Yandex tracks are matched to their audio source automatically
@@ -703,6 +743,35 @@ lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
 
 then `pct reboot <CTID>` (a plain restart isn't enough). Inside the LXC, deploy
 exactly like the VPS guide.
+
+### DNS when the router or provider rewrites replies
+
+Compose starts `dns-pool` and points the bot, xray, sing-box and Instagram login
+containers at it. The pool uses encrypted DoH, DoT and DoQ upstreams, a small
+cache and a five-second upstream deadline. If they are all unavailable,
+`dns-pool` sends the query to `dns-warp`, which makes a DoH request through
+`warp:1080` using SOCKS5. Enable `COMPOSE_PROFILES=warp` for that fallback.
+Media platform domains are sent through `dns-warp` immediately: a forged
+NXDOMAIN is a valid DNS response and would not activate an error fallback.
+The IP-addressed DoH upstreams and encrypted bootstrap requests keep the pool
+from depending on the router's plain DNS.
+Docker's embedded resolver continues to resolve Compose service names.
+
+The default Docker subnet is `172.30.53.0/24`, and the resolver is
+`172.30.53.53`. If that subnet overlaps a LAN or VPN route, set both
+`DNS_POOL_SUBNET` and `DNS_POOL_IP` in `.env` to an unused subnet and an address
+inside it. `DNS_SERVER` can point to an existing trusted resolver instead.
+`DNS_VPN_SOCKS_URL` and `DNS_VPN_DOH_URL` select the fallback proxy and DoH
+endpoint. The fallback has a four-second request deadline and caps concurrent
+queries; without WARP it returns DNS failure promptly. Changing DNS does not
+route platform HTTP traffic through the VPN.
+
+After changing router or DNS settings, check a real answer from the bot's
+container with `docker compose exec bot python -c "import socket; print(socket.getaddrinfo('www.youtube.com', 443))"`.
+Also inspect `docker compose logs --tail=100 dns-pool xray bot` and compare a
+direct platform request with a request through the configured SOCKS proxy.
+An NXDOMAIN for an existing domain or a stalled proxy probe identifies the
+failing layer before changing the platform downloader.
 
 ### VLESS proxy routing
 

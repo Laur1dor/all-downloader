@@ -34,7 +34,7 @@ REQUEST_FILE = Path(os.getenv("IG_RESOLVE_REQUEST", "data/igresolve_request"))
 RESULT_FILE = Path(os.getenv("IG_RESOLVE_RESULT", "data/igresolve_result.json"))
 # A page load plus a browser start. Generous, because the alternative to waiting
 # is telling somebody the post does not exist.
-TIMEOUT = int(os.getenv("IG_RESOLVE_TIMEOUT", "90"))
+TIMEOUT = int(os.getenv("IG_RESOLVE_TIMEOUT", "300"))
 _POLL = 1.5
 ENABLED = os.getenv("IG_RESOLVE", "1") not in ("0", "false", "no")
 
@@ -43,8 +43,8 @@ ENABLED = os.getenv("IG_RESOLVE", "1") not in ("0", "false", "no")
 _lock = asyncio.Lock()
 
 # Who to tell when the account itself needs a person, and when it was last done.
-# A CAPTCHA cannot be answered by code - nothing here should try - so the only
-# useful thing is to say so, and not every time a link fails.
+# The helper tries bounded local audio recognition first. Notify only if its
+# automatic attempt could not clear the checkpoint, not on every failed link.
 _notify = None
 _CAPTCHA_NOTICE_EVERY = 12 * 3600
 _last_captcha_notice = 0.0
@@ -71,10 +71,10 @@ async def _captcha_notice() -> None:
         return
     try:
         await _notify(
-            "⚠️ Instagram просит капчу у аккаунта бота. Нажми кнопку "
+            "⚠️ Проверка Instagram не прошла автоматически. Нажми кнопку "
             "— пришлю ссылку на браузер сервера, пройдёшь её с телефона. "
-            "Пока капча висит, не качаются только посты 18+ и закрытые; "
-            "остальное бот берёт без аккаунта.",
+            "Посты, которым нужен вход, временно недоступны. "
+            "Часть открытых ссылок бот может загрузить без аккаунта.",
             "captcha",
         )
         _last_captcha_notice = now
@@ -99,6 +99,8 @@ async def resolve(url: str) -> ResolvedPost | None:
         return None
 
     async with _lock:
+        if time.monotonic() < _captcha_until:
+            return None
         try:
             if RESULT_FILE.exists():
                 RESULT_FILE.unlink()

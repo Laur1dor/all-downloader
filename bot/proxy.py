@@ -56,7 +56,7 @@ _PROBE_TIMEOUT = 8.0
 # address a 403 challenge page while the same request through a proxy returns
 # 200, and "status < 500" read that 403 as "direct works", so the platform was
 # routed direct and every download failed. These mean blocked, not reachable.
-_BLOCKED_STATUSES = frozenset({401, 403, 451})
+_BLOCKED_STATUSES = frozenset({401, 403, 429, 451})
 
 # Preferred pool order per policy. "main" (the personal node) is ALWAYS last so
 # day-to-day traffic never loads the operator's personal subscription while a
@@ -86,6 +86,17 @@ _DEFAULT_ROUTING: dict = {
     "defaults": {"policy": "adaptive", "main_fallback": "goida"},
     "services": {"tiktok": "main", "rule34": "goida", "rule34video": "bypass"},
 }
+
+
+def warp_fallback_enabled() -> bool:
+    """Whether Xray can route a failed pool through WARP.
+
+    Pool HTTP probes include that fallback, so they cannot prove that a native
+    VPN node is healthy when this flag is enabled.
+    """
+    return os.getenv("XRAY_WARP_FALLBACK", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 class ProxyRouter:
@@ -167,16 +178,17 @@ class ProxyRouter:
 
     def proxy_for(self, platform: str) -> str | None:
         """Proxy URL to use for this platform, or None to go direct."""
+        policy = self._policy_for(platform)
+        if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
+            # A dedicated external proxy pinned for this platform (e.g. WARP for
+            # DDoS-Guard sites that need one stable Cloudflare exit IP). This
+            # must work even when the separate xray/goida/bypass pools are off.
+            return policy
         if not self.enabled:
             return None
-        policy = self._policy_for(platform)
         if platform == "tiktok" and _tiktok_own_vpn() and self._main_url():
             # /control says TikTok goes through the operator's own subscription.
             return self._main_url()
-        if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
-            # A dedicated external proxy pinned for this platform (e.g. WARP for
-            # DDoS-Guard sites that need one stable Cloudflare exit IP).
-            return policy
         if policy.startswith("vless://"):
             # Node pinned in xray by domain-routing → must ride the main socks.
             return self._proxy_url
@@ -203,6 +215,12 @@ class ProxyRouter:
             if policy.startswith(("socks5://", "socks5h://", "http://", "https://")):
                 # Dedicated proxy (e.g. WARP) is primary; a retry after a block
                 # uses a rotating pool as an alternate exit.
+                if platform == "rule34video":
+                    # Its CDN intermittently refuses WARP even when the page
+                    # loads there. The personal pool serves the same MP4s.
+                    main = self._pool_url("main")
+                    if main and self._pool_ok.get("main"):
+                        return main
                 return self._cascade("goida")
             if policy.startswith("vless://"):
                 return self._main_url()
@@ -233,13 +251,29 @@ class ProxyRouter:
                 logger.exception("Proxy health check failed")
 
     async def _check_all(self) -> None:
-        for name in ("main", "goida", "bypass"):
-            url = self._pool_url(name)
-            self._pool_ok[name] = (
-                await self._reachable(_PROXY_TEST_URL, url) if url else False
-            )
-        for platform, url in _PROBE_URLS.items():
-            self._direct_ok[platform] = await self._reachable(url, None)
+        # The startup check used to run every eight-second probe in series.
+        # A broken router could therefore delay polling for over a minute.
+        # Bound both fan-out and total startup latency while keeping probes
+        # independent (one failed DNS lookup cannot stop the others).
+        gate = asyncio.Semaphore(4)
+
+        async def probe(url: str, proxy: str | None) -> bool:
+            async with gate:
+                return await self._reachable(url, proxy)
+
+        async def unavailable() -> bool:
+            return False
+
+        pool_names = ("main", "goida", "bypass")
+        checks = [
+            probe(_PROXY_TEST_URL, self._pool_url(name))
+            if self._pool_url(name) else unavailable()
+            for name in pool_names
+        ]
+        checks.extend(probe(url, None) for url in _PROBE_URLS.values())
+        results = await asyncio.gather(*checks)
+        self._pool_ok.update(zip(pool_names, results[:len(pool_names)], strict=True))
+        self._direct_ok.update(zip(_PROBE_URLS, results[len(pool_names):], strict=True))
         blocked = [p for p, ok in self._direct_ok.items() if not ok]
         dead_pools = [n for n in ("goida", "bypass", "main")
                       if self._pool_url(n) and not self._pool_ok[n]]
@@ -350,9 +384,18 @@ def proxy_ladder(platform: str) -> list[str]:
     # The rungs exist only in front of the xray pool, where each node was given
     # its own inbound. Any other exit — WARP, an AmneziaWG tunnel — is a single
     # proxy, and counting ports down from it would dial ports nothing listens on.
-    if port != _TIKTOK_BASE_PORT:
-        return [first]
-    return [f"{base}:{port - i}" for i in range(_TIKTOK_LADDER_PORTS)]
+    exits = (
+        [f"{base}:{port - i}" for i in range(_TIKTOK_LADDER_PORTS)]
+        if port == _TIKTOK_BASE_PORT else [first]
+    )
+    # An explicit primary such as WARP must not strand TikTok when it fails.
+    # Independent live pools remain fallback candidates, without inventing
+    # adjacent ports on gateways that do not expose a TikTok ladder.
+    for name in ("goida", "bypass", "main"):
+        alternate = _router._pool_url(name)
+        if alternate and _router._pool_ok.get(name) and alternate not in exits:
+            exits.append(alternate)
+    return exits
 
 
 def forced_proxy(platform: str = "") -> str | None:

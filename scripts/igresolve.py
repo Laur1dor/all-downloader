@@ -137,21 +137,19 @@ def _dismiss(page) -> None:
             continue
 
 
-def resolve(url: str) -> dict:
+def _resolve_with_browser(url: str, code: str) -> dict:
     from playwright.sync_api import sync_playwright
 
-    code = _shortcode(url)
-    if not code:
-        return {"ok": False, "error": "not an instagram post link"}
     if Path(os.getenv("IG_REMOTE_ACTIVE", "/app/data/igremote.active")).exists():
         # A person has the browser open to answer a CAPTCHA. Launching a second
         # Chromium on the same profile would fail on its lock - or worse, win it.
         return {"ok": False, "error": "the browser is in use for a captcha"}
 
     sys.path.insert(0, "/app/scripts")
-    from iglogin_browser import clear_stale_profile_lock
+    from iglogin_browser import browser_proxy, clear_stale_profile_lock
 
     clear_stale_profile_lock(PROFILE_DIR)
+    proxy = browser_proxy()
     with sync_playwright() as driver:
         context = driver.chromium.launch_persistent_context(
             str(PROFILE_DIR),
@@ -162,17 +160,28 @@ def resolve(url: str) -> dict:
             ],
             viewport={"width": 1280, "height": 900},
             locale="en-US",
+            **({"proxy": proxy} if proxy else {}),
         )
         page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto(f"https://www.instagram.com/p/{code}/", timeout=NAV_TIMEOUT)
             page.wait_for_timeout(PAGE_WAIT)
             if _challenged(page):
-                # Measured 23 Sep: every post, including ones other roads could
-                # still fetch, redirected here. No page load will get past it,
-                # and nothing here should try - it is for a person.
-                return {"ok": False, "captcha": True,
-                        "error": "instagram is asking this account for a captcha"}
+                from igcaptcha import present, solve
+
+                if not present(page) or not solve(page, log):
+                    return {"ok": False, "captcha": True,
+                            "error": "Instagram checkpoint could not be cleared automatically"}
+                _dismiss(page)
+                page.goto(f"https://www.instagram.com/p/{code}/", timeout=NAV_TIMEOUT)
+                page.wait_for_timeout(PAGE_WAIT)
+                if _challenged(page):
+                    return {"ok": False, "captcha": True,
+                            "error": "Instagram checkpoint remains after CAPTCHA"}
+                from iglogin_browser import _logged_in, write_cookies
+
+                if _logged_in(page):
+                    write_cookies(context.cookies())
             data = page.evaluate(_EXTRACT, code)
             if not data.get("found"):
                 # One retry behind whatever interstitial appeared, then give up
@@ -198,6 +207,19 @@ def resolve(url: str) -> dict:
             }
         finally:
             context.close()
+
+
+def resolve(url: str) -> dict:
+    from ig_profile import ProfileBusy, profile_lock
+
+    code = _shortcode(url)
+    if not code:
+        return {"ok": False, "error": "not an instagram post link"}
+    try:
+        with profile_lock(timeout=0):
+            return _resolve_with_browser(url, code)
+    except ProfileBusy:
+        return {"ok": False, "busy": True, "error": "Instagram browser profile is busy"}
 
 
 def _answer(payload: dict) -> None:

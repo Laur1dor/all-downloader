@@ -27,6 +27,7 @@ _PATH_ID_PATTERNS = {
     "instagram": re.compile(r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)"),
     "twitter": re.compile(r"/status/(\d+)"),
     "youtube": re.compile(r"/(?:shorts|embed|live)/([A-Za-z0-9_-]{6,})"),
+    "pinterest": re.compile(r"/pin/(\d+)"),
 }
 _QUERY_ID_KEYS = {
     "youtube": "v",
@@ -42,6 +43,7 @@ def _platform(host: str) -> str:
         "tiktok.com": "tiktok", "instagram.com": "instagram", "instagr.am": "instagram",
         "x.com": "twitter", "twitter.com": "twitter",
         "youtube.com": "youtube", "youtu.be": "youtube",
+        "pinterest.com": "pinterest", "pin.it": "pinterest",
         "pornhub.com": "pornhub", "pornhub.org": "pornhub",
         "rule34.xxx": "rule34", "rule34video.com": "rule34video",
         "the-joi-database.com": "joidb", "soundcloud.com": "soundcloud",

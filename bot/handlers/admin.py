@@ -14,7 +14,6 @@ import logging
 import os
 import signal
 import time
-import sys
 from contextlib import suppress
 from pathlib import Path
 
@@ -31,7 +30,7 @@ from aiogram.types import (
 
 from bot import vpnstore
 from bot.db import Database, hash_url
-from bot.urlkey import canonical_key, is_short_link
+from bot.proxy import warp_fallback_enabled
 from bot.runtime import (
     BANDWIDTH_OPTIONS_MBIT,
     RANGES,
@@ -39,6 +38,7 @@ from bot.runtime import (
     UPLOAD_OPTIONS_MB,
     config,
 )
+from bot.urlkey import canonical_key, is_short_link
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,11 @@ def _speed_line(key: str) -> str:
 
 
 def _control_text() -> str:
+    fallback_note = (
+        "🛟 Резерв WARP включён. Проверки выходов учитывают резерв; "
+        "состояние собственных VPN-узлов отдельно не подтверждено.\n\n"
+        if warp_fallback_enabled() else ""
+    )
     return (
         "⚙️ <b>Управление</b>\n\n"
         f"📦 Лимит загрузки — юзеры: <b>{_mb_label(config.get('user_upload_mb'))}</b>,"
@@ -110,6 +115,7 @@ def _control_text() -> str:
         f" админ: <b>{_speed_line('vpn_admin_speed_mbit')}</b>\n"
         f"📶 Канал (всего): <b>{_speed_line('bandwidth_mbit')}</b>\n"
         f"🔒 Solo-режим (пауза для юзеров): <b>{'ВКЛ' if config.solo_mode else 'выкл'}</b>\n\n"
+        f"{fallback_note}"
         "<i>✏️ — задать своё значение в диапазоне.</i>"
     )
 
@@ -310,7 +316,7 @@ def _render_stats(label: str, data: dict) -> str:
 _IGLOGIN_REQUEST = Path(os.getenv("IG_REQUEST_FILE", "data/iglogin_request"))
 _IGLOGIN_RESULT = Path(os.getenv("IG_RESULT_FILE", "data/iglogin_result.txt"))
 # Long, because the slow part is waiting for Instagram to send a code by mail.
-_IGLOGIN_TIMEOUT = 420
+_IGLOGIN_TIMEOUT = 600
 
 
 async def _run_iglogin() -> tuple[bool, str]:
@@ -329,8 +335,8 @@ async def _run_iglogin() -> tuple[bool, str]:
         head, _, body = report.partition(NEWLINE)
         return head.strip() == "OK", body.strip() or head.strip()
     return False, (
-        "Не дождался ответа. Контейнер iglogin запущен? "
-        "docker compose up -d iglogin"
+        "Не дождались результата входа от iglogin за 10 минут. "
+        "Проверьте журнал контейнера."
     )
 
 
@@ -457,14 +463,24 @@ def create_router(admin_id: int) -> Router:
         Reached from /igcaptcha and from the button under the CAPTCHA notice,
         so the link always arrives in this chat rather than anywhere else.
         """
-        with suppress(FileNotFoundError):
-            _IGREMOTE_STATUS.unlink()
-        _IGREMOTE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
-        _IGREMOTE_REQUEST.write_text(str(int(time.time())), encoding="utf-8")
-        notice = await target.answer("\U0001f5a5 Поднимаю браузер сервера…")
+        status = _igremote_status()
+        reusable = (
+            status.get("state") == "open"
+            and _IGREMOTE_STATUS.with_name("igremote.active").exists()
+            and 0 <= time.time() - float(status.get("at", 0)) < _IGREMOTE_LIFETIME
+        )
+        if not reusable:
+            with suppress(FileNotFoundError):
+                _IGREMOTE_STATUS.unlink()
+            _IGREMOTE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+            _IGREMOTE_REQUEST.write_text(str(int(time.time())), encoding="utf-8")
+            status = {}
+        notice = await target.answer("\U0001f5a5 Браузер открыт." if reusable
+                                     else "\U0001f5a5 Поднимаю браузер сервера…")
 
-        status: dict = {}
         for _ in range(60):
+            if status.get("state") in ("open", "failed", "signed_in"):
+                break
             await asyncio.sleep(1.5)
             status = _igremote_status()
             if status.get("state") in ("open", "failed", "signed_in"):
@@ -493,14 +509,15 @@ def create_router(admin_id: int) -> Router:
                                    "<code>IG_REMOTE_URL</code> — ссылку дать некуда.")
             return
 
-        lead = ("Instagram показывает капчу." if status.get("challenged")
+        lead = ("Instagram требует подтверждения входа." if status.get("challenged")
                 else "Капчи сейчас нет — можно просто проверить, что всё в порядке.")
         await notice.edit_text(
             f"\U0001f5a5 {lead}" + NEWLINE + NEWLINE
             + NEWLINE.join(links) + NEWLINE + NEWLINE
-            + "Пройди капчу сам — как только Instagram её уберёт, бот сохранит "
-            "сессию и закроет доступ. Ссылка одноразовая и живёт "
-            f"{_IGREMOTE_LIFETIME // 60} минут.",
+            + "Пройди необходимые шаги Instagram, включая телефон и SMS. "
+            "После успешного входа бот сохранит сессию и закроет экран. "
+            f"Сеанс живёт до {_IGREMOTE_LIFETIME // 60} минут; "
+            "повторная /igcaptcha выдаст текущую ссылку.",
             disable_web_page_preview=True,
         )
 

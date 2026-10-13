@@ -103,7 +103,10 @@ print("url cache OK")
 # --- routers wire up ---
 router = create_root_router(admin_id=111111111)
 names = [r.name for r in router.sub_routers]
-assert names == ["admin", "user", "download", "fallback"], names
+assert names == [
+    "admin", "suggestions_admin", "analytics", "broadcasts", "support",
+    "user", "download", "fallback",
+], names
 print("routers OK:", names)
 
 # --- internal-address guard ---
@@ -657,8 +660,14 @@ async def _drive(jar, folder, probe_answers, login_ok):
     """One check() with the probe and the login faked, so what is measured is
     the decision-making rather than Instagram."""
     said = []
+    # Each scenario is a separate bot run. Persistent warning markers should
+    # suppress repeats within one run, not suppress this independent scenario.
+    import uuid
+
+    case_dir = folder / uuid.uuid4().hex
+    case_dir.mkdir()
     watch = _igs.InstagramSession(
-        jar, folder / 'req', folder / 'res',
+        jar, case_dir / 'req', case_dir / 'res',
         lambda text: _note(said, text),
     )
     answers = list(probe_answers)

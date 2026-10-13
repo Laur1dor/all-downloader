@@ -20,6 +20,8 @@ import time
 from aiogram import BaseMiddleware
 from aiogram.types import Message, TelegramObject
 
+from bot.handlers.events import mark_outcome
+
 logger = logging.getLogger(__name__)
 
 # Seven a minute: comfortably above anyone typing normally, and far below what
@@ -64,6 +66,7 @@ class FloodMiddleware(BaseMiddleware):
         if self._allow(user.id):
             return await handler(event, data)
         logger.info("Flood limit hit by %s", user.id)
+        mark_outcome("rate_limited")
         if isinstance(event, Message) and self._should_tell(user.id):
             await event.answer(
                 "🐢 Слишком много сообщений подряд. Подождите минуту."

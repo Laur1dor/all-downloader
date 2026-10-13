@@ -19,11 +19,7 @@ services:
       AWG_PROXY_URL: ${AWG_PROXY_URL:-socks5h://awg:1080}
       SINGBOX_PROXY_URL: ${SINGBOX_PROXY_URL:-socks5h://singbox:2081}
     dns:
-      # The provider intercepts and rewrites plain DNS — 1.1.1.1 comes back
-      # empty for whole domains — so name resolution goes to a recursive
-      # resolver on the host that talks to the root servers itself and validates
-      # DNSSEC. DNS_SERVER is the docker bridge gateway.
-      - ${DNS_SERVER:-172.18.0.1}
+      - ${DNS_SERVER:-172.30.53.53}
     extra_hosts:
       # Telegram API resolved statically, bypassing DNS (provider DNS may be unreliable).
       - "api.telegram.org:149.154.167.220"
@@ -35,6 +31,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      dns-pool:
+        condition: service_started
     healthcheck:
       test:
         - CMD
@@ -58,14 +56,18 @@ services:
     container_name: xray
     profiles: ["vless"]
     dns:
-      - ${DNS_SERVER:-172.18.0.1}
+      - ${DNS_SERVER:-172.30.53.53}
     environment:
       VLESS_SUBSCRIPTION: ${VLESS_SUBSCRIPTION:-}
       VLESS_CONFIGS: ${VLESS_CONFIGS:-}
       VLESS_CONFIGS_FILE: ${VLESS_CONFIGS_FILE:-}
       VLESS_UPDATE_INTERVAL: ${VLESS_UPDATE_INTERVAL:-21600}
+      XRAY_WARP_FALLBACK: ${XRAY_WARP_FALLBACK:-0}
       # Free public fallback pool (exposed on its own SOCKS :2079).
-      GOIDA_SUBSCRIPTIONS: ${GOIDA_SUBSCRIPTIONS:-}
+      GOIDA_SUBSCRIPTIONS: ${GOIDA_SUBSCRIPTIONS:-https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/1.txt,https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/6.txt,https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/22.txt,https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/23.txt,https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/24.txt,https://gitlab.com/avencores/goida-vpn-configs/-/raw/main/githubmirror/25.txt}
+      GOIDA_FETCH_WORKERS: ${GOIDA_FETCH_WORKERS:-3}
+      MAX_SUBSCRIPTION_BYTES: ${MAX_SUBSCRIPTION_BYTES:-8388608}
+      SUBSCRIPTION_FETCH_TIMEOUT: ${SUBSCRIPTION_FETCH_TIMEOUT:-12}
       GOIDA_POOL_SIZE: ${GOIDA_POOL_SIZE:-50}
       # Curated premium bypass pool (comma-sep vless://) on SOCKS :2078.
       BYPASS_CONFIGS: ${BYPASS_CONFIGS:-}
@@ -147,7 +149,7 @@ services:
     container_name: singbox
     profiles: ["singbox"]
     dns:
-      - ${DNS_SERVER:-172.18.0.1}
+      - ${DNS_SERVER:-172.30.53.53}
     environment:
       SINGBOX_SOCKS_PORT: ${SINGBOX_SOCKS_PORT:-2081}
     volumes:
@@ -164,10 +166,13 @@ services:
       context: .
       dockerfile: Dockerfile.iglogin
     container_name: iglogin
+    mem_limit: 1024m
+    cpus: "1.0"
+    pids_limit: 256
     env_file:
       - .env
     dns:
-      - ${DNS_SERVER:-172.18.0.1}
+      - ${DNS_SERVER:-172.30.53.53}
     volumes:
       - ./data:/app/data
     # noVNC, for answering a CAPTCHA by hand (scripts/igremote.py). Nothing
@@ -189,6 +194,7 @@ services:
   igtunnel:
     image: cloudflare/cloudflared:latest
     container_name: igtunnel
+    profiles: ["ig-remote"]
     network_mode: "service:tun2socks"
     depends_on:
       - tun2socks
@@ -258,6 +264,63 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+
+  # Encrypted DNS for all application containers.  Docker's embedded resolver
+  # still handles service names; external names are forwarded here.  Addresses
+  # in the first upstreams avoid poisoned bootstrap DNS, while encrypted
+  # bootstrap allows the named DoT/DoQ endpoints to come up independently.
+  dns-pool:
+    image: adguard/dnsproxy:v0.86.0
+    container_name: dns-pool
+    depends_on:
+      dns-warp:
+        condition: service_started
+    command:
+      - --listen=0.0.0.0
+      - --port=53
+      - --cache
+      - --cache-size=4194304
+      - --timeout=5s
+      - --max-go-routines=128
+      - --ratelimit=100
+      - --upstream-mode=load_balance
+      - --upstream=https://94.140.14.14/dns-query
+      - --upstream=https://1.1.1.1/dns-query
+      - --upstream=https://8.8.8.8/dns-query
+      - --upstream=tls://dns.quad9.net
+      - --upstream=quic://p0.freedns.controld.com
+      # A forged NXDOMAIN is a valid DNS answer, so a generic fallback will not
+      # run. Resolve media domains over WARP from the outset instead.
+      - --upstream=[/youtube.com/youtu.be/googlevideo.com/ytimg.com/youtubei.googleapis.com/tiktok.com/tiktokcdn.com/tiktokv.com/byteoversea.com/ibytedtos.com/instagram.com/cdninstagram.com/fbcdn.net/pinterest.com/pinimg.com/x.com/twitter.com/twimg.com/soundcloud.com/sndcdn.com/spotify.com/scdn.co/yandex.ru/ya.ru/pornhub.com/rule34.xxx/rule34video.com/the-joi-database.com/telegram.org/telegram.me/t.me/]tcp://${DNS_VPN_IP:-172.30.53.54}:5353
+      - --bootstrap=https://94.140.14.14/dns-query
+      - --bootstrap=https://1.1.1.1/dns-query
+      - --bootstrap=https://8.8.8.8/dns-query
+      - --fallback=tcp://${DNS_VPN_IP:-172.30.53.54}:5353
+    networks:
+      default:
+        ipv4_address: ${DNS_POOL_IP:-172.30.53.53}
+    restart: unless-stopped
+
+  # Fallback DNS path: dnsproxy forwards only when direct encrypted resolvers
+  # fail; this service relays DoH over WARP's SOCKS5 proxy.  It can start when
+  # the optional warp profile is off and returns SERVFAIL quickly in that case.
+  dns-warp:
+    build: .
+    container_name: dns-warp
+    command: ["python", "-m", "bot.dns_vpn"]
+    environment:
+      DNS_VPN_SOCKS_URL: ${DNS_VPN_SOCKS_URL:-socks5://warp:1080}
+      DNS_VPN_DOH_URL: ${DNS_VPN_DOH_URL:-https://94.140.14.14/dns-query}
+    networks:
+      default:
+        ipv4_address: ${DNS_VPN_IP:-172.30.53.54}
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${DNS_POOL_SUBNET:-172.30.53.0/24}
 
 volumes:
   pgdata:

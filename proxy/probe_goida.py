@@ -78,6 +78,7 @@ _CRLF = chr(13) + chr(10)
 TCP_WORKERS = int(os.getenv("GOIDA_PROBE_TCP_WORKERS", "60"))
 # Параллельных xray немного: у сервера одно ядро.
 DEEP_WORKERS = int(os.getenv("GOIDA_PROBE_DEEP_WORKERS", "6"))
+FETCH_WORKERS = max(1, min(6, int(os.getenv("GOIDA_FETCH_WORKERS", "3"))))
 BASE_PORT = 41000
 
 _ENDPOINT_RE = re.compile(r"vless://[^@]+@([^:/?#]+):(\d+)")
@@ -109,7 +110,7 @@ def _candidates() -> list[str]:
             if ln.strip().startswith("vless://") and not bc._is_russian(ln.strip())
         ]
 
-    with cf.ThreadPoolExecutor(min(12, len(urls) or 1)) as pool:
+    with cf.ThreadPoolExecutor(min(FETCH_WORKERS, len(urls) or 1)) as pool:
         per_source = list(pool.map(fetch, urls))
 
     # Из каждого источника берём поровну, чтобы один гигантский блок не вытеснил
@@ -289,7 +290,9 @@ def probe_round() -> list[str]:
     if live:
         _write_live(live)
         _remember_recent(live)
-        if len(live) != len(previous):
+        # The target often stays at 25 while the individual free nodes rotate.
+        # Order alone is irrelevant and must not restart active connections.
+        if set(live) != set(previous):
             _request_rebuild()
         print(
             f"probe: живых {len(live)}/{len(batch)} → {LIVE_FILE} "

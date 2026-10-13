@@ -1,0 +1,8 @@
+[Unit]
+Description=Compressed PostgreSQL backup pushed to the private GitHub repo
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/all-downloader-private/scripts/db-backup-push.sh

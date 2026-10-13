@@ -1,3 +1,5 @@
+FROM denoland/deno:bin-2.9.7 AS deno
+
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -20,6 +22,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m venv /opt/spotdl \
     && /opt/spotdl/bin/pip install --no-cache-dir spotdl \
     && chmod -R a+rx /opt/spotdl
+
+# yt-dlp's YouTube JS challenge solver uses Deno by default. Copy the pinned
+# official binary instead of downloading an installer script at build time.
+COPY --from=deno /deno /usr/local/bin/deno
 
 COPY bot/ ./bot/
 # Optional legacy statistics dump, imported automatically on first start with an

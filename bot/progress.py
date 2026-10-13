@@ -13,7 +13,8 @@ API gives no upload progress callbacks).
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 # The percent bar appears only for files bigger than this; below it the plain
 # status text stays (no message-edit noise for small quick downloads).
@@ -28,6 +29,9 @@ _EMPTY = "⬜"
 _MB = 1024 * 1024
 
 PHASE_DOWNLOAD = "download"
+PHASE_QUEUE = "queue"
+PHASE_PREPARE = "prepare"
+PHASE_RESOLVE = "resolve"
 PHASE_UPLOAD = "upload"
 # While the bot waits for the user's compress-or-cancel choice the updater
 # must not overwrite the question message.
@@ -43,6 +47,9 @@ class ProgressState:
     speed: float | None = None
     eta: int | None = None
     phase: str = PHASE_DOWNLOAD  # set to PHASE_UPLOAD by the handler before sending
+    started_at: float = field(default_factory=time.monotonic)
+    part_index: int = 1
+    part_count: int = 1
 
 
 class CancelRegistry:
@@ -76,6 +83,12 @@ def render_progress(progress: ProgressState, media_kind: str, tick: int = 0) -> 
     """Build the status message for the current phase; None = keep the previous text."""
     if progress.phase == PHASE_PAUSED:
         return None
+    if progress.phase in (PHASE_QUEUE, PHASE_PREPARE, PHASE_RESOLVE):
+        elapsed = max(0, int(time.monotonic() - progress.started_at))
+        if progress.phase == PHASE_QUEUE:
+            return f"⏳ Ожидаю очередь для {media_kind}… {elapsed} с"
+        action = "Готовлю" if progress.phase == PHASE_PREPARE else "Ищу источник для"
+        return f"⏳ {action} {media_kind}… {elapsed} с"
     if progress.phase == PHASE_UPLOAD:
         # Marquee: a window of three blocks runs across the bar while uploading.
         offset = tick % _BLOCKS
@@ -83,7 +96,11 @@ def render_progress(progress: ProgressState, media_kind: str, tick: int = 0) -> 
         for i in range(3):
             blocks[(offset + i) % _BLOCKS] = _FILLED
         size = f" ({progress.downloaded / _MB:.1f} МБ)" if progress.downloaded else ""
-        return f"📤 Отправляю {media_kind}…{size}\n{''.join(blocks)}"
+        part = (
+            f" · часть {progress.part_index}/{progress.part_count}"
+            if progress.part_count > 1 else ""
+        )
+        return f"📤 Отправляю {media_kind}{part}…{size}\n{''.join(blocks)}"
 
     total = progress.total
     speed = f" • {progress.speed / _MB:.1f} МБ/с" if progress.speed else ""
@@ -95,10 +112,12 @@ def render_progress(progress: ProgressState, media_kind: str, tick: int = 0) -> 
         blocks = [_EMPTY] * _BLOCKS
         for i in range(3):
             blocks[(offset + i) % _BLOCKS] = _FILLED
-        return (
-            f"⬇️ Скачиваю {media_kind}… {progress.downloaded / _MB:.1f} МБ{speed}\n"
-            f"{''.join(blocks)}"
+        elapsed = max(0, int(time.monotonic() - progress.started_at))
+        amount = (
+            f"{progress.downloaded / _MB:.1f} МБ{speed}"
+            if progress.downloaded else f"ожидаю данные источника · {elapsed} с"
         )
+        return f"⬇️ Скачиваю {media_kind}… {amount}\n{''.join(blocks)}"
 
     # Known size: only bother with a bar for sizeable files (avoid edit-spam).
     if total < PROGRESS_MIN_BYTES:
