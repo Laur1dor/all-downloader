@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -110,7 +111,8 @@ _YT_AUDIO_PREFIX = "yta:"
 _QUALITY_PREFIX = "qh:"
 _DESCRIPTION_PREFIX = "desc:"
 _TIKTOK_FILE_PREFIX = "ttfile:"
-_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_source_v2"
+_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_mp4_v3"
+_TIKTOK_PHOTO_DOCUMENT_CACHE_KEY = "tiktok_photo_documents_v1"
 # How long interactive questions (compress? video-or-audio?) stay active.
 _COMPRESS_CHOICE_TIMEOUT = 10.0
 _MEDIA_CHOICE_TIMEOUT = 10.0
@@ -167,7 +169,7 @@ def _prune_tiktok_originals(now: float, needed: int = 0) -> None:
 
 
 def _remember_tiktok_original(url: str, source: Path) -> None:
-    """Retain original bytes with a hard link; never duplicate a large upload."""
+    """Retain the validated playback MP4 with a hard link for document delivery."""
     global _tiktok_original_dir
     size = source.stat().st_size
     if size > _TIKTOK_ORIGINAL_MAX_BYTES:
@@ -1139,7 +1141,7 @@ async def _run_link(
                         and len(upload_paths) == 1 and time_range is None
                     ):
                         try:
-                            _remember_tiktok_original(url, media.original_path or media.path)
+                            _remember_tiktok_original(url, media.path)
                         except OSError:
                             logger.warning("Could not retain TikTok original for file button")
                 break
@@ -1833,7 +1835,7 @@ async def handle_audio_request(
 async def handle_tiktok_file_request(
     callback: CallbackQuery, db: Database, settings: Settings, url_cache: UrlCache,
 ) -> None:
-    """Send the source media as documents, preserving bytes and image quality."""
+    """Send a compatible video file or full-quality photos, caching document IDs."""
     token = callback.data.removeprefix(_TIKTOK_FILE_PREFIX)
     url = url_cache.get(token)
     if url is None or detect_platform(url) != "tiktok" or not isinstance(callback.message, Message):
@@ -1845,34 +1847,63 @@ async def handle_tiktok_file_request(
     async with _user_gate(user_id, is_admin, callback.message) as allowed:
         if not allowed:
             return
-        cached = await db.get_cached_file(hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY)
-        if cached is not None and not is_photo_post_url(url) and (
-            not cached["file_size"] or cached["file_size"] <= _user_limit(settings, user_id)
-        ):
-            try:
-                sent = await _send_paced(
-                    lambda: callback.message.answer_document(
-                        cached["file_id"], caption=_CAPTION,
-                        disable_content_type_detection=True,
-                    ),
-                    90,
-                )
-            except TelegramBadRequest:
-                await db.delete_cached_file(hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY)
+        photo_post = is_photo_post_url(url)
+        cache_key = (_TIKTOK_PHOTO_DOCUMENT_CACHE_KEY if photo_post
+                     else _TIKTOK_DOCUMENT_CACHE_KEY)
+        cached = await db.get_cached_file(hash_url(url), cache_key)
+        cached_items = []
+        if cached is not None:
+            if photo_post:
+                try:
+                    cached_items = json.loads(cached["description"] or "")
+                    if not isinstance(cached_items, list) or not 0 < len(cached_items) <= 100:
+                        raise ValueError("Invalid photo document manifest")
+                    if any(not isinstance(item, dict)
+                           or not isinstance(item.get("file_id"), str) or not item["file_id"]
+                           or type(item.get("file_size")) is not int or item["file_size"] < 0
+                           for item in cached_items):
+                        raise ValueError("Invalid cached photo document")
+                except (ValueError, TypeError, KeyError):
+                    await db.delete_cached_file(hash_url(url), cache_key)
+                    cached_items = []
             else:
-                if sent.document is not None:
-                    await db.add_conversion(user_id, STATUS_DONE, "tiktok", "document",
-                                            file_size=cached["file_size"], processing_time=0.0)
+                cached_items = [cached]
+        if cached_items and all(not item["file_size"] or item["file_size"] <=
+                                _user_limit(settings, user_id) for item in cached_items):
+            delivered = 0
+            try:
+                for item in cached_items:
+                    sent = await _send_paced(
+                        lambda item=item: callback.message.answer_document(
+                            item["file_id"], caption=_CAPTION,
+                            disable_content_type_detection=True,
+                        ), 90,
+                    )
+                    if sent.document is None:
+                        raise DownloadFailedError("Telegram не принял сохранённый файл.")
+                    delivered += 1
+            except (TelegramBadRequest, DownloadFailedError):
+                await db.delete_cached_file(hash_url(url), cache_key)
+                if delivered:
+                    await callback.message.answer(
+                        "⚠️ Один из сохранённых файлов недоступен. Отправьте ссылку ещё раз."
+                    )
+                    await db.add_conversion(user_id, STATUS_FAILED, "tiktok", "document")
                     return
-                await db.delete_cached_file(hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY)
-        original_path = None if is_photo_post_url(url) else _tiktok_original_path(url)
+            else:
+                await db.add_conversion(user_id, STATUS_DONE, "tiktok", "document",
+                                        file_size=sum(item["file_size"] or 0
+                                                      for item in cached_items),
+                                        processing_time=0.0)
+                return
+        original_path = None if photo_post else _tiktok_original_path(url)
         delay = _rate_delay(user_id) if not is_admin and original_path is None else 0
         if delay:
             await callback.message.answer(
                 f"⏳ Подождите {int(delay) + 1} сек. перед новой загрузкой."
             )
             return
-        status = await callback.message.answer("⏳ Готовлю исходные файлы…")
+        status = await callback.message.answer("⏳ Готовлю файлы…")
         started = time.monotonic()
         try:
             async with (nullcontext() if is_admin else _download_slots):
@@ -1883,6 +1914,8 @@ async def handle_tiktok_file_request(
                         document = Path(tmpdir) / "tiktok.mp4"
                         os.link(original_path, document)
                         total = document.stat().st_size
+                        if total > _user_limit(settings, user_id):
+                            raise FileTooLargeError(total, _user_limit(settings, user_id))
                         async with _upload_capacity.slot(total, is_admin, db, "tiktok"):
                             sent = await _send_with_retries(
                                 lambda: callback.message.answer_document(
@@ -1895,12 +1928,13 @@ async def handle_tiktok_file_request(
                         await db.store_cached_file(
                             hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY, sent.document.file_id, total,
                         )
-                elif is_photo_post_url(url):
+                elif photo_post:
                     async with download_album(url, settings.cookies_file) as album:
                         if any(p.stat().st_size > _user_limit(settings, user_id)
                                for p in album.items):
                             raise DownloadFailedError("Один из файлов превышает лимит отправки.")
                         total = album.total_size
+                        documents = []
                         async with _upload_capacity.slot(total, is_admin, db, "tiktok"):
                             for path in album.items:
                                 sent = await _send_paced(
@@ -1911,13 +1945,18 @@ async def handle_tiktok_file_request(
                                 )
                                 if sent.document is None:
                                     raise DownloadFailedError("Telegram не принял фото как файл.")
+                                documents.append({"file_id": sent.document.file_id,
+                                                  "file_size": path.stat().st_size})
+                        await db.store_cached_file(
+                            hash_url(url), cache_key, documents[0]["file_id"], total,
+                            description=json.dumps(documents),
+                        )
                 else:
                     async with download_video(
                         url, settings.cookies_file,
                         max_bytes=_user_limit(settings, user_id),
-                        original_only=True,
                     ) as media:
-                        source = media.original_path or media.path
+                        source = media.path
                         total = source.stat().st_size
                         if total > _user_limit(settings, user_id):
                             raise FileTooLargeError(total, _user_limit(settings, user_id))

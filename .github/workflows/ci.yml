@@ -81,10 +81,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: compose.yml is valid
         # Every value the file interpolates has a default or is supplied here,
-        # so this checks the shape of the file and not the contents of a .env
-        # that deliberately never leaves the server.
+        # so an empty env_file is enough to validate a checkout without the
+        # server's private .env. Compose still requires that file to exist.
         env:
           DB_NAME: ci
           DB_USER: ci
           DB_PASSWORD: ci
-        run: docker compose -f compose.yml config --quiet
+        run: |
+          touch .env
+          docker compose -f compose.yml config --quiet

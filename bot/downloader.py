@@ -2054,7 +2054,8 @@ def _tiktok_playable(path: Path) -> bool:
     try:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,codec_name,pix_fmt,color_transfer:format=format_name",
+             "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height:"
+             "format=format_name,duration",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=20, check=False,
         )
@@ -2070,6 +2071,13 @@ def _tiktok_playable(path: Path) -> bool:
         video = next((s for s in streams if s.get("codec_type") == "video"), None)
         if video is None or video.get("codec_name") != "h264":
             logger.warning("TikTok media rejected: video codec is not H.264")
+            return False
+        duration = float((data.get("format") or {}).get("duration") or 0)
+        if (
+            not 0 < duration <= 4 * 3600
+            or not (video.get("width", 0) > 0 and video.get("height", 0) > 0)
+        ):
+            logger.warning("TikTok media rejected: missing duration or dimensions")
             return False
         if (
             video.get("pix_fmt", "yuv420p") not in ("yuv420p", "yuvj420p")

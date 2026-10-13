@@ -48,15 +48,17 @@
 - **Наилучшее доступное совместимое качество.** Обычно видео перепаковывается
   без перекодирования; для плеера Telegram предпочтительны **H.264/AAC**.
   Подрезка и несовместимые исходники требуют подготовки совместимой MP4-копии.
-  Кнопка TikTok «Файл» позволяет получить сохранённый исходник, когда он доступен.
+  Кнопка TikTok «Файл» отправляет совместимую MP4-копию документом; повторная
+  отправка файлов и фото-документов использует кэш Telegram без новой загрузки.
 - **Меню качества с размерами.** Для платформ с несколькими разрешениями бот
   показывает инлайн-меню (напр. *1080p · 320 МБ*, *720p · 140 МБ*), чтобы выбрать
   до скачивания.
   Размер может быть приблизительным; если источник его не сообщает и проверить
   не удалось, меню явно показывает «размер неизвестен».
 - **Особые форматы TikTok.** HDR-исходник при необходимости преобразуется в SDR
-  для совместимого просмотра с корректным отображением цветов; сохранённый
-  исходник доступен кнопкой «Файл». Live Photo сейчас отправляются как фотографии,
+  для совместимого просмотра с корректным отображением цветов. Кнопка «Файл»
+  также отправляет SDR-копию, без повреждённых дополнительных дорожек.
+  Live Photo сейчас отправляются как фотографии,
   без сохранения движения. Музыкальные альбомы, плейлисты и прямая загрузка
   защищённых DRM-потоков не поддерживаются.
 - **Извлечение аудио.** У каждого видео есть кнопка *«Скачать аудио»*; ссылки
@@ -546,9 +548,11 @@ Dockerfile*         образы бота, xray-прокси и своего Bot
   Among equal-quality formats it prefers **H.264/AAC**, because mobile
   Telegram plays other codecs (VP9/AV1) as a frozen frame with sound.
   Incompatible TikTok sources may also require a compatible MP4 copy; the File
-  button provides the retained source when available. HDR sources are converted
-  to SDR when needed for compatible playback, with tone mapping; the retained
-  source is available through File. TikTok Live Photos currently arrive as still
+  button sends the compatible MP4 as a document. Repeated document and photo-file
+  requests reuse cached Telegram file IDs without another download.
+  HDR sources are converted to SDR when needed for compatible playback, with
+  tone mapping; File also sends this SDR copy without broken extra tracks.
+  TikTok Live Photos currently arrive as still
   images. Music albums, playlists and direct downloads of DRM-protected streams
   are not supported.
 - **Quality menu with sizes.** For platforms exposing multiple resolutions, an

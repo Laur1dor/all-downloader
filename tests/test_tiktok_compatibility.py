@@ -26,6 +26,23 @@ def _probe(transfer: str | None = None):
 
 
 class TikTokCompatibilityTests(unittest.TestCase):
+    def test_playable_document_requires_duration_and_dimensions(self) -> None:
+        for duration, width, height, codec in (
+            ("0", 960, 1920, "h264"),
+            ("32", 0, 1920, "h264"),
+            ("32", 960, 0, "h264"),
+            ("32", 960, 1920, "hevc"),
+        ):
+            with self.subTest(duration=duration, width=width, height=height, codec=codec):
+                result = MagicMock(returncode=0, stdout=json.dumps({
+                    "format": {"duration": duration, "format_name": "mov,mp4"},
+                    "streams": [{"codec_type": "video", "codec_name": codec,
+                                 "pix_fmt": "yuv420p", "width": width, "height": height}],
+                }))
+                with patch.object(downloader.subprocess, "run", return_value=result) as run:
+                    self.assertFalse(downloader._tiktok_playable(Path("document.mp4")))
+                run.assert_called_once()
+
     def test_original_only_cold_chain_fetches_hdr_bytes_without_preview_work(self) -> None:
         url = "https://vt.tiktok.com/example/"
         session = MagicMock(proxies={})
