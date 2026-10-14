@@ -26,6 +26,103 @@ def _probe(transfer: str | None = None):
 
 
 class TikTokCompatibilityTests(unittest.TestCase):
+    def test_dolby_vision_is_not_mislabeled_as_an_sdr_preview(self) -> None:
+        video = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+                 "width": 720, "height": 1280, "color_transfer": "bt709",
+                 "side_data_list": [{"side_data_type": "DOVI configuration record",
+                                     "dv_profile": 9, "rpu_present_flag": 1}]}
+        payload = {"streams": [video], "format": {"duration": "2", "format_name": "mp4"}}
+        with patch.object(downloader.subprocess, "run", return_value=MagicMock(
+            returncode=0, stdout=json.dumps(payload),
+        )) as run, patch.object(downloader, "_run_ffmpeg") as encode:
+            self.assertFalse(downloader._tiktok_playable(Path("hdr.mp4")))
+            self.assertIsNone(downloader._transcode_tiktok_compatible(Path("hdr.mp4"), 1000, None))
+            self.assertTrue(downloader._source_hdr(Path("hdr.mp4")))
+        self.assertEqual(run.call_count, 3)
+        encode.assert_not_called()
+
+    def test_resolver_requests_and_preserves_distinct_hd_source(self) -> None:
+        url = "https://vt.tiktok.com/example/"
+        payload = {"id": "123", "play": "https://v19.tiktokcdn-us.com/preview.mp4",
+                   "hdplay": "https://v19.tiktokcdn-us.com/source.mp4",
+                   "size": 100, "hd_size": 500, "duration": 30}
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {"code": 0, "data": payload}
+        with patch("curl_cffi.requests.Session", return_value=session):
+            data, _ = downloader._tikwm_data(url)
+        self.assertEqual(session.get.call_args.kwargs["params"], {"url": url, "hd": "1"})
+        item = downloader._tikwm_video_item(data)
+        preview = downloader._tiktok_variants(item)[0]
+        source = downloader._tiktok_variants(item, original_only=True)[0]
+        self.assertEqual(preview["urls"], [payload["play"]])
+        self.assertEqual(source["urls"], [payload["hdplay"]])
+        self.assertEqual(source["size"], 500)
+        self.assertEqual(source["codec"], "")
+        payload["hdplay"] = payload["play"]
+        self.assertEqual(len(downloader._tiktok_variants(downloader._tikwm_video_item(payload))), 1)
+
+    def test_sdr_resolver_preview_keeps_proven_hdr_from_distinct_source(self) -> None:
+        item = downloader._tikwm_video_item({
+            "id": "123", "play": "https://v19.tiktokcdn-us.com/preview.mp4",
+            "hdplay": "https://v19.tiktokcdn-us.com/source.mp4",
+        })
+        session = MagicMock(proxies={})
+
+        def fetch(_session, _url, destination, *_args, **_kwargs):
+            destination.write_bytes(b"SDR preview")
+            return True
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(downloader, "_stream_to_file", side_effect=fetch), \
+             patch.object(downloader, "_tiktok_playable", return_value=True), \
+             patch("bot.tiktok_hdr.probe_tiktok_item_hdr", return_value=True) as probe:
+            _, info = downloader._fetch_tiktok_media(
+                item, session, directory, None, 10_000, None, None, {}, resolver=True,
+            )
+        self.assertIs(info["source_hdr"], True)
+        self.assertFalse(info["original_matches_preview"])
+        probe.assert_called_once_with(item, session)
+
+    def test_original_file_prefers_proven_hdr_even_below_highest_sdr(self) -> None:
+        sdr_url = "https://v19.tiktokcdn-us.com/sdr.mp4"
+        hdr_url = "https://v19.tiktokcdn-us.com/hdr.mp4"
+        for listing in ("listed", "outside", "mirror"):
+            entries = [{"CodecType": "h264", "Bitrate": 10, "PlayAddr": {
+                "UrlList": [sdr_url], "Width": 2160, "Height": 3840,
+            }}]
+            if listing == "listed":
+                entries.append({"CodecType": "h265", "Bitrate": 5, "PlayAddr": {
+                    "UrlList": [hdr_url], "Width": 1080, "Height": 1920,
+                }})
+            elif listing == "mirror":
+                entries[0]["PlayAddr"]["UrlList"].append(hdr_url)
+            item = {"id": "123", "video": {"bitrateInfo": entries}}
+            guard = {}
+
+            def proof(video_item, _session):
+                video_item["video"]["_verified_hdr_urls"] = [hdr_url]
+                return True
+
+            def fetch(_session, url, destination, *_args, transfer_guard=guard, **_kwargs):
+                self.assertEqual(url, hdr_url)
+                destination.write_bytes(b"actual HDR")
+                transfer_guard["_last_complete_body"] = True
+                return True
+
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory() as directory, \
+                 patch("bot.tiktok_hdr.probe_tiktok_item_hdr", side_effect=proof), \
+                 patch.object(downloader, "_stream_to_file", side_effect=fetch), \
+                 patch.object(downloader, "_tiktok_original_valid", return_value=True), \
+                 patch.object(downloader, "_source_hdr_state", return_value=True), \
+                 patch.object(downloader, "_transcode_tiktok_compatible") as encode:
+                _, info = downloader._fetch_tiktok_media(
+                    item, MagicMock(proxies={}), directory, None, 10_000, None, None,
+                    guard, resolver=False, original_only=True,
+                )
+            self.assertIs(info["source_hdr"], True)
+            encode.assert_not_called()
+
     def test_conversion_budget_accounts_for_actual_4k60_and_stays_bounded(self) -> None:
         low = {"width": 960, "height": 1920, "pix_fmt": "yuv420p10le",
                "avg_frame_rate": "30/1"}
@@ -66,7 +163,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
 
     def test_media_hdr_known_state_does_not_mislabel_lower_sdr_preview(self) -> None:
         cases = ((True, False, True, True), (False, False, False, True),
-                 (None, False, False, False), (None, True, False, True))
+                 (None, False, False, False), (None, True, False, False))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "preview.mp4"
             path.write_bytes(b"SDR preview")
@@ -113,6 +210,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
                  "id": "123", "play": "https://v19.tiktokcdn-us.com/video", "duration": 32,
              }, session)), patch.object(downloader, "_stream_to_file", side_effect=fetch), \
              patch.object(downloader, "_tiktok_original_valid", return_value=True), \
+             patch("bot.tiktok_hdr.probe_tiktok_item_hdr", return_value=None), \
              patch.object(downloader, "_tiktok_playable") as playable, \
              patch.object(downloader, "_transcode_tiktok_compatible") as encode:
             result, info = downloader._download_tiktok_sync(
@@ -163,6 +261,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(downloader, "_stream_to_file", side_effect=fetch), \
              patch.object(downloader, "_tiktok_original_valid", return_value=True) as structural, \
+             patch("bot.tiktok_hdr.probe_tiktok_item_hdr", return_value=None), \
              self.assertRaises(downloader.ConfirmedVideoError):
             downloader._fetch_tiktok_media(
                 {"id": "123", "video": {"playAddr": "https://v19.tiktokcdn-us.com/video"}},
@@ -289,7 +388,8 @@ class TikTokCompatibilityTests(unittest.TestCase):
             with patch.object(downloader, "_stream_to_file", side_effect=fetch), \
                  patch.object(downloader, "_tiktok_playable", side_effect=[False, True]), \
                  patch.object(downloader, "_repair_tiktok_sei", return_value=None), \
-                 patch.object(downloader, "_transcode_tiktok_compatible", side_effect=convert):
+                 patch.object(downloader, "_transcode_tiktok_compatible", side_effect=convert), \
+                 patch.object(downloader, "_source_hdr_state", return_value=True):
                 result, info = downloader._fetch_tiktok_media(
                     item, session, directory, None, 10_000, progress, None, {}, resolver=True,
                 )

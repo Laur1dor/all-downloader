@@ -27,6 +27,9 @@ class TikwmFallbackTests(unittest.TestCase):
         guard = patch("bot.tiktok_live_photo.ensure_public_url")
         guard.start()
         self.addCleanup(guard.stop)
+        hdr_probe = patch("bot.tiktok_hdr.probe_tiktok_item_hdr", return_value=None)
+        hdr_probe.start()
+        self.addCleanup(hdr_probe.stop)
 
     @patch("curl_cffi.requests.Session")
     def test_forced_retry_really_uses_alternate_before_primary(self, session_class):
@@ -104,7 +107,9 @@ class TikwmFallbackTests(unittest.TestCase):
         session_class.assert_called_once_with(
             impersonate="firefox133", proxies=None, timeout=15,
         )
-        session.get.assert_called_once_with("https://www.tikwm.com/api/", params={"url": link})
+        session.get.assert_called_once_with(
+            "https://www.tikwm.com/api/", params={"url": link, "hd": "1"},
+        )
 
     @patch("curl_cffi.requests.Session")
     def test_resolver_retries_configured_proxy_after_direct_fails(self, session_class):

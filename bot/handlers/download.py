@@ -545,11 +545,13 @@ _CAPTION = (
 )
 
 
-def _video_caption(source_hdr: bool = False, *, preview_sdr: bool = True) -> str:
+def _video_caption(source_hdr: bool = False, *, preview_sdr: bool | None = True) -> str:
     if not source_hdr:
         return _CAPTION
-    if not preview_sdr:
+    if preview_sdr is False:
         return _CAPTION + "\n\nВидео в HDR."
+    if preview_sdr is None:
+        return _CAPTION + "\n\nИсточник HDR. Для исходного качества нажмите «Файл»."
     return _CAPTION + "\n\nИсточник HDR. Здесь — SDR. Для HDR нажмите «Файл»."
 
 
@@ -564,7 +566,8 @@ def _tiktok_video_cache_description(
     description: str | None, source_hdr: bool | None, *, source_hdr_checked: bool = False,
 ) -> str:
     return json.dumps({"tiktok_source_v1": True, "description": description,
-                       "source_hdr": source_hdr, "source_hdr_checked": source_hdr_checked})
+                       "source_hdr": source_hdr, "source_hdr_checked": source_hdr_checked,
+                       "source_hdr_check_version": 2})
 
 
 def _tiktok_cached_video_metadata(value: str | None) -> tuple[str | None, bool]:
@@ -584,16 +587,18 @@ async def _tiktok_source_hdr_from_cache(
     cookies_file: Path | None = None,
 ) -> bool | None:
     """An SDR preview cannot disprove HDR already measured in the source File."""
-    if known_hdr or source_hdr_checked:
-        return known_hdr
+    if known_hdr:
+        return True
     source = await db.get_cached_file(hash_url(url), _TIKTOK_DOCUMENT_CACHE_KEY)
     if source is not None:
         try:
             metadata = json.loads(source["description"] or "")
-            if isinstance(metadata, dict) and type(metadata.get("source_hdr")) is bool:
-                return metadata["source_hdr"]
+            if isinstance(metadata, dict) and metadata.get("source_hdr") is True:
+                return True
         except (ValueError, TypeError, KeyError):
             pass
+    if source_hdr_checked:
+        return False
     from bot.tiktok_hdr import probe_tiktok_source_hdr
 
     return await probe_tiktok_source_hdr(url, cookies_file)
@@ -602,7 +607,9 @@ async def _tiktok_source_hdr_from_cache(
 def _tiktok_hdr_checked(description: str | None) -> bool:
     try:
         metadata = json.loads(description or "")
-        return (isinstance(metadata, dict) and metadata.get("source_hdr_checked") is True
+        return (isinstance(metadata, dict) and metadata.get("tiktok_source_v1") is True
+                and metadata.get("source_hdr_check_version") == 2
+                and metadata.get("source_hdr_checked") is True
                 and type(metadata.get("source_hdr")) is bool)
     except (ValueError, TypeError):
         return False
@@ -973,6 +980,7 @@ async def _run_link(
         (_video_cache_key("tiktok"), _video_cache_key("tiktok", capped=True))
         if platform == "tiktok"
         else ("video", "video_capped"),
+        cookies_file=settings.cookies_file,
     ):
         if choice_message is not None:
             await _delete_silently(choice_message)
@@ -1064,6 +1072,7 @@ async def _run_link(
             if time_range is None and await _send_cached_video(
                 message, db, url_cache, url, platform,
                 _user_limit(settings, user_id), (cache_key,),
+                cookies_file=settings.cookies_file,
             ):
                 await _delete_silently(status_message)
                 return
@@ -1542,6 +1551,15 @@ async def _deliver_single_video(
             options=_source_quality_options(height, path.stat().st_size),
         )
     description = (album.description or "").strip()
+    source_hdr = False
+    raw_hdr = False
+    if platform == "tiktok":
+        from bot.downloader import _source_hdr
+
+        raw_hdr = await asyncio.to_thread(_source_hdr, path)
+        source_hdr = await _tiktok_source_hdr_from_cache(
+            db, url, raw_hdr, cookies_file=settings.cookies_file if settings else None,
+        )
     with_description = _description_capable(url, platform) and bool(description)
     if with_description:
         _remember_description(token, description)
@@ -1552,7 +1570,9 @@ async def _deliver_single_video(
             sent = await _send_with_retries(
                 lambda: message.answer_video(
                     FSInputFile(path),
-                    caption=_CAPTION,
+                    caption=_video_caption(
+                        bool(source_hdr), preview_sdr=(False if raw_hdr else None),
+                    ),
                     width=width, height=height, duration=duration,
                     supports_streaming=True,
                     reply_markup=_video_keyboard(token, with_description, platform == "tiktok"),
@@ -1807,6 +1827,7 @@ async def _send_cached_video(
     platform: str,
     limit: int,
     keys: tuple[str, ...],
+    *, cookies_file: Path | None = None,
 ) -> bool:
     """Resend a previously uploaded video by its Telegram file_id. Returns True on success.
 
@@ -1835,18 +1856,28 @@ async def _send_cached_video(
         )
         upgraded_description = None
         store_key = cache_key
+        cached_source_hdr = source_hdr
         if platform == "tiktok":
             checked = _tiktok_hdr_checked(cached["description"])
             if not source_hdr:
                 source_hdr = await _tiktok_source_hdr_from_cache(
-                    db, url, False, source_hdr_checked=checked,
+                    db, url, False, source_hdr_checked=checked, cookies_file=cookies_file,
                 )
-            if source_hdr is not None and (not checked or cache_key.startswith("video_validated")):
+            if source_hdr is not None and (
+                not checked or cache_key.startswith("video_validated")
+                or source_hdr != cached_source_hdr
+            ):
                 store_key = (_video_cache_key("tiktok", capped=cache_key.endswith("_capped"))
                              if cache_key.startswith("video_validated") else cache_key)
                 upgraded_description = _tiktok_video_cache_description(
                     description, source_hdr, source_hdr_checked=True,
                 )
+            elif source_hdr is None:
+                unknown_description = _tiktok_video_cache_description(description, None)
+                if cached["description"] != unknown_description:
+                    store_key = (_video_cache_key("tiktok", capped=cache_key.endswith("_capped"))
+                                 if cache_key.startswith("video_validated") else cache_key)
+                    upgraded_description = unknown_description
         with_description = _description_capable(url, platform) and bool(
             description and description.strip()
         )
@@ -2028,6 +2059,17 @@ async def handle_tiktok_file_request(
                         source_metadata = {}
                 except (ValueError, TypeError):
                     source_metadata = {}
+                if source_metadata.get("source_hdr") is False:
+                    # A previously selected SDR source cannot satisfy a later
+                    # proven HDR source request. Preserve all positive HDR IDs.
+                    for preview_key in (_video_cache_key("tiktok"),
+                                        _video_cache_key("tiktok", capped=True)):
+                        preview = await db.get_cached_file(hash_url(url), preview_key)
+                        if (preview is not None and _tiktok_cached_video_metadata(
+                                preview.get("description"))[1]):
+                            await db.delete_cached_file(hash_url(url), cache_key)
+                            cached_items = []
+                            break
         if cached_items and all(not item["file_size"] or item["file_size"] <=
                                 _user_limit(settings, user_id) for item in cached_items):
             delivered = 0

@@ -16,6 +16,156 @@ from bot.tiktok_live_photo import PreparedLivePhoto
 
 
 class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_probe_clears_legacy_false_confidence_once_without_changing_id(self):
+        preview = {'file_id': 'real-preview', 'file_size': 100,
+                   'description': '{"tiktok_source_v1":true,"source_hdr":false,'
+                                  '"source_hdr_checked":true,"description":"text"}'}
+
+        async def cached(_hash, key):
+            return None if key == handler._TIKTOK_DOCUMENT_CACHE_KEY else preview
+
+        async def store(_hash, _key, file_id, _size, *, description):
+            self.assertEqual(file_id, 'real-preview')
+            preview['description'] = description
+
+        async def send(build, *_args):
+            return await build()
+
+        message = MagicMock(spec=Message, from_user=SimpleNamespace(id=123))
+        message.answer_video = AsyncMock()
+        db = MagicMock(get_cached_file=AsyncMock(side_effect=cached),
+                       store_cached_file=AsyncMock(side_effect=store), add_conversion=AsyncMock())
+        cache = MagicMock()
+        cache.store.return_value = 'unknown-proof'
+        with (
+            patch.object(handler, '_send_paced', side_effect=send),
+            patch('bot.tiktok_hdr.probe_tiktok_source_hdr', AsyncMock(return_value=None)),
+        ):
+            for _ in range(2):
+                self.assertTrue(await handler._send_cached_video(
+                    message, db, cache, 'https://www.tiktok.com/@u/video/123', 'tiktok', 1000,
+                    (handler._video_cache_key('tiktok'),),
+                ))
+        db.store_cached_file.assert_awaited_once()
+        self.assertFalse(handler._tiktok_hdr_checked(preview['description']))
+        self.assertIn('"source_hdr": null', preview['description'])
+        self.assertNotIn('HDR', message.answer_video.await_args.kwargs['caption'])
+        handler._album_descriptions.pop('unknown-proof', None)
+
+    async def test_hdr_file_overrides_even_checked_sdr_preview_and_repairs_metadata(self):
+        preview = {'file_id': 'sdr-preview', 'file_size': 100,
+                   'description': handler._tiktok_video_cache_description(
+                       'text', False, source_hdr_checked=True,
+                   )}
+
+        async def cached(_hash, key):
+            return {'description': '{"source_hdr":true}'} if (
+                key == handler._TIKTOK_DOCUMENT_CACHE_KEY
+            ) else preview
+
+        async def send(build, *_args):
+            return await build()
+
+        message = MagicMock(spec=Message, from_user=SimpleNamespace(id=123))
+        message.answer_video = AsyncMock()
+        db = MagicMock(get_cached_file=AsyncMock(side_effect=cached),
+                       store_cached_file=AsyncMock(), add_conversion=AsyncMock())
+        cache = MagicMock()
+        cache.store.return_value = 'override-proof'
+        with (
+            patch.object(handler, '_send_paced', side_effect=send),
+            patch('bot.tiktok_hdr.probe_tiktok_source_hdr', AsyncMock()) as probe,
+        ):
+            self.assertTrue(await handler._send_cached_video(
+                message, db, cache, 'https://www.tiktok.com/@u/video/123', 'tiktok', 1000,
+                (handler._video_cache_key('tiktok'),),
+            ))
+        probe.assert_not_awaited()
+        self.assertIn('Источник HDR', message.answer_video.await_args.kwargs['caption'])
+        self.assertEqual(handler._tiktok_cached_video_metadata(
+            db.store_cached_file.await_args.kwargs['description'],
+        ), ('text', True))
+        handler._album_descriptions.pop('override-proof', None)
+
+    async def test_old_false_checked_is_reprobed_with_configured_cookie_jar(self):
+        import json
+
+        description = json.dumps({'tiktok_source_v1': True, 'source_hdr': False,
+                                  'source_hdr_checked': True, 'description': 'text'})
+        self.assertFalse(handler._tiktok_hdr_checked(description))
+        preview = {'file_id': 'sdr-preview', 'file_size': 100, 'description': description}
+        url = 'https://www.tiktok.com/@u/video/123'
+
+        async def cached(_hash, key):
+            return None if key == handler._TIKTOK_DOCUMENT_CACHE_KEY else preview
+
+        async def send(build, *_args):
+            return await build()
+
+        message = MagicMock(spec=Message, from_user=SimpleNamespace(id=123))
+        message.answer_video = AsyncMock()
+        db = MagicMock(get_cached_file=AsyncMock(side_effect=cached),
+                       store_cached_file=AsyncMock(), add_conversion=AsyncMock())
+        cache = MagicMock()
+        cache.store.return_value = 'reprobe-proof'
+        jar = Path('configured-cookies.txt')
+        with (
+            patch.object(handler, '_send_paced', side_effect=send),
+            patch('bot.tiktok_hdr.probe_tiktok_source_hdr', AsyncMock(return_value=True)) as probe,
+        ):
+            self.assertTrue(await handler._send_cached_video(
+                message, db, cache, url, 'tiktok', 1000,
+                (handler._video_cache_key('tiktok'),), cookies_file=jar,
+            ))
+        probe.assert_awaited_once_with(url, jar)
+        self.assertIn('Источник HDR', message.answer_video.await_args.kwargs['caption'])
+        self.assertTrue(handler._tiktok_hdr_checked(
+            db.store_cached_file.await_args.kwargs['description'],
+        ))
+        handler._album_descriptions.pop('reprobe-proof', None)
+
+    async def test_single_video_album_fallback_retains_hdr_notice_and_file_button(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'preview.mp4'
+            path.write_bytes(b'sdr-preview')
+            album = AlbumMedia([path], None, description='post text')
+            message = MagicMock(spec=Message)
+            message.answer_video = AsyncMock(return_value=SimpleNamespace(
+                video=None, document=None,
+            ))
+            cache = MagicMock()
+            cache.store.return_value = 'fallback-hdr'
+
+            @asynccontextmanager
+            async def slot(*_args):
+                yield
+
+            async def send(build, *_args):
+                return await build()
+
+            with (
+                patch.object(handler, 'video_metadata', return_value=(100, 100, 3)),
+                patch('bot.downloader._source_hdr', return_value=False),
+                patch.object(handler, '_tiktok_source_hdr_from_cache',
+                             AsyncMock(return_value=True)) as resolve,
+                patch.object(handler._upload_capacity, 'slot', slot),
+                patch.object(handler, '_send_with_retries', side_effect=send),
+                patch.object(handler, '_record', AsyncMock()),
+                patch.object(handler, '_delete_silently', AsyncMock()),
+            ):
+                self.assertTrue(await handler._deliver_single_video(
+                    message, MagicMock(), MagicMock(), 'https://www.tiktok.com/@u/video/123',
+                    album, 'tiktok', 123, time.monotonic(), cache,
+                    settings=SimpleNamespace(cookies_file=Path('cookies.txt')),
+                ))
+            caption = message.answer_video.await_args.kwargs['caption']
+            self.assertIn('Источник HDR', caption)
+            self.assertIn('«Файл»', caption)
+            self.assertNotIn('Здесь — SDR', caption)
+            resolve.assert_awaited_once()
+            self.assertEqual(resolve.await_args.kwargs['cookies_file'], Path('cookies.txt'))
+            self.assertEqual(handler._album_descriptions.pop('fallback-hdr'), 'post text')
+
     async def test_old_sdr_preview_metadata_is_repaired_from_confirmed_hdr_file(self):
         url = 'https://www.tiktok.com/@u/video/7696055072110677268'
         preview = {'file_id': 'existing-preview', 'file_size': 100,
@@ -83,12 +233,12 @@ class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual('Источник HDR' in handler._video_caption(bool(hdr)), hdr is True)
 
     async def test_verified_sdr_cache_skips_native_probe(self):
-        db = MagicMock(get_cached_file=AsyncMock())
+        db = MagicMock(get_cached_file=AsyncMock(return_value=None))
         with patch('bot.tiktok_hdr.probe_tiktok_source_hdr', AsyncMock()) as probe:
             self.assertFalse(await handler._tiktok_source_hdr_from_cache(
                 db, 'https://www.tiktok.com/@u/video/123', False, source_hdr_checked=True,
             ))
-        db.get_cached_file.assert_not_awaited()
+        db.get_cached_file.assert_awaited_once()
         probe.assert_not_awaited()
 
     async def test_run_link_reads_hdr_key_first_and_repairs_legacy_without_source_fetch(self):
@@ -129,7 +279,8 @@ class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     patch('bot.tiktok_hdr.probe_tiktok_source_hdr', AsyncMock()) as probe,
                 ):
                     await handler._run_link(
-                        message, db, SimpleNamespace(admin_id=123), cache, MagicMock(),
+                        message, db, SimpleNamespace(admin_id=123, cookies_file=None),
+                        cache, MagicMock(),
                     )
                 self.assertEqual(db.get_cached_file.await_args_list[0].args[1], primary)
                 self.assertEqual(message.answer_video.await_args.args[0], 'preview-id')

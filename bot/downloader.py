@@ -1373,9 +1373,9 @@ def _build_media(path: Path, info: dict) -> Media:
     actual_hdr = _source_hdr_state(info.get("original_path") or path)
     native_hdr = info.get("source_hdr")
     source_hdr = native_hdr is True or actual_hdr is True
-    source_hdr_verified = source_hdr or isinstance(native_hdr, bool) or (
-        bool(info.get("original_matches_preview")) and isinstance(actual_hdr, bool)
-    )
+    # A public SDR rendition can come from a hidden HDR upload. Its transfer
+    # proves the rendition's color, not the original upload's color.
+    source_hdr_verified = source_hdr or isinstance(native_hdr, bool)
     return Media(
         path=path,
         title=info.get("title") or "media",
@@ -1924,8 +1924,11 @@ def _tikwm_data(url: str, proxy: str | None = None) -> tuple[dict, object]:
         session = cffi_requests.Session(
             impersonate="firefox133", proxies=proxies, timeout=min(15, remaining),
         )
+        # Only this fresh, anonymous provider session may inspect provider URLs.
+        # The HDR probe additionally refuses cookies, even with this marker.
+        session._tiktok_hdr_anonymous_resolver = True
         try:
-            response = session.get(_TIKWM_API, params={"url": url})
+            response = session.get(_TIKWM_API, params={"url": url, "hd": "1"})
             if response.status_code != 200:
                 raise DownloadFailedError("Резервный сервис TikTok недоступен.")
             payload = response.json()
@@ -1946,6 +1949,24 @@ def _tikwm_data(url: str, proxy: str | None = None) -> tuple[dict, object]:
     raise DownloadFailedError("Резервный сервис TikTok недоступен.") from last_error
 
 
+def _tikwm_video_item(data: dict) -> dict:
+    """Retain both resolver renditions; HD is a quality choice, never HDR proof."""
+    sources = []
+    for url_key, size_key in (("play", "size"), ("hdplay", "hd_size")):
+        raw = data.get(url_key)
+        if not raw:
+            continue
+        url = _tikwm_media_url(raw)
+        if any(url in source["urls"] for source in sources):
+            continue
+        sources.append({"urls": [url], "codec": "", "bitrate": 0,
+                        "width": None, "height": None, "size": data.get(size_key)})
+    if not sources:
+        raise DownloadFailedError("Резервный сервис не вернул адрес видео.")
+    return {"id": data["id"], "desc": data.get("title") or "",
+            "video": {"_resolver_sources": sources, "duration": data.get("duration")}}
+
+
 def _tiktok_variants(item: dict, *, original_only: bool = False) -> list[dict]:
     """Playable files for the post, best first.
 
@@ -1955,6 +1976,10 @@ def _tiktok_variants(item: dict, *, original_only: bool = False) -> list[dict]:
     the post uses, not its own sound.
     """
     video = item.get("video") or {}
+    if sources := video.get("_resolver_sources"):
+        # Resolver HD addresses lack trustworthy native codec/geometry tags.
+        # Preview uses its playable rendition first; File prefers the HD one.
+        return list(reversed(sources)) if original_only else list(sources)
     variants: list[dict] = []
     for entry in video.get("bitrateInfo") or []:
         play = entry.get("PlayAddr") or {}
@@ -2095,7 +2120,7 @@ def _tiktok_playable(path: Path) -> bool:
             ["ffprobe", "-v", "error", "-show_entries",
              "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height,"
              "avg_frame_rate,r_frame_rate:"
-             "format=format_name,duration",
+             "stream_side_data:format=format_name,duration",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=20, check=False,
         )
@@ -2119,9 +2144,11 @@ def _tiktok_playable(path: Path) -> bool:
         ):
             logger.warning("TikTok media rejected: missing duration or dimensions")
             return False
+        from bot.tiktok_hdr import hdr_state_from_stream
+
         if (
             video.get("pix_fmt", "yuv420p") not in ("yuv420p", "yuvj420p")
-            or video.get("color_transfer") in ("smpte2084", "arib-std-b67")
+            or hdr_state_from_stream(video) is True
         ):
             logger.warning("TikTok media rejected: HDR or unsupported pixel format")
             return False
@@ -2263,6 +2290,12 @@ def _transcode_tiktok_compatible(
         if video is None or video.get("codec_name") not in ("h264", "hevc", "av1", "vp9", "mpeg4"):
             return None
         hdr = video.get("color_transfer") in ("smpte2084", "arib-std-b67")
+        from bot.tiktok_hdr import hdr_state_from_stream
+
+        if not hdr and hdr_state_from_stream(video) is True:
+            # Dolby Vision without an HLG/PQ-compatible base needs a separate
+            # color pipeline. Keep it for File and try a genuine SDR preview.
+            return None
         if (
             video["codec_name"] == "h264" and not hdr
             and video.get("pix_fmt", "yuv420p") in ("yuv420p", "yuvj420p")
@@ -2353,19 +2386,13 @@ def _source_hdr_state(path: Path) -> bool | None:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "stream=color_transfer,pix_fmt", "-of", "json", str(path)],
+             "stream=color_transfer,pix_fmt:stream_side_data", "-of", "json", str(path)],
             capture_output=True, text=True, timeout=10, check=False,
         )
         streams = json.loads(result.stdout).get("streams", []) if result.returncode == 0 else []
-        transfer = streams[0].get("color_transfer") if streams else None
-        if transfer in ("arib-std-b67", "smpte2084"):
-            return True
-        if transfer in (
-            "bt709", "gamma22", "gamma28", "smpte170m", "smpte240m",
-            "iec61966-2-1", "bt2020-10", "bt2020-12",
-        ):
-            return False
-        return None
+        from bot.tiktok_hdr import hdr_state_from_stream
+
+        return hdr_state_from_stream(streams[0]) if streams else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
@@ -2379,7 +2406,7 @@ def _source_document_probe(path: Path) -> tuple[dict, dict, float]:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
              "stream=codec_type,codec_name,pix_fmt,width,height,color_transfer,color_primaries,"
-             "color_space,avg_frame_rate,r_frame_rate:format=duration,format_name",
+             "color_space,avg_frame_rate,r_frame_rate:stream_side_data:format=duration,format_name",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=20, check=False,
         )
@@ -2470,7 +2497,9 @@ def _prepare_source_document(
     if path.stat().st_size > max_bytes:
         raise FileTooLargeError(path.stat().st_size, max_bytes)
     data, video, duration = _source_document_probe(path)
-    hdr = video.get("color_transfer") in ("arib-std-b67", "smpte2084")
+    from bot.tiktok_hdr import hdr_state_from_stream
+
+    hdr = hdr_state_from_stream(video) is True
     output = path.with_name(f"{path.stem}-source.mp4")
     output.unlink(missing_ok=True)
     complete = False
@@ -2509,6 +2538,7 @@ def _prepare_source_document(
                       "color_primaries", "color_space")
         if (
             any(video.get(key) != prepared.get(key) for key in properties)
+            or hdr_state_from_stream(prepared) != hdr_state_from_stream(video)
             or abs(actual - duration) > 1
         ):
             raise DownloadFailedError("Подготовка изменила параметры исходного видео.")
@@ -2574,6 +2604,20 @@ def _fetch_tiktok_media(
     native_variants = _tiktok_variants(item, original_only=True)
     if not variants:
         raise DownloadFailedError("В этом посте TikTok нет видео.")
+    from bot.tiktok_hdr import probe_tiktok_item_hdr
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError
+    if original_only:
+        probe_tiktok_item_hdr(item, session)
+        proven = set((item.get("video") or {}).get("_verified_hdr_urls") or [])
+        known = {url for variant in variants for url in variant["urls"]}
+        for url in proven - known:
+            variants.append({"urls": [_tikwm_media_url(url)], "codec": "", "bitrate": 0,
+                             "width": None, "height": None, "size": None})
+        variants.sort(key=lambda variant: not proven.intersection(variant["urls"]))
+        variants = [variant | {"urls": sorted(variant["urls"], key=lambda url: url not in proven)}
+                    for variant in variants]
     destination = Path(tmpdir) / f"{item.get('id') or 'tiktok'}.mp4"
     last_reason = "no response"
     origin_proxy = getattr(session, "proxies", {}).get("https")
@@ -2650,10 +2694,9 @@ def _fetch_tiktok_media(
                                         converted.unlink(missing_ok=True)
                     if selected is not None:
                         video = item.get("video") or {}
-                        native_hdr = None
-                        if variant != native_variants[0]:
-                            from bot.tiktok_hdr import probe_tiktok_item_hdr
-
+                        actual_hdr = _source_hdr_state(original or selected)
+                        native_hdr = True if actual_hdr is True else None
+                        if not original_only and native_hdr is None:
                             native_hdr = probe_tiktok_item_hdr(item, session)
                         return selected, {
                             "id": item.get("id"),
@@ -2663,7 +2706,9 @@ def _fetch_tiktok_media(
                             "width": variant.get("width") or video.get("width"),
                             "height": variant.get("height") or video.get("height"),
                             "original_path": original,
-                            "original_matches_preview": variant == native_variants[0],
+                            "original_matches_preview": variant == native_variants[0] and not (
+                                native_hdr is True and actual_hdr is not True
+                            ),
                             "source_hdr": native_hdr,
                         }
                     last_reason = (
@@ -2722,12 +2767,7 @@ def _download_tiktok_sync(
         data, resolver_session = _tikwm_data(url, proxy)
         if is_photo_post_url(url) or data.get("images"):
             raise NotAVideoPostError("Это фото-пост, видео в нём нет.")
-        play = _tikwm_media_url(data.get("play"))
-        item = {
-            "id": data["id"], "desc": data.get("title") or "",
-            "video": {"playAddr": play, "duration": data.get("duration"),
-                      "dataSize": data.get("size")},
-        }
+        item = _tikwm_video_item(data)
         return _fetch_tiktok_media(
             item, resolver_session, tmpdir, proxy, max_bytes, progress,
             cancel_event, size_guard, resolver=True, original_only=original_only,

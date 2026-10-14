@@ -17,6 +17,32 @@ from bot.media_parts import MediaPreparationError
 
 
 class SourceDocumentTests(unittest.TestCase):
+    def test_remux_cannot_report_hdr_if_dolby_vision_metadata_was_lost(self) -> None:
+        video = {"codec_type": "video", "codec_name": "hevc", "width": 720, "height": 1280,
+                 "pix_fmt": "yuv420p10le", "color_transfer": "bt709",
+                 "side_data_list": [{"side_data_type": "DOVI configuration record",
+                                     "dv_profile": 8, "rpu_present_flag": 1}]}
+        stripped = {key: value for key, value in video.items() if key != "side_data_list"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            source.write_bytes(b"original Dolby Vision")
+
+            def remux(command, *_args):
+                Path(command[-1]).write_bytes(b"same video packets but missing DV configuration")
+
+            with patch.object(downloader, "_source_document_probe", side_effect=[
+                ({"streams": [video]}, video, 2), ({"streams": [stripped]}, stripped, 2),
+            ]), patch.object(downloader, "_source_document_faststart", return_value=False), \
+                 patch.object(downloader, "_source_document_decode") as decode, \
+                 patch.object(downloader, "_run_ffmpeg", side_effect=remux), \
+                 patch.object(downloader.shutil, "disk_usage") as usage, \
+                 self.assertRaisesRegex(downloader.DownloadFailedError, "изменила параметры"):
+                usage.return_value.free = 10 * 1024**3
+                downloader._prepare_source_document(source, 100_000, None)
+            decode.assert_not_called()
+            self.assertEqual(source.read_bytes(), b"original Dolby Vision")
+            self.assertFalse(source.with_name("source-source.mp4").exists())
+
     def test_hdr_flag_requires_pq_or_hlg_instead_of_bit_depth_alone(self) -> None:
         for transfer, expected in (("arib-std-b67", True), ("smpte2084", True), ("bt709", False)):
             with self.subTest(transfer=transfer), patch.object(downloader.subprocess, "run",
