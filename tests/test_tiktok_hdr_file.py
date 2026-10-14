@@ -39,6 +39,13 @@ class TikTokHdrFileTests(unittest.IsolatedAsyncioTestCase):
             async def cached(_url, key):
                 if key in ('tiktok_document_source_v2', 'tiktok_document_mp4_v3'):
                     return {'file_id': 'old-document', 'file_size': 10}
+                if key == handler._TIKTOK_DOCUMENT_CACHE_KEY:
+                    return {'file_id': 'old-sdr-original', 'file_size': 10,
+                            'description': '{"source_hdr":false}'}
+                if key == handler._video_cache_key('tiktok'):
+                    return {'description': handler._tiktok_video_cache_description(
+                        None, True, source_hdr_checked=True,
+                    )}
                 return None
 
             message = MagicMock(spec=Message)
@@ -51,6 +58,7 @@ class TikTokHdrFileTests(unittest.IsolatedAsyncioTestCase):
             callback.from_user.id = 123
             callback.answer = AsyncMock()
             db = MagicMock(get_cached_file=AsyncMock(side_effect=cached),
+                           delete_cached_file=AsyncMock(),
                            store_cached_file=AsyncMock())
             settings = SimpleNamespace(admin_id=123, cookies_file=None)
             cache = MagicMock()
@@ -69,6 +77,9 @@ class TikTokHdrFileTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await handler.handle_tiktok_file_request(callback, db, settings, cache)
             self.assertTrue(requests[0]['original_only'])
+            db.delete_cached_file.assert_awaited_once_with(
+                handler.hash_url(cache.get.return_value), handler._TIKTOK_DOCUMENT_CACHE_KEY,
+            )
             self.assertEqual(prepare.await_args.args[0], source)
             self.assertEqual(Path(message.answer_document.await_args.args[0].path), source)
             self.assertIn('HDR', message.answer_document.await_args.kwargs['caption'])
@@ -88,7 +99,7 @@ class TikTokHdrFileTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock(get_cached_file=AsyncMock(return_value={
             'file_id': 'compatible-document', 'file_size': 200,
             'description': '{"source_hdr":true,"structure_modified":true}',
-        }), add_conversion=AsyncMock())
+        }), add_conversion=AsyncMock(), delete_cached_file=AsyncMock())
         cache = MagicMock()
         cache.get.return_value = 'https://www.tiktok.com/@user/video/7696055072110677268'
 
@@ -105,6 +116,7 @@ class TikTokHdrFileTests(unittest.IsolatedAsyncioTestCase):
                 callback, db, SimpleNamespace(admin_id=123), cache,
             )
         fetch.assert_not_called()
+        db.delete_cached_file.assert_not_awaited()
         retained.assert_not_called()
         message.answer_document.assert_awaited_once()
         self.assertEqual(message.answer_document.await_args.args[0], 'compatible-document')
