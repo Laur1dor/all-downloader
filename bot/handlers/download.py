@@ -32,6 +32,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
     Message,
@@ -1617,7 +1618,7 @@ async def _deliver_single_video(
 
 
 def _album_media_batches(items: list, sizes: list[int]):
-    """Preserve source order around native Live Photos and ten-item groups."""
+    """Preserve order while keeping documents and native Live Photos separate."""
     batch, total = [], 0
     for item, size in zip(items, sizes, strict=True):
         if isinstance(item, PreparedLivePhoto):
@@ -1628,6 +1629,12 @@ def _album_media_batches(items: list, sizes: list[int]):
             # model only accepts string references for the two media fields.
             yield [item], size
         else:
+            if batch and (
+                isinstance(item, InputMediaDocument)
+                != isinstance(batch[0], InputMediaDocument)
+            ):
+                yield batch, total
+                batch, total = [], 0
             batch.append(item)
             total += size
             if len(batch) == 10:
@@ -1689,7 +1696,6 @@ async def _deliver_album(
                 while len(_tiktok_photo_posts) > 500:
                     _tiktok_photo_posts.popitem(last=False)
             group_sizes = []
-            documents = []  # photos above Telegram's 10 MB photo limit go as files
             for index, path in enumerate(album.items):
                 pair = (album.live_photos or {}).get(index)
                 if pair is not None:
@@ -1714,7 +1720,8 @@ async def _deliver_album(
                 elif await asyncio.to_thread(
                     photo_needs_document, path, _PHOTO_MAX_BYTES
                 ):
-                    documents.append(path)
+                    group.append(InputMediaDocument(media=FSInputFile(path)))
+                    group_sizes.append(path.stat().st_size)
                 else:
                     group.append(InputMediaPhoto(media=FSInputFile(path)))
                     group_sizes.append(path.stat().st_size)
@@ -1728,7 +1735,7 @@ async def _deliver_album(
                 caption_left = False
 
             album_status.total = (
-                len(group) + len(documents) + int(album.music is not None)
+                len(group) + int(album.music is not None)
             )
             album_status.phase = "upload"
 
@@ -1757,6 +1764,13 @@ async def _deliver_album(
                             ), _upload_timeout(batch_size),
                         )
                         caption_left = False
+                    elif isinstance(batch[0], InputMediaDocument):
+                        item = batch[0]
+                        await _send_paced(
+                            lambda item=item: message.answer_document(
+                                item.media, caption=item.caption,
+                            ), _upload_timeout(batch_size),
+                        )
                     elif isinstance(batch[0], InputMediaVideo):
                         item = batch[0]
                         await _send_paced(
@@ -1774,16 +1788,6 @@ async def _deliver_album(
                             ), _upload_timeout(batch_size),
                         )
                     album_status.sent += len(batch)
-                for path in documents:
-                    send_started = True
-                    await _send_paced(
-                        lambda path=path, caption_left=caption_left: message.answer_document(
-                            FSInputFile(path), caption=_CAPTION if caption_left else None,
-                        ),
-                        _upload_timeout(path.stat().st_size),
-                    )
-                    album_status.sent += 1
-                    caption_left = False
                 if album.music is not None:
                     send_started = True
                     await _send_paced(
