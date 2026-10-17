@@ -99,6 +99,7 @@ from bot.yandex_preview import (
     YandexPreview,
     resolve_yandex_preview,
 )
+from bot.youtube_posts import is_post_url as is_youtube_post_url
 
 logger = logging.getLogger(__name__)
 
@@ -619,7 +620,7 @@ def _description_capable(url: str, platform: str) -> bool:
     """Platforms whose posts carry a text description worth a button."""
     if platform in ("tiktok", "instagram", "twitter"):
         return True
-    return platform == "youtube" and is_youtube_shorts(url)
+    return platform == "youtube" and (is_youtube_shorts(url) or is_youtube_post_url(url))
 
 
 def _video_keyboard(
@@ -943,9 +944,17 @@ async def _run_link(
         await _record(db, user_id, STATUS_FAILED, platform, "video", time.monotonic())
         return
 
+    youtube_post = platform == "youtube" and is_youtube_post_url(url)
+    if youtube_post and time_range is not None:
+        await message.answer(
+            "⚠️ Интервал времени применим только к видео. "
+            "Отправьте ссылку на пост без таймингов."
+        )
+        return
+
     # Music services (SoundCloud, Yandex Music, Spotify) and YouTube Music are
     # always audio-only — no video/audio prompt.
-    if is_youtube_music(url) or is_audio_only_platform(platform):
+    if (is_youtube_music(url) and not youtube_post) or is_audio_only_platform(platform):
         if is_music_album(url):
             await message.answer(
                 "⚠️ Скачивание альбомов и плейлистов не поддерживается — "
@@ -961,7 +970,7 @@ async def _run_link(
     # For a full YouTube video the user picks video or audio up front (video on
     # timeout). Shorts are always downloaded as video — no prompt.
     choice_message: Message | None = None
-    if platform == "youtube" and not is_youtube_shorts(url):
+    if platform == "youtube" and not is_youtube_shorts(url) and not youtube_post:
         choice_token = url_cache.store(url)
         choice, choice_message = await _ask_youtube_choice(message, choice_token)
         if choice == "audio":
@@ -975,12 +984,16 @@ async def _run_link(
     # Short-form sources (no quality menu) keep a single cached copy that is
     # served back instantly. Quality-menu platforms are cached per resolution
     # below, after the user has chosen — so the menu is always offered.
-    if time_range is None and not _should_offer_quality(url, platform) and await _send_cached_video(
-        message, db, url_cache, url, platform, _user_limit(settings, user_id),
-        (_video_cache_key("tiktok"), _video_cache_key("tiktok", capped=True))
-        if platform == "tiktok"
-        else ("video", "video_capped"),
-        cookies_file=settings.cookies_file,
+    if (
+        time_range is None and not youtube_post
+        and not _should_offer_quality(url, platform)
+        and await _send_cached_video(
+            message, db, url_cache, url, platform, _user_limit(settings, user_id),
+            (_video_cache_key("tiktok"), _video_cache_key("tiktok", capped=True))
+            if platform == "tiktok"
+            else ("video", "video_capped"),
+            cookies_file=settings.cookies_file,
+        )
     ):
         if choice_message is not None:
             await _delete_silently(choice_message)
@@ -1008,11 +1021,19 @@ async def _run_link(
     # Carousel/photo posts go straight to gallery-dl: yt-dlp would either fail
     # (TikTok /photo/) or silently drop the photos of a mixed Instagram post.
     if is_photo_post_url(url) and time_range is None:
+        album_started = time.monotonic()
         album_status = await message.answer("📸 Скачиваю пост…")
         if await _deliver_album(
             message, db, album_status, url, settings, platform, user_id,
-            time.monotonic(), url_cache,
+            album_started, url_cache,
         ):
+            return
+        if youtube_post:
+            await _safe_edit(
+                album_status,
+                "⚠️ Не удалось скачать изображения из поста YouTube. Попробуйте позже.",
+            )
+            await _record(db, user_id, STATUS_FAILED, platform, "album", album_started)
             return
         # Not actually an album (e.g. a plain /p/ video post) — try the video flow.
         await _delete_silently(album_status)
@@ -1378,7 +1399,7 @@ def _should_offer_quality(url: str, platform: str) -> bool:
     if platform in ("tiktok", "instagram"):
         return False
     # PornHub shorties resolve to a regular video, so they keep the quality menu.
-    return not (platform == "youtube" and is_youtube_shorts(url))
+    return not (platform == "youtube" and (is_youtube_shorts(url) or is_youtube_post_url(url)))
 
 
 def _source_quality_options(height: int | None, size: int) -> list[QualityOption]:

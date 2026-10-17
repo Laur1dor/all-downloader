@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, urlparse
 
+from bot.youtube_posts import post_id as youtube_post_id
+
 # Hosts that hand out per-share links; these must be expanded before a key can
 # be built, since the id is not in the address at all.
 SHORTLINK_HOSTS = (
@@ -65,6 +67,11 @@ def canonical_key(url: str) -> str:
     host = (parsed.hostname or "").lower()
     platform = _platform(host)
     path = parsed.path
+
+    if platform == "youtube":
+        post = youtube_post_id(url)
+        if post:
+            return f"youtube:post:{post}"
 
     if platform == "youtube" and host.endswith("youtu.be"):
         video = path.strip("/").split("/")[0]

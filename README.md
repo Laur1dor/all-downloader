@@ -42,7 +42,7 @@
 
 **Скачивание**
 
-- **Много платформ** — YouTube (включая Shorts и YouTube Music), TikTok,
+- **Много платформ** — YouTube (включая Shorts, YouTube Music и фото-карусели в постах), TikTok,
   Instagram, Twitter/X, SoundCloud, Spotify, Yandex Music и другие. Просто
   пришлите ссылку — платформа определяется автоматически.
 - **Наилучшее доступное совместимое качество.** Обычно видео перепаковывается
@@ -542,7 +542,7 @@ Dockerfile*         образы бота, xray-прокси и своего Bot
 
 **Downloading**
 
-- **Many platforms** — YouTube (incl. Shorts and YouTube Music), TikTok,
+- **Many platforms** — YouTube (incl. Shorts, YouTube Music and community photo carousels), TikTok,
   Instagram, Twitter/X, SoundCloud, Spotify, Yandex Music and more. Just send a
   link; the platform is detected automatically.
 - **Maximum quality for ordinary downloads.** Video is taken at the highest

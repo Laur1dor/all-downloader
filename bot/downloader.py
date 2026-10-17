@@ -37,7 +37,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
 from yt_dlp.utils import YoutubeDLError, download_range_func
 
-from bot import instagram
+from bot import instagram, youtube_posts
 from bot.media_parts import MediaPreparationError, _run_ffmpeg, prepare_streaming_mp4
 from bot.progress import PHASE_DOWNLOAD, PHASE_PREPARE, PHASE_RESOLVE, ProgressState
 from bot.proxy import forced_proxy, proxy_for, proxy_ladder
@@ -3215,6 +3215,50 @@ async def _instagram_browser_album(url: str, tmpdir: str) -> AlbumMedia | None:
     )
 
 
+def _youtube_photo_album(url: str, tmpdir: str, proxy: str | None) -> AlbumMedia:
+    """Download every community attachment in order, or reject the whole post."""
+    from curl_cffi import requests as cffi_requests
+
+    try:
+        post = youtube_posts.resolve_post(url, proxy)
+    except youtube_posts.YouTubePostError as exc:
+        raise DownloadFailedError(str(exc)) from exc
+    if not post.image_urls or len(post.image_urls) > 40:
+        raise AlbumLimitError("В посте не найдено фото либо их больше 40.")
+    session = cffi_requests.Session(impersonate="chrome131", timeout=30)
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    paths = []
+    total = 0
+    deadline = time.monotonic() + 150
+    try:
+        for index, media_url in enumerate(post.image_urls):
+            if time.monotonic() >= deadline:
+                raise DownloadFailedError("Превышено время загрузки фото YouTube.")
+            destination = Path(tmpdir) / f"youtube-{index:03d}"
+            written = _stream_to_file(
+                session, media_url, destination, 20 * 1024 * 1024,
+                None, None, {}, None, referer="https://www.youtube.com/",
+                allow_redirects=False,
+            )
+            extension = _tikwm_photo_extension(destination) if written else None
+            if extension is None:
+                raise DownloadFailedError("YouTube не отдал одно из фото поста целиком.")
+            renamed = destination.with_suffix(extension)
+            destination.rename(renamed)
+            paths.append(renamed)
+            total += renamed.stat().st_size
+            if total > 80 * 1024 * 1024:
+                raise AlbumLimitError("Фото-пост YouTube превышает лимит 80 МБ.")
+    except DownloadFailedError:
+        raise
+    except Exception as exc:
+        raise DownloadFailedError("Не удалось скачать все фото поста YouTube.") from exc
+    finally:
+        session.close()
+    return AlbumMedia(paths, None, post.description)
+
+
 @asynccontextmanager
 async def download_album(
     url: str, cookies_file: Path | None, force_proxy: bool = False
@@ -3270,7 +3314,15 @@ async def download_album(
                 # post and sent as a truncated carousel.
                 await asyncio.to_thread(_clear_directory, tmpdir)
             try:
-                if host.endswith("rule34.xxx"):
+                if youtube_posts.is_post_url(url):
+                    try:
+                        album = await asyncio.to_thread(
+                            _youtube_photo_album, url, tmpdir, exit_proxy,
+                        )
+                    except DownloadFailedError as exc:
+                        last_error = exc
+                        continue
+                elif host.endswith("rule34.xxx"):
                     album = await asyncio.to_thread(
                         _scrape_rule34_sync, url, tmpdir, exit_proxy
                     )
@@ -3614,6 +3666,8 @@ def is_photo_post_url(url: str) -> bool:
     """
     host = (urlparse(url).hostname or "").lower()
     path = urlparse(url).path
+    if youtube_posts.is_post_url(url):
+        return True
     if host.endswith("rule34.xxx"):
         return True
     if host == "pinterest.com" or host.endswith(".pinterest.com") or host == "pin.it":
