@@ -1,0 +1,22 @@
+[Unit]
+Description=Temporary owner statistics tunnel
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/tiktok-bot
+Environment=STATS_TUNNEL_DATA=/root/tiktok-bot/data
+EnvironmentFile=-/root/tiktok-bot/data/stats-tunnel.env
+ExecStart=/usr/bin/python3 /root/tiktok-bot/scripts/stats_tunnel.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/root/tiktok-bot/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

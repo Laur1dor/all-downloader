@@ -66,6 +66,7 @@ async def _set_command_menus(bot: Bot, settings: Settings) -> None:
     admin = [
         *public,
         BotCommand(command="stats", description="📈 Итоги за период"),
+        BotCommand(command="dashboard", description="🖥 Защищённая панель статистики"),
         BotCommand(command="events", description="📊 Действия пользователей"),
         BotCommand(command="analytics", description="📊 Активность и надёжность"),
         BotCommand(command="analytics_export", description="📄 Выгрузка событий CSV"),
@@ -179,7 +180,9 @@ async def run() -> None:
     igbrowser.set_notifier(_tell_admin)
     await ig_session.start()
 
-    health_runner = await start_health_server(settings.health_port)
+    health_runner = await start_health_server(settings.health_port, db, settings.admin_id)
+    with suppress(Exception):
+        await db.record_event(settings.admin_id, "system:startup", "ok")
     announcement_worker = asyncio.create_task(supervised_worker(bot, db))
 
     async def retain_events() -> None:
@@ -209,6 +212,8 @@ async def run() -> None:
         logger.info("Starting polling")
         await dispatcher.start_polling(bot)
     finally:
+        with suppress(Exception):
+            await db.record_event(settings.admin_id, "system:shutdown", "ok")
         for task in (announcement_worker, retention_worker):
             task.cancel()
             with suppress(asyncio.CancelledError):

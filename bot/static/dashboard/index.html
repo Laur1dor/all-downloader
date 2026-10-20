@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Статистика · All Downloader</title>
+  <link rel="stylesheet" href="/stats/style.css">
+  <script src="/stats/app.js" defer></script>
+</head>
+<body>
+  <main id="access-gate" class="gate" hidden>
+    <div class="brand-mark" aria-hidden="true">a<span>↓</span></div>
+    <p class="eyebrow">ALL DOWNLOADER / ДОСТУП ОПЕРАТОРА</p>
+    <h1 id="gate-title">Статистика под защитой</h1>
+    <p id="gate-message">Отправьте /dashboard боту и откройте новую ссылку доступа. Она действует ограниченное время.</p>
+    <button id="retry-auth" class="button secondary" type="button">Проверить доступ</button>
+  </main>
+  <div id="dashboard" class="shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/stats/" aria-label="All Downloader, статистика"><span class="brand-mark" aria-hidden="true">a<span>↓</span></span><span>all downloader<small>ПАНЕЛЬ ОПЕРАТОРА</small></span></a>
+      <div class="nav-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+      <div class="nav-item active"><span aria-hidden="true">▥</span> Статистика <span class="live-dot" aria-hidden="true"></span></div>
+      <div class="sidebar-note"><span class="note-symbol" aria-hidden="true">⌑</span><strong>Доступ только для вас</strong><p>Временная сессия. Данные обновляются по запросу.</p><span id="session-expiry">Проверяем срок доступа…</span></div>
+      <button id="logout" class="logout" type="button">Завершить доступ <span aria-hidden="true">↗</span></button>
+    </aside>
+    <main class="workspace">
+      <header class="topbar"><span>Обзор / <strong>Статистика бота</strong></span><span class="private-badge"><span aria-hidden="true">●</span> Приватная панель</span></header>
+      <section class="page-heading"><div><p class="eyebrow">ВСЯ АКТИВНОСТЬ В ОДНОМ МЕСТЕ</p><h1>Пульс бота<span>.</span></h1><p class="subtitle">Пользователи, загрузки и события — от общего к деталям.</p></div><div class="refresh-block"><button id="refresh" class="button secondary" type="button"><span aria-hidden="true">↻</span> Обновить</button><span id="last-updated" aria-live="polite">Ещё не обновлено</span></div></section>
+      <section class="filter-panel" aria-label="Фильтры статистики">
+        <div class="filter-heading"><div class="presets" role="group" aria-label="Период"><button type="button" data-period="24h">24 часа</button><button type="button" data-period="7d">7 дней</button><button type="button" data-period="30d" class="selected" aria-pressed="true">30 дней</button><button type="button" data-period="90d">90 дней</button><button type="button" data-period="all">Всё время</button><button type="button" data-period="custom">Свой период</button></div><button id="reset" class="text-button" type="button">Сбросить фильтры</button></div>
+        <form id="filters">
+          <div id="custom-dates" class="custom-dates" hidden><label>С даты<input id="date-from" name="date_from" type="date"></label><label>По дату включительно<input id="date-to" name="date_to" type="date"></label></div>
+          <div class="filter-grid">
+            <label>Платформа<select id="filter-platform" name="platform"><option value="">Все платформы</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="twitter">Twitter / X</option><option value="rule34">Rule34</option><option value="rule34video">Rule34Video</option></select></label>
+            <label>Статус<select id="filter-status" name="status"><option value="">Все статусы</option><option value="success">Успешно</option><option value="error">Ошибка</option><option value="cancelled">Отменено</option><option value="started">Начато</option></select></label>
+            <label>Тип медиа<select id="filter-media" name="media_type"><option value="">Все типы</option><option value="video">Видео</option><option value="audio">Аудио</option><option value="photo">Фото</option><option value="album">Альбом</option><option value="document">Файл</option></select></label>
+            <label>Действие<select id="filter-action" name="action"><option value="">Все действия</option><option value="download">Загрузка</option><option value="start">Старт</option><option value="cancel">Отмена</option><option value="restart">Перезапуск</option></select></label>
+            <label>Результат<select id="filter-outcome" name="outcome"><option value="">Все результаты</option><option value="success">Успешно</option><option value="error">Ошибка</option><option value="cancelled">Отменено</option></select></label>
+            <label>Пользователь<input id="filter-user" name="user" type="search" placeholder="Имя или Telegram ID" autocomplete="off"></label>
+          </div>
+          <div class="filter-footer"><label class="checkbox-label"><input id="exclude-owner" name="exclude_owner" type="checkbox"><span>Исключить владельца</span></label><button class="button primary" type="submit">Применить фильтры <span aria-hidden="true">↗</span></button></div>
+        </form>
+      </section>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="kpis" class="kpi-grid" aria-label="Основные показатели"></section>
+      <section class="charts-grid"><article class="panel activity-panel"><div class="panel-title"><div><p class="eyebrow">ДИНАМИКА</p><h2>Активность по дням</h2></div><span class="chart-legend"><i></i> События</span></div><div id="activity-chart" class="chart" aria-label="График активности"></div><div id="chart-caption" class="chart-caption"></div></article><article class="panel platform-panel"><div class="panel-title"><div><p class="eyebrow">ИСТОЧНИКИ</p><h2>Платформы</h2></div></div><div id="platforms" class="platform-list"></div></article></section>
+      <section class="panel detail-panel"><div class="detail-heading"><div class="tabs" role="tablist" aria-label="Подробная статистика"><button id="tab-events" type="button" role="tab" aria-selected="true" aria-controls="table-region" data-tab="events">Журнал событий</button><button id="tab-users" type="button" role="tab" aria-selected="false" aria-controls="table-region" data-tab="users">Пользователи</button></div><span id="result-count" class="muted"></span></div><div id="table-region" class="table-region" role="tabpanel" aria-labelledby="tab-events" tabindex="0"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table><div id="table-empty" class="empty-state" hidden><span aria-hidden="true">⌕</span><h3>Здесь пока пусто</h3><p>За выбранный период событий нет. Попробуйте изменить фильтры.</p></div></div><footer class="table-footer"><label>На странице <select id="page-size" aria-label="Записей на странице"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label><div class="pagination"><button id="page-prev" class="button icon-button" type="button" aria-label="Предыдущая страница">←</button><span id="page-label">Страница 1</span><button id="page-next" class="button icon-button" type="button" aria-label="Следующая страница">→</button></div></footer></section>
+      <p id="history-note" class="history-note">Журнал хранится до 90 дней.</p><footer class="page-footer"><span>All Downloader · Статистика оператора</span><span id="access-mode">Доступ ограничен текущей сессией</span></footer>
+    </main>
+  </div>
+</body>
+</html>
