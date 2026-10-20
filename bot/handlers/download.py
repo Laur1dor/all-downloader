@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
-from aiogram import Bot, F, Router, html
+from aiogram import Bot, F, Router
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramNetworkError,
@@ -150,8 +150,7 @@ _PHOTO_MAX_BYTES = 10 * 1024 * 1024
 # token -> (event, state) for pending compress-or-cancel questions.
 _pending_choices: dict[str, tuple[asyncio.Event, dict]] = {}
 
-# token -> post caption, for album description buttons (albums carry no inline
-# keyboard, and a photo post's caption can't be re-fetched via yt-dlp).
+# token -> complete post caption, shared by video and album description buttons.
 _album_descriptions: OrderedDict[str, str] = OrderedDict()
 _tiktok_photo_posts: OrderedDict[str, None] = OrderedDict()
 
@@ -202,6 +201,21 @@ def _remember_description(token: str, description: str) -> None:
     _album_descriptions[token] = description
     while len(_album_descriptions) > 500:
         _album_descriptions.popitem(last=False)
+
+
+def _description_chunks(text: str) -> list[str]:
+    """Keep the whole description within Telegram's UTF-16 message budget."""
+    chunks = []
+    start = units = 0
+    for index, character in enumerate(text):
+        size = 2 if ord(character) > 0xFFFF else 1
+        if units + size > 4000:
+            chunks.append(text[start:index])
+            start, units = index, 0
+        units += size
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
 
 # Machine protection: cap concurrent non-admin downloads. The admin bypasses it.
 _download_slots = asyncio.Semaphore(3)
@@ -1149,6 +1163,8 @@ async def _run_link(
                     with_description = _description_capable(url, platform) and bool(
                         media.description and media.description.strip()
                     )
+                    if with_description:
+                        _remember_description(token, media.description.strip())
                     if time_range is not None or media.file_size > part_limit:
                         if time_range is not None and platform == "rule34":
                             progress.phase = PHASE_PAUSED
@@ -1980,28 +1996,50 @@ async def handle_quality_choice(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith(_DESCRIPTION_PREFIX))
 async def handle_description_request(
-    callback: CallbackQuery, settings: Settings, url_cache: UrlCache
+    callback: CallbackQuery, settings: Settings, url_cache: UrlCache, db: Database
 ) -> None:
     token = callback.data.removeprefix(_DESCRIPTION_PREFIX)
     if not isinstance(callback.message, Message):
         await callback.answer()
         return
     await callback.answer("Получаю описание…")
-    # Albums keep their caption in memory; videos are re-fetched via yt-dlp.
+    # Reuse the exact caption downloaded with the media, including cached sends.
     description = _album_descriptions.get(token)
     if description is None:
         url = url_cache.get(token)
         if url is None:
             await callback.message.answer("📝 Описание устарело. Отправьте ссылку ещё раз.")
             return
-        description = await fetch_description(url, settings.cookies_file)
+        platform = detect_platform(url)
+        keys = (_video_cache_key(platform), _video_cache_key(platform, capped=True))
+        if platform == "tiktok":
+            keys += ("video_validated", "video_validated_capped", "video", "video_capped")
+        for key in keys:
+            cached = await db.get_cached_file(hash_url(url), key)
+            if cached is not None:
+                value = cached["description"]
+                description = (
+                    _tiktok_cached_video_metadata(value)[0] if platform == "tiktok" else value
+                )
+                if description and description.strip():
+                    break
+        if not description or not description.strip():
+            try:
+                description = await fetch_description(url, settings.cookies_file)
+            except DownloadFailedError:
+                await callback.message.answer(
+                    "📝 Не удалось получить описание из источника. Попробуйте позже."
+                )
+                return
     if not description or not description.strip():
         await callback.message.answer("📝 Описания нет.")
         return
     text = description.strip()
-    if len(text) > 4000:  # Telegram message limit is 4096
-        text = text[:4000] + "…"
-    await callback.message.answer(f"📝 <b>Описание:</b>\n\n{html.quote(text)}")
+    _remember_description(token, text)
+    for index, chunk in enumerate(_description_chunks(text)):
+        await callback.message.answer(
+            ("📝 Описание:\n\n" if index == 0 else "") + chunk, parse_mode=None,
+        )
 
 
 @router.callback_query(F.data.startswith((_YT_VIDEO_PREFIX, _YT_AUDIO_PREFIX)))

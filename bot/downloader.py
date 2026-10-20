@@ -1186,11 +1186,32 @@ def _fetch_description_sync(url: str, options: dict) -> str | None:
 async def fetch_description(url: str, cookies_file: Path | None) -> str | None:
     """Return the post's text/description (metadata only, no download)."""
     try:
+        if detect_platform(url) == "tiktok":
+            return await asyncio.to_thread(_fetch_tiktok_description_sync, url, cookies_file)
         return await asyncio.to_thread(
             _fetch_description_sync, url, _base_options(cookies_file, url)
         )
-    except YtdlpDownloadError:
-        return None
+    except YtdlpDownloadError as exc:
+        raise DownloadFailedError("Не удалось получить описание из источника.") from exc
+
+
+def _fetch_tiktok_description_sync(url: str, cookies_file: Path | None) -> str | None:
+    """Use TikTok's working media resolvers rather than the blocked yt-dlp API."""
+    proxy = proxy_for("tiktok")
+    try:
+        item, session = _tiktok_item(
+            url, proxy, _tiktok_cookies(cookies_file), photo_source=True,
+        )
+    except DownloadFailedError:
+        data, session = _tikwm_data(url, proxy)
+        try:
+            return (data.get("title") or "").strip() or None
+        finally:
+            session.close()
+    try:
+        return (item.get("desc") or "").strip() or None
+    finally:
+        session.close()
 
 
 def _probe_filesize(url: str, options: dict) -> int | None:
