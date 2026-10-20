@@ -105,6 +105,31 @@ INSERT INTO upload_samples VALUES ('2026-10-19','youtube',false,100,2,1);
         self.assertEqual(result["series"][0]["service_events"], 1)
         self.assertEqual((await self.snapshot(exclude_owner=False))["summary"]["nonstart"], 3)
 
+    async def test_jit_is_disabled_only_inside_dashboard_transaction(self):
+        await self.conn.execute("SET jit = on")
+        conn = self.conn
+        testcase = self
+        checks = []
+
+        class CheckedConnection:
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
+            async def fetchrow(self, *args, **kwargs):
+                checks.append(await conn.fetchval("SELECT current_setting('jit')"))
+                testcase.assertEqual(checks[-1], "off")
+                return await conn.fetchrow(*args, **kwargs)
+
+        class CheckedPool:
+            @asynccontextmanager
+            async def acquire(self):
+                yield CheckedConnection()
+
+        self.db.pool = CheckedPool()
+        await self.snapshot()
+        self.assertTrue(checks)
+        self.assertEqual(await conn.fetchval("SELECT current_setting('jit')"), "on")
+
     async def test_legacy_actors_without_registration_are_not_lost(self):
         await self.conn.execute("""
 INSERT INTO conversions VALUES (5,6,'2026-10-19','done','youtube','photo',200,1);

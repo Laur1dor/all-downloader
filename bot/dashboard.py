@@ -209,7 +209,9 @@ def register_dashboard(app: web.Application, db: Database, admin_id: int) -> Non
         response.set_cookie(
             _COOKIE, token, max_age=max(1, int((until - _now()).total_seconds())),
             httponly=True, samesite="Strict", path="/stats",
-            secure=request.secure or request.host.endswith(".trycloudflare.com"),
+            secure=request.secure or (
+                urlsplit("//" + request.host).hostname or ""
+            ).endswith(".trycloudflare.com"),
         )
         return response
 

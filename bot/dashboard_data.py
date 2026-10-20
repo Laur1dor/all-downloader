@@ -164,6 +164,10 @@ async def dashboard_data(db, filters: dict, admin_id: int) -> dict:
             db.pool.acquire() as conn,
             conn.transaction(isolation="repeatable_read", readonly=True),
         ):
+            # PostgreSQL can overestimate the union/CTE cost and spend seconds
+            # compiling JIT code for this small analytics snapshot. Keep this
+            # setting local to our read-only transaction, never the shared pool.
+            await conn.execute("SET LOCAL jit = off", timeout=5)
             summary = dict(
                 await conn.fetchrow(
                     _CTE

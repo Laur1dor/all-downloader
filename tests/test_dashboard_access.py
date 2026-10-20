@@ -163,6 +163,19 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
         _, session_until = await self.access.consume(issued["ticket"])
         self.assertEqual(session_until, until)
 
+    async def test_tunnel_cookie_stays_secure_with_uppercase_host_and_port(self):
+        Path(self.directory.name + "/status.json").write_text(json.dumps({
+            "state": "ready", "expires_at": 9999999999,
+            "url": "https://one.trycloudflare.com",
+        }))
+        issued = await self.access.issue(internet=False)
+        response = await self.client.post(
+            "/stats/api/login", json={"ticket": issued["ticket"]},
+            headers={"Host": "ONE.TRYCLOUDFLARE.COM:443"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.cookies["stats_session"]["secure"])
+
     async def test_bad_filters_and_login_flood_are_bounded(self):
         await self.login()
         response = await self.client.get("/stats/api/data?page_size=100000")
