@@ -94,7 +94,7 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
 
     async def login(self):
         issued = await self.access.issue(internet=False)
-        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"]})
+        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"], "password": issued["password"]})
         self.assertEqual(response.status, 200)
         return issued, response
 
@@ -117,11 +117,45 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
         self.assertIsNone(await self.conn.fetchval(
             "SELECT token_hash FROM dashboard_access WHERE token_hash=$1", _hash(issued["ticket"]),
         ))
-        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"]})
+        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"], "password": issued["password"]})
         self.assertEqual(response.status, 401)
         response = await self.client.get("/stats/api/data?period=7d")
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["summary"]["nonstart"], 42)
+
+    async def test_password_is_required_and_wrong_password_does_not_consume_link(self):
+        issued = await self.access.issue(internet=False)
+        for password in (None, "", "wrong", "A" * 16):
+            response = await self.client.post("/stats/api/login", json={
+                "ticket": issued["ticket"], "password": password,
+            })
+            self.assertEqual(response.status, 401)
+        self.assertIsNotNone(await self.access.consume(issued["ticket"], issued["password"]))
+
+    async def test_new_issue_revokes_old_session_and_uses_new_credentials(self):
+        old, _ = await self.login()
+        issued = await self.access.issue(internet=False)
+        self.assertNotEqual(old["ticket"], issued["ticket"])
+        self.assertNotEqual(old["password"], issued["password"])
+        self.assertEqual((await self.client.get("/stats/api/data")).status, 401)
+        self.assertIsNone(await self.access.consume(old["ticket"], old["password"]))
+        self.assertIsNone(await self.access.consume(issued["ticket"], old["password"]))
+        self.assertIsNotNone(await self.access.consume(issued["ticket"], issued["password"]))
+
+    async def test_credentials_and_sessions_are_bound_to_configured_owner(self):
+        issued = await self.access.issue(internet=False)
+        other = DashboardAccess(self.db, 2)
+        self.assertIsNone(await other.consume(issued["ticket"], issued["password"]))
+        token, _ = await self.access.consume(issued["ticket"], issued["password"])
+        self.assertIsNone(await other.session(token))
+        self.assertIsNotNone(await self.access.session(token))
+
+    async def test_data_api_rejects_all_write_methods(self):
+        await self.login()
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            response = await self.client.request(method, "/stats/api/data", json={})
+            self.assertEqual(response.status, 405)
+        self.data.assert_not_awaited()
 
     async def test_logout_revokes_every_session_and_closes_window(self):
         await self.login()
@@ -136,7 +170,7 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
     async def test_expired_ticket_and_session_are_refused(self):
         issued = await self.access.issue(internet=False)
         await self.conn.execute("UPDATE dashboard_access SET expires_at=now()-interval '1 second'")
-        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"]})
+        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"], "password": issued["password"]})
         self.assertEqual(response.status, 401)
         await self.login()
         await self.conn.execute("UPDATE dashboard_access SET expires_at=now()-interval '1 second'")
@@ -146,21 +180,21 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
 
     async def test_cross_origin_posts_do_not_consume_ticket_or_revoke_session(self):
         issued = await self.access.issue(internet=False)
-        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"]},
+        response = await self.client.post("/stats/api/login", json={"ticket": issued["ticket"], "password": issued["password"]},
                                           headers={"Origin": "https://evil.example"})
         self.assertEqual(response.status, 403)
-        self.assertIsNotNone(await self.access.consume(issued["ticket"]))
+        self.assertIsNotNone(await self.access.consume(issued["ticket"], issued["password"]))
         response = await self.client.post("/stats/api/logout", data="")
         self.assertEqual(response.status, 403)
 
     async def test_tunnel_window_and_session_share_expiry(self):
         before = datetime.now(timezone.utc)
-        issued = await self.access.issue(minutes=15)
+        issued = await self.access.issue(minutes=10)
         request = json.loads(Path(self.directory.name + "/request.json").read_text())
         until = datetime.fromisoformat(issued["expires_at"])
-        self.assertTrue(before + timedelta(minutes=14) < until < before + timedelta(minutes=16))
+        self.assertTrue(before + timedelta(minutes=9) < until < before + timedelta(minutes=11))
         self.assertEqual(request["expires_at"], until.timestamp())
-        _, session_until = await self.access.consume(issued["ticket"])
+        _, session_until = await self.access.consume(issued["ticket"], issued["password"])
         self.assertEqual(session_until, until)
 
     async def test_tunnel_cookie_stays_secure_with_uppercase_host_and_port(self):
@@ -170,7 +204,7 @@ CREATE TEMP TABLE dashboard_access(token_hash text PRIMARY KEY,kind text,
         }))
         issued = await self.access.issue(internet=False)
         response = await self.client.post(
-            "/stats/api/login", json={"ticket": issued["ticket"]},
+            "/stats/api/login", json={"ticket": issued["ticket"], "password": issued["password"]},
             headers={"Host": "ONE.TRYCLOUDFLARE.COM:443"},
         )
         self.assertEqual(response.status, 200)

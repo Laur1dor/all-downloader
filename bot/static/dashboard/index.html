@@ -14,6 +14,11 @@
     <p class="eyebrow">ALL DOWNLOADER / ДОСТУП ОПЕРАТОРА</p>
     <h1 id="gate-title">Статистика под защитой</h1>
     <p id="gate-message">Отправьте /dashboard боту и откройте новую ссылку доступа. Она действует ограниченное время.</p>
+    <form id="login-form" hidden>
+      <label for="access-password">Пароль из сообщения бота</label>
+      <input id="access-password" type="password" autocomplete="one-time-code" maxlength="64" required>
+      <button id="login-submit" class="button secondary" type="submit">Войти</button>
+    </form>
     <button id="retry-auth" class="button secondary" type="button">Проверить доступ</button>
   </main>
   <div id="dashboard" class="shell" hidden>

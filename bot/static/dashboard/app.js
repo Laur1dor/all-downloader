@@ -96,7 +96,7 @@
     return false;
   }
   async function api(path, options = {}) {
-    const response = await fetch(`/stats/api/${path}`, { credentials: "same-origin", cache: "no-store", ...options });
+    const response = await fetch(`/stats/api/${path}`, { credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(15000), ...options });
     let data;
     try { data = await response.json(); } catch { data = {}; }
     if (!response.ok) {
@@ -106,10 +106,16 @@
     }
     return data;
   }
-  async function authenticate(ticket) {
+  async function authenticate(loginTicket, password) {
     $("retry-auth").disabled = true;
+    gate("Проверяем доступ…");
     try {
-      if (ticket) await api("login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket }) });
+      if (loginTicket) {
+        await api("login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket: loginTicket, password }) });
+        ticket = null;
+        $("access-password").value = "";
+        $("login-form").hidden = true;
+      }
       const session = await api("session");
       if (scheduleExpiry(session.expires_at)) return;
       $("session-expiry").textContent = `Доступ до ${date(session.expires_at)}`;
@@ -120,7 +126,7 @@
       await load();
     } catch (error) {
       gate(error.status === 401 || error.status === 403
-        ? "Отправьте /dashboard боту и откройте новую ссылку доступа. Срок предыдущей ссылки или сессии мог истечь."
+        ? (loginTicket ? error.message : "Нет действующей сессии. Отправьте /dashboard боту и откройте новую ссылку с паролем. Срок доступа — 10 минут с момента запроса.")
         : error.message);
     } finally { $("retry-auth").disabled = false; }
   }
@@ -352,7 +358,19 @@
   $("retry-auth").addEventListener("click", () => authenticate());
   document.addEventListener("visibilitychange", () => { if (!document.hidden) checkExpiry(); });
   $("exclude-owner").checked = true;
-  gate("Проверяем доступ к статистике…");
-  authenticate(ticket);
-  ticket = null;
+  $("login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    $("login-submit").disabled = true;
+    try { await authenticate(ticket, $("access-password").value.trim()); }
+    finally { $("login-submit").disabled = false; }
+  });
+  if (ticket) {
+    $("login-form").hidden = false;
+    $("retry-auth").hidden = true;
+    gate("Введите одноразовый пароль из того же сообщения бота. Доступ — на 10 минут с момента запроса.");
+    $("access-password").focus();
+  } else {
+    gate("Проверяем доступ к статистике…");
+    authenticate();
+  }
 })();

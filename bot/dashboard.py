@@ -73,35 +73,40 @@ class DashboardAccess:
         self.db = db
         self.admin_id = admin_id
 
-    async def issue(self, minutes: int = 30, *, internet: bool = True) -> dict:
-        if minutes not in {15, 30, 60, 120}:
-            raise ValueError("Access duration must be 15, 30, 60 or 120 minutes")
+    async def issue(self, minutes: int = 10, *, internet: bool = True) -> dict:
+        if minutes != 10:
+            raise ValueError("Access duration must be 10 minutes")
         until = _now() + timedelta(minutes=minutes)
         if internet:
             _write_window(until)
         ticket = secrets.token_urlsafe(32)
-        await self.db.pool.execute("DELETE FROM dashboard_access WHERE expires_at <= now()")
+        password = secrets.token_urlsafe(12)
+        await self.db.pool.execute("DELETE FROM dashboard_access")
         await self.db.pool.execute(
             "INSERT INTO dashboard_access(token_hash,kind,expires_at,access_until) "
-            "VALUES($1,'ticket',$2,$3)", _hash(ticket), _now() + timedelta(minutes=5), until,
+            "VALUES($1,'ticket',$2,$3)", _hash(f"{self.admin_id}:{ticket}:{password}"), until, until,
         )
         await self.db.record_event(self.admin_id, "system:stats_access_issued", "ok")
-        return {"ticket": ticket, "expires_at": until.isoformat(), "local_url": local_url()}
+        return {"ticket": ticket, "password": password, "expires_at": until.isoformat(),
+                "local_url": local_url()}
 
-    async def consume(self, ticket: str) -> tuple[str, datetime] | None:
+    async def consume(self, ticket: str, password: str = "") -> tuple[str, datetime] | None:
         if not isinstance(ticket, str) or not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", ticket):
+            return None
+        if not isinstance(password, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16}", password):
             return None
         async with self.db.pool.acquire() as connection, connection.transaction():
             until = await connection.fetchval(
                 "DELETE FROM dashboard_access WHERE token_hash=$1 AND kind='ticket' "
-                "AND expires_at>now() AND access_until>now() RETURNING access_until", _hash(ticket),
+                "AND expires_at>now() AND access_until>now() RETURNING access_until",
+                _hash(f"{self.admin_id}:{ticket}:{password}"),
             )
             if until is None:
                 return None
             token = secrets.token_urlsafe(32)
             await connection.execute(
                 "INSERT INTO dashboard_access(token_hash,kind,expires_at,access_until) "
-                "VALUES($1,'session',$2,$2)", _hash(token), until,
+                "VALUES($1,'session',$2,$2)", _hash(f"{self.admin_id}:{token}"), until,
             )
         await self.db.record_event(self.admin_id, "system:stats_login", "ok")
         return token, until
@@ -111,7 +116,7 @@ class DashboardAccess:
             return None
         return await self.db.pool.fetchval(
             "SELECT expires_at FROM dashboard_access WHERE token_hash=$1 "
-            "AND kind='session' AND expires_at>now()", _hash(token),
+            "AND kind='session' AND expires_at>now()", _hash(f"{self.admin_id}:{token}"),
         )
 
     async def revoke(self) -> None:
@@ -199,10 +204,13 @@ def register_dashboard(app: web.Application, db: Database, admin_id: int) -> Non
             return web.json_response({"error": "Слишком много попыток. Подождите минуту."},
                                      status=429)
         payload = await request.json()
-        result = await access.consume(payload.get("ticket") if isinstance(payload, dict) else None)
+        result = await access.consume(
+            payload.get("ticket") if isinstance(payload, dict) else None,
+            payload.get("password") if isinstance(payload, dict) else None,
+        )
         if result is None:
             return web.json_response(
-                {"error": "Ссылка истекла или уже использована. Запросите /dashboard."}, status=401,
+                {"error": "Неверный пароль, ссылка истекла или уже использована. Запросите /dashboard."}, status=401,
             )
         token, until = result
         response = web.json_response({"expires_at": until.isoformat()})

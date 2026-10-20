@@ -180,6 +180,25 @@ class OperatorDispatcherTests(unittest.IsolatedAsyncioTestCase):
             await callback(ADMIN)
             launch.assert_awaited_once_with(self.db, 1)
 
+    async def _check_dashboard_issue_and_revoke_are_private_owner_only(self) -> None:
+        with patch("bot.handlers.analytics._open_dashboard", new_callable=AsyncMock) as issue:
+            await self._feed_message(self._message(USER, USER, "/dashboard"))
+            await self._feed_message(self._message(ADMIN, INBOX, "/dashboard"))
+            issue.assert_not_awaited()
+            await self._feed_message(self._message(ADMIN, ADMIN, "/dashboard"))
+            issue.assert_awaited_once()
+        with patch("bot.dashboard.DashboardAccess.revoke", new_callable=AsyncMock) as revoke:
+            for user_id, chat_id in ((USER, USER), (ADMIN, INBOX)):
+                self.update_id += 1
+                await self.dispatcher.feed_update(self.bot, Update(
+                    update_id=self.update_id, callback_query=CallbackQuery(
+                        id=f"close-{self.update_id}", from_user=self._user(user_id),
+                        chat_instance="test", data="dashboardclose",
+                        message=self._message(999, chat_id, "Access"),
+                    ),
+                ))
+            revoke.assert_not_awaited()
+
     async def _check_analytics_is_private_admin_command(self) -> None:
         await self._feed_message(self._message(ADMIN, ADMIN, "/analytics"))
         self.assertTrue(any("Аналитика за 24h" in (method.text or "")
@@ -216,6 +235,7 @@ class OperatorDispatcherTests(unittest.IsolatedAsyncioTestCase):
         await self._check_unknown_tell_never_sends_to_target()
         await self._check_broadcast_draft_and_confirm_are_admin_only()
         await self._check_analytics_is_private_admin_command()
+        await self._check_dashboard_issue_and_revoke_are_private_owner_only()
         await self._check_group_draft_can_be_cancelled_without_launch()
         await self._check_legacy_subscription_commands_cannot_change_delivery()
 

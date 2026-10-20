@@ -32,15 +32,13 @@ async def _open_dashboard(
         return
     internet = "local" not in values
     values = [value for value in values if value != "local"]
-    periods = {"15": 15, "15m": 15, "30": 30, "30m": 30, "60": 60, "1h": 60,
-               "120": 120, "2h": 120}
-    if len(values) > 1 or (values and values[0] not in periods):
+    if values:
         await message.answer(
-            "/dashboard — панель на 30 минут\n/dashboard 1h — на час\n"
+            "/dashboard — панель на 10 минут\n"
             "/dashboard local — только локальная ссылка\n/dashboard close — закрыть доступ"
         )
         return
-    minutes = periods[values[0]] if values else 30
+    minutes = 10
     status = await message.answer("Готовлю защищённую ссылку на статистику…")
     info = await access.issue(minutes, internet=internet)
     remote = None
@@ -55,9 +53,10 @@ async def _open_dashboard(
     note = "Доступен из интернета и домашней сети." if remote else "Пока доступен в домашней сети."
     await status.edit_text(
         f"Панель статистики · {minutes} мин\n\n{note}\n"
-        "Ссылка для входа одноразовая и действует 5 минут. "
+        f"Пароль: <code>{info['password']}</code>\n\n"
+        "Ссылка и пароль одноразовые, действуют 10 минут с момента запроса. "
         "После входа сессия сохранится до конца выделенного времени.\n"
-        "Для другого устройства запросите новую ссылку. /dashboard close — закрыть доступ.",
+        "Новый запрос отзовёт предыдущий доступ. /dashboard close — закрыть доступ.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Открыть статистику", url=url),
         ], [InlineKeyboardButton(text="Закрыть доступ", callback_data="dashboardclose")]]),
