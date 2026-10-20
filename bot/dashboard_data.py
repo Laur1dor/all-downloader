@@ -87,10 +87,16 @@ def _json(value):
 # excludes journal events because they do not carry platform/media attributes;
 # an action/outcome filter selects journal events and excludes conversions.
 _CTE = """
-WITH population AS (
- SELECT u.* FROM users u WHERE ($3::bigint IS NULL OR u.telegram_id <> $3)
+WITH actors AS (
+ SELECT telegram_id FROM users
+ UNION SELECT telegram_id FROM conversions
+ UNION SELECT telegram_id FROM user_events WHERE action NOT LIKE 'system:%'
+), population AS (
+ SELECT a.telegram_id, u.username, u.registration_date
+ FROM actors a LEFT JOIN users u USING (telegram_id)
+ WHERE ($3::bigint IS NULL OR a.telegram_id <> $3)
  AND ($4::text = '' OR strpos(lower(coalesce(u.username,'')), lower($4)) > 0
-      OR strpos(u.telegram_id::text, $4) > 0)
+      OR strpos(a.telegram_id::text, $4) > 0)
 ), c AS (
  SELECT c.* FROM conversions c JOIN population p USING (telegram_id)
  WHERE ($1::timestamptz IS NULL OR c.created_at >= $1) AND c.created_at < $2

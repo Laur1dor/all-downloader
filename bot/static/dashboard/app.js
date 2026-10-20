@@ -19,6 +19,15 @@
     bot_start: "Запуск бота", bot_restart: "Перезапуск бота", service_start: "Запуск сервиса", service_stop: "Остановка сервиса",
     description: "Описание", file: "Получить файл", quality: "Выбор качества", timing: "Выбор интервала",
     command: "Команда", callback: "Нажатие кнопки", message: "Сообщение", shutdown: "Остановка", upload: "Отправка",
+    unknown: "Не указано",
+  };
+  const callbackLabels = {
+    desc: "Описание", ttfile: "Исходный файл TikTok", qh: "Выбор качества", ytv: "Видео YouTube", yta: "Аудио YouTube",
+    audio: "Аудио", cancel: "Отмена", help: "Помощь",
+  };
+  const systemLabels = {
+    startup: "Запуск сервиса", shutdown: "Остановка сервиса", stats_access_issued: "Выдан доступ к статистике",
+    stats_login: "Вход в статистику", stats_access_closed: "Доступ к статистике закрыт",
   };
   let state = { period: "30d", page: 1, pageSize: 25, tab: "events", data: null, controller: null, applied: {}, expiry: null, expiryTimer: null };
 
@@ -29,6 +38,17 @@
     return node;
   }
   function translated(value) { return value == null || value === "" ? "—" : labels[value] || String(value); }
+  function actionLabel(value) {
+    if (!value) return "—";
+    const text = String(value), separator = text.indexOf(":");
+    if (separator === -1) return translated(text);
+    const prefix = text.slice(0, separator), detail = text.slice(separator + 1);
+    if (prefix === "command") return `Команда /${detail}`;
+    if (prefix === "callback") return `Кнопка: ${callbackLabels[detail] || translated(detail)}`;
+    if (prefix === "message") return { text: "Текстовое сообщение", media: "Сообщение с медиа" }[detail] || `Сообщение: ${translated(detail)}`;
+    if (prefix === "system") return systemLabels[detail] || `Сервис: ${translated(detail)}`;
+    return translated(text);
+  }
   function num(value) { const n = Number(value); return Number.isFinite(n) ? n : 0; }
   function count(value) { return format.format(num(value)); }
   function date(value) { const d = new Date(value); return value && !Number.isNaN(d.valueOf()) ? dateFormat.format(d) : "—"; }
@@ -172,8 +192,8 @@
     const attempts = num(s.done) + num(s.failed) + num(s.cancelled);
     const success = attempts ? `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(num(s.done) / attempts * 100)}%` : "—";
     const cards = [
-      ["Зарегистрировано", count(s.registered), `Активных за период: ${count(s.active)}`, "◉"],
-      ["Сделали больше /start", count(s.nonstart), "Любое другое действие, включая /help", "↗"],
+      ["Зарегистрировано", count(s.registered), `К концу периода · активных: ${count(s.active)}`, "◉"],
+      ["Сделали больше /start", count(s.nonstart), "За период: любое действие, включая /help", "↗"],
       ["Пользователи с загрузками", count(s.converters), "Хотя бы одна отправленная ссылка", "♧"],
       ["Загрузки", count(s.conversions), `Получено данных: ${bytes(s.bytes)}`, "↓"],
       ["Успешное завершение", success, `Ошибок: ${count(s.failed)} · отмен: ${count(s.cancelled)}`, "✓"],
@@ -230,7 +250,7 @@
     const fragment = document.createDocumentFragment();
     for (const entry of platforms) {
       const row = el("div", "platform-row");
-      const name = translated(entry.platform);
+      const name = entry.platform ? translated(entry.platform) : "Не указано";
       const detail = el("div", "platform-detail");
       const track = el("div", "platform-track");
       const fill = el("div", "platform-fill");
@@ -251,7 +271,7 @@
       const values = options[key].map((entry) => typeof entry === "object" && entry ? entry.value || entry.id : entry).filter((value) => value != null && value !== "");
       if (selected && !values.includes(selected)) values.push(selected);
       select.replaceChildren(first);
-      for (const value of values) { const option = el("option", "", translated(value)); option.value = value; select.append(option); }
+      for (const value of values) { const option = el("option", "", key === "actions" ? actionLabel(value) : translated(value)); option.value = value; select.append(option); }
       select.value = selected;
     }
   }
@@ -284,7 +304,7 @@
     for (const item of rows) {
       const row = el("tr");
       if (users) row.append(userCell(item), cell(date(item.registration_date)), cell(count(item.conversions), "cell-primary"), cell(count(item.done)), cell(count(item.failed)), cell(count(item.cancelled)), cell(count(item.events)), cell(date(item.last_activity)));
-      else row.append(cell(date(item.created_at)), userCell(item), cell(translated(item.action || item.kind), "cell-primary"), cell(translated(item.platform)), cell(translated(item.media_type)), statusCell(item.outcome), cell(bytes(item.file_size)), cell(item.duration_ms == null ? "—" : `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(num(item.duration_ms) / 1000)} с`));
+      else row.append(cell(date(item.created_at)), userCell(item), cell(actionLabel(item.action || item.kind), "cell-primary"), cell(item.platform ? translated(item.platform) : "Не указано"), cell(translated(item.media_type)), statusCell(item.outcome), cell(bytes(item.file_size)), cell(item.duration_ms == null ? "—" : `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(num(item.duration_ms) / 1000)} с`));
       fragment.append(row);
     }
     $("table-body").replaceChildren(fragment);

@@ -105,6 +105,31 @@ INSERT INTO upload_samples VALUES ('2026-10-19','youtube',false,100,2,1);
         self.assertEqual(result["series"][0]["service_events"], 1)
         self.assertEqual((await self.snapshot(exclude_owner=False))["summary"]["nonstart"], 3)
 
+    async def test_legacy_actors_without_registration_are_not_lost(self):
+        await self.conn.execute("""
+INSERT INTO conversions VALUES (5,6,'2026-10-19','done','youtube','photo',200,1);
+INSERT INTO user_events VALUES
+ (4,7,'2026-10-19','message:text','ok',10),
+ (5,8,'2026-10-19','system:startup','ok',NULL);
+""")
+        result = await self.snapshot()
+        summary = result["summary"]
+        self.assertEqual(summary["registered"], 4)
+        self.assertEqual(summary["nonstart"], 4)
+        self.assertEqual(summary["converters"], 2)
+        self.assertEqual(summary["active"], 5)
+        self.assertEqual(result["pagination"]["users_total"], 6)
+        orphan = next(row for row in result["users"] if row["telegram_id"] == 6)
+        self.assertIsNone(orphan["username"])
+        self.assertIsNone(orphan["registration_date"])
+        self.assertEqual(orphan["conversions"], 1)
+        self.assertFalse(any(row["telegram_id"] == 8 for row in result["users"]))
+        self.assertEqual(summary["service_events"], 2)
+        by_id = await self.snapshot(q="6")
+        self.assertEqual(by_id["summary"]["registered"], 0)
+        self.assertEqual(by_id["summary"]["converters"], 1)
+        self.assertEqual(by_id["users"][0]["telegram_id"], 6)
+
     async def test_filters_are_literal_and_do_not_mix_unattributed_events(self):
         result = await self.snapshot(platform="youtube", media_type="photo")
         self.assertEqual(result["summary"]["conversions"], 1)
