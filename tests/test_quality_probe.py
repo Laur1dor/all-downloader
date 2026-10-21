@@ -37,7 +37,7 @@ class QualityProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("размер неизвестен", options[3].label)
         self.assertEqual([option.height for option in options], [1080, 720, 480, 360, 240])
 
-    def test_slow_size_probe_keeps_source_heights_and_metadata_estimates(self) -> None:
+    def test_slow_size_probe_keeps_source_heights_without_peak_hls_size(self) -> None:
         release = threading.Event()
         info = {"duration": 10, "formats": [
             {"height": 720, "format_id": "hls", "protocol": "m3u8_native",
@@ -58,10 +58,38 @@ class QualityProbeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 options = downloader._probe_quality_options_sync("https://youtu.be/test", {})
                 self.assertEqual([option.height for option in options], [720, 480])
-                self.assertEqual(options[0].estimated_size, 1_000_000)
+                self.assertIsNone(options[0].estimated_size)
                 self.assertIsNone(options[1].estimated_size)
             finally:
                 release.set()
+
+    def test_missing_hls_measurement_does_not_reject_small_stream_by_peak(self) -> None:
+        info = {"duration": 1200, "formats": [
+            {"height": 360, "format_id": "hls", "protocol": "m3u8_native",
+             "tbr": 2560, "filesize_approx": 400_000_000,
+             "url": "https://media.example/360.m3u8", "acodec": "aac"},
+        ]}
+        with (
+            patch.object(downloader, "_extract_info", return_value=info),
+            patch.object(downloader, "_hls_size", return_value=None),
+        ):
+            options = downloader._probe_quality_options_sync("https://youtu.be/test", {})
+        self.assertEqual(options[0].height, 360)
+        self.assertIsNone(options[0].estimated_size)
+        self.assertIn("размер неизвестен", options[0].label)
+
+    def test_hls_measurement_and_explicit_exact_size_remain_available(self) -> None:
+        info = {"duration": 1200, "formats": [
+            {"height": 360, "format_id": "hls", "protocol": "m3u8_native",
+             "filesize": 45_000_000, "filesize_approx": 400_000_000,
+             "url": "https://media.example/360.m3u8", "acodec": "aac"},
+        ]}
+        for measured, expected in ((None, 45_000_000), (35_000_000, 35_000_000)):
+            with self.subTest(measured=measured), patch.object(
+                downloader, "_extract_info", return_value=info,
+            ), patch.object(downloader, "_hls_size", return_value=measured):
+                options = downloader._probe_quality_options_sync("https://youtu.be/test", {})
+            self.assertEqual(options[0].estimated_size, expected)
 
     def test_optional_size_failure_keeps_all_heights(self) -> None:
         info = {"formats": [

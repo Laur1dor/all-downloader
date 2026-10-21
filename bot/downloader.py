@@ -1077,14 +1077,16 @@ def _probe_quality_options_sync(
 
     def size_of(height: int) -> int | None:
         fmt = best_per_height[height]
-        size = _format_size(fmt, duration)
+        is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
+        # Manifest bandwidth is a peak, not a file size. An unfinished CDN
+        # measurement must not lock a small stream behind a fictitious limit.
+        size = fmt.get("filesize") if is_hls else _format_size(fmt, duration)
         if platform == "rule34video":
             # The menu is known from the page. CDN size requests can stall long
             # enough to discard every discovered resolution at the outer timeout.
             return size
         if time.monotonic() >= deadline:
             return size
-        is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
         if is_hls and fmt.get("url"):
             # For HLS the bitrate-derived estimate above is not just imprecise,
             # it is wrong by an order of magnitude on some sites — always prefer
@@ -1106,10 +1108,10 @@ def _probe_quality_options_sync(
     futures = {}
     for height in heights:
         fmt = best_per_height[height]
-        size = _format_size(fmt, duration)
+        is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
+        size = fmt.get("filesize") if is_hls else _format_size(fmt, duration)
         muxed = fmt.get("acodec") not in (None, "none")
         sizes[height] = None if size is None else size + (0 if muxed else audio_size)
-        is_hls = ".m3u8" in str(fmt.get("url") or "") or "m3u8" in str(fmt.get("protocol") or "")
         if platform != "rule34video" and fmt.get("url") and (size is None or is_hls):
             futures[_QUALITY_SIZE_POOL.submit(size_of, height)] = height
     if futures:
