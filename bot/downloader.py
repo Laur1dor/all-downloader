@@ -616,7 +616,11 @@ def _base_options(cookies_file: Path | None, url: str = "", force_proxy: bool = 
             options["impersonate"] = target
     if any(host == h or host.endswith("." + h) for h in _NOCHECKCERT_HOSTS):
         options["nocheckcertificate"] = True
-    _plat = detect_platform(url) if url else ""
+    # Yandex Music resolves to a YouTube search rather than an HTTP URL.
+    # Its search result and media must keep the configured YouTube route.
+    _plat = "youtube" if re.match(r"^ytsearch\d*:", url) else (
+        detect_platform(url) if url else ""
+    )
     proxy = forced_proxy(_plat) if force_proxy else (proxy_for(_plat) if url else None)
     if proxy:
         options["proxy"] = proxy
