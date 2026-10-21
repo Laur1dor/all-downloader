@@ -61,6 +61,7 @@ SOCKS_PORT = int(os.getenv("XRAY_SOCKS_PORT", "2080"))
 HTTP_PORT = int(os.getenv("XRAY_HTTP_PORT", "2081"))
 TELEGRAM_NODE_FILE = "/app/data/telegram_node.txt"
 TELEGRAM_SOCKS_PORT = 2069
+YOUTUBE_SPLIT_SOCKS_PORT = 2068
 PROBE_URL = os.getenv("XRAY_PROBE_URL", "https://www.google.com/generate_204")
 
 # Free public pool (e.g. AvenCores/goida-vpn-configs). Exposed on its own SOCKS
@@ -683,7 +684,7 @@ def build_config(
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"},
     ]
-    if WARP_FALLBACK:
+    if WARP_FALLBACK or telegram_outbound is not None:
         outbounds.append({
             "tag": "warp-fallback",
             "protocol": "socks",
@@ -776,6 +777,23 @@ def build_config(
             "type": "field", "inboundTag": ["telegram-socks"],
             "outboundTag": "telegram-pinned",
         })
+        inbounds.append({
+            "tag": "youtube-split-socks", "listen": "0.0.0.0",
+            "port": YOUTUBE_SPLIT_SOCKS_PORT, "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        })
+        # Keep metadata on WARP; only the media CDN uses the verified pin.
+        # Both rules must precede per-service domain pins and pool balancers.
+        pinned_rules[1:1] = [
+            {
+                "type": "field", "inboundTag": ["youtube-split-socks"],
+                "domain": ["domain:googlevideo.com"], "outboundTag": "telegram-pinned",
+            },
+            {
+                "type": "field", "inboundTag": ["youtube-split-socks"],
+                "outboundTag": "warp-fallback",
+            },
+        ]
 
     # Free goida pool on its own inbound. leastLoad over a burst-health-checked
     # set rotates among the *live* nodes (random over all would keep hitting dead

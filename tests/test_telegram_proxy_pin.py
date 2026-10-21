@@ -69,7 +69,7 @@ class TelegramProxyPinTests(unittest.TestCase):
                      patch.object(bc, "_pinned_services", return_value={}), \
                      redirect_stderr(io.StringIO()) as errors:
                     config = bc.build_config([MAIN])
-                self.assertFalse(any(i["port"] == 2069 for i in config["inbounds"]))
+                self.assertFalse(any(i["port"] in (2068, 2069) for i in config["inbounds"]))
                 self.assertFalse(any(o["tag"] == "telegram-pinned" for o in config["outbounds"]))
                 self.assertEqual(errors.getvalue(),
                                  "WARN: invalid private Telegram node; pin disabled\n")
@@ -79,6 +79,50 @@ class TelegramProxyPinTests(unittest.TestCase):
                  redirect_stderr(io.StringIO()) as errors:
                 self.assertIsNone(bc._telegram_pinned_outbound())
             self.assertNotIn("TOPSECRET", errors.getvalue())
+
+    def test_youtube_split_routes_only_cdn_to_pin_before_service_overrides(self) -> None:
+        with patch.object(bc, "_telegram_pinned_outbound",
+                          return_value=bc.link_to_outbound(PIN, "telegram-pinned")), \
+             patch.object(bc, "WARP_FALLBACK", True), \
+             patch.object(bc, "collect_tiktok_links", return_value=[OTHER] * 8), \
+             patch.object(bc, "_pinned_services", return_value={"youtube": MAIN}):
+            config = bc.build_config([MAIN])
+        inbound = next(i for i in config["inbounds"] if i["tag"] == "youtube-split-socks")
+        self.assertEqual(inbound["port"], 2068)
+        ports = [i["port"] for i in config["inbounds"]]
+        self.assertEqual(len(ports), len(set(ports)))
+
+        def route(inbound_tag: str, host: str) -> str | None:
+            for rule in config["routing"]["rules"]:
+                if "inboundTag" in rule and inbound_tag not in rule["inboundTag"]:
+                    continue
+                if "domain" in rule and not any(
+                    host == domain.removeprefix("domain:")
+                    or host.endswith("." + domain.removeprefix("domain:"))
+                    for domain in rule["domain"]
+                ):
+                    continue
+                return rule.get("outboundTag")
+            return None
+
+        for host in ("googlevideo.com", "rr1.example.googlevideo.com"):
+            self.assertEqual(route("youtube-split-socks", host), "telegram-pinned")
+        for host in ("www.youtube.com", "youtubei.googleapis.com", "i.ytimg.com",
+                     "googlevideo.com.attacker.example", "notgooglevideo.com"):
+            self.assertEqual(route("youtube-split-socks", host), "warp-fallback")
+        self.assertEqual(route("telegram-socks", "www.youtube.com"), "telegram-pinned")
+        self.assertIsNone(route("socks", "rr1.example.googlevideo.com"))
+
+    def test_youtube_split_warp_route_exists_without_balancer_fallback_enabled(self) -> None:
+        with patch.object(bc, "_telegram_pinned_outbound",
+                          return_value=bc.link_to_outbound(PIN, "telegram-pinned")), \
+             patch.object(bc, "WARP_FALLBACK", False), \
+             patch.object(bc, "collect_tiktok_links", return_value=[]), \
+             patch.object(bc, "_pinned_services", return_value={}):
+            config = bc.build_config([MAIN])
+        warp = next(o for o in config["outbounds"] if o["tag"] == "warp-fallback")
+        self.assertEqual(warp["settings"]["servers"], [{"address": "warp", "port": 1080}])
+        self.assertTrue(all("fallbackTag" not in b for b in config["routing"]["balancers"]))
 
 
 if __name__ == "__main__":

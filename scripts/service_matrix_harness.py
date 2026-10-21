@@ -39,6 +39,14 @@ from bot.urlcache import UrlCache
 from bot.telegram_outbound import OutgoingLimiter
 
 
+def _choose_offered_height(offered: list[int], target: int) -> int | None:
+    """Choose a real menu option without overriding the handler's size checks."""
+    heights = sorted({height for height in offered if height > 0})
+    if not heights:
+        return None
+    return max((height for height in heights if height <= target), default=heights[0])
+
+
 def _probe_local_video(file: FSInputFile) -> dict:
     """Inspect the exact file passed to Telegram while it still exists."""
     path = Path(file.path)
@@ -93,6 +101,8 @@ class _Trace(BaseRequestMiddleware):
         self.platform = platform
         self.events: list[dict] = []
         self.file_callback_data: str | None = None
+        self.quality_offers: dict[str, list[int]] = {}
+        self.quality_selections: list[dict] = []
 
     async def __call__(self, make_request, bot, method):
         name = method.__api_method__
@@ -110,6 +120,12 @@ class _Trace(BaseRequestMiddleware):
                 for button in row:
                     if (button.callback_data or "").startswith("ttfile:"):
                         self.file_callback_data = button.callback_data
+                    if (button.callback_data or "").startswith(download_handler._QUALITY_PREFIX):
+                        token, _, height = button.callback_data.removeprefix(
+                            download_handler._QUALITY_PREFIX,
+                        ).partition(":")
+                        if height.isdigit() and int(height) > 0:
+                            self.quality_offers.setdefault(token, []).append(int(height))
         if name in {"sendVideo", "sendDocument"}:
             upload = getattr(method, "video" if name == "sendVideo" else "document", None)
             if isinstance(upload, FSInputFile):
@@ -264,9 +280,18 @@ async def _run(
             # Select through the handler's real quality menu, leaving its
             # estimated-size and disk-limit checks in place.
             while True:
-                for event, state in tuple(download_handler._pending_choices.values()):
+                for token, (event, state) in tuple(download_handler._pending_choices.items()):
                     if "height" in state and not event.is_set():
-                        state["height"] = quality_height
+                        offered = trace.quality_offers.get(token, [])
+                        selected = _choose_offered_height(offered, quality_height)
+                        if selected is None:
+                            continue  # Wait until this token's actual menu is available.
+                        state["height"] = selected
+                        trace.quality_selections.append({
+                            "requested": quality_height,
+                            "offered": sorted(set(offered)),
+                            "selected": selected,
+                        })
                         event.set()
                         return
                 await asyncio.sleep(0.1)
@@ -346,6 +371,7 @@ async def _run(
             "tested_at": datetime.now(timezone.utc).isoformat(),
             "url": url, "platform": platform,
             "quality_height": quality_height,
+            "quality_selections": trace.quality_selections,
             "elapsed_s": round(time.monotonic() - started, 2),
             "error": errors[0], "concurrent_url": concurrent_url,
             "concurrent_error": errors[1] if len(errors) > 1 else None,
