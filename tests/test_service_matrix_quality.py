@@ -36,5 +36,23 @@ class MatrixQualityMenuTests(unittest.IsolatedAsyncioTestCase):
         )
         await trace(AsyncMock(return_value=SimpleNamespace(message_id=1)), None, method)
         self.assertEqual(trace.quality_offers, {"one": [720, 1080], "two": [360]})
-        # The harness selects a real locked option; the handler still rejects its size.
-        self.assertEqual(_choose_offered_height(trace.quality_offers["one"], 480), 720)
+        self.assertEqual(trace.quality_locked, {"one": {720}})
+        self.assertEqual(_choose_offered_height(trace.quality_candidates("one"), 480), 1080)
+
+    async def test_locked_requested_quality_prefers_lower_unlocked_option(self):
+        trace = _Trace(time.monotonic(), "pornhub")
+        method = SimpleNamespace(
+            __api_method__="editMessageText", text="quality menu",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="480p 🔒", callback_data="qh:one:480")],
+                [InlineKeyboardButton(text="240p", callback_data="qh:one:240")],
+            ]),
+        )
+        await trace(AsyncMock(return_value=SimpleNamespace(message_id=1)), None, method)
+        self.assertEqual(_choose_offered_height(trace.quality_candidates("one"), 480), 240)
+
+    def test_all_locked_keeps_actual_options_for_real_handler_rejection(self):
+        trace = _Trace(time.monotonic(), "pornhub")
+        trace.quality_offers["one"] = [720, 480]
+        trace.quality_locked["one"] = {720, 480}
+        self.assertEqual(_choose_offered_height(trace.quality_candidates("one"), 480), 480)

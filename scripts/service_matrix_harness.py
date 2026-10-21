@@ -102,7 +102,13 @@ class _Trace(BaseRequestMiddleware):
         self.events: list[dict] = []
         self.file_callback_data: str | None = None
         self.quality_offers: dict[str, list[int]] = {}
+        self.quality_locked: dict[str, set[int]] = {}
         self.quality_selections: list[dict] = []
+
+    def quality_candidates(self, token: str) -> list[int]:
+        offered = self.quality_offers.get(token, [])
+        locked = self.quality_locked.get(token, set())
+        return [height for height in offered if height not in locked] or offered
 
     async def __call__(self, make_request, bot, method):
         name = method.__api_method__
@@ -126,6 +132,8 @@ class _Trace(BaseRequestMiddleware):
                         ).partition(":")
                         if height.isdigit() and int(height) > 0:
                             self.quality_offers.setdefault(token, []).append(int(height))
+                            if "🔒" in button.text:
+                                self.quality_locked.setdefault(token, set()).add(int(height))
         if name in {"sendVideo", "sendDocument"}:
             upload = getattr(method, "video" if name == "sendVideo" else "document", None)
             if isinstance(upload, FSInputFile):
@@ -283,13 +291,16 @@ async def _run(
                 for token, (event, state) in tuple(download_handler._pending_choices.items()):
                     if "height" in state and not event.is_set():
                         offered = trace.quality_offers.get(token, [])
-                        selected = _choose_offered_height(offered, quality_height)
+                        selected = _choose_offered_height(
+                            trace.quality_candidates(token), quality_height,
+                        )
                         if selected is None:
                             continue  # Wait until this token's actual menu is available.
                         state["height"] = selected
                         trace.quality_selections.append({
                             "requested": quality_height,
                             "offered": sorted(set(offered)),
+                            "locked": sorted(trace.quality_locked.get(token, set())),
                             "selected": selected,
                         })
                         event.set()
