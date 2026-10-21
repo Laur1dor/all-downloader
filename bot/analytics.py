@@ -29,7 +29,7 @@ _CONVERSIONS_SQL = """
 SELECT coalesce(source_platform, 'other') AS platform, status,
        count(*) AS total,
        round(avg(processing_time)::numeric, 1) AS avg_seconds,
-       coalesce(sum(file_size), 0) AS bytes
+       coalesce(sum(file_size) FILTER (WHERE status = 'done'), 0) AS bytes
 FROM conversions
 WHERE created_at >= now() - ($1::int * interval '1 hour')
 GROUP BY 1, 2 ORDER BY total DESC
@@ -89,13 +89,14 @@ async def summary(db: Database, period: str = "24h") -> str:
     done = sum(row["total"] for row in conversions if row["status"] == "done")
     failed = sum(row["total"] for row in conversions if row["status"] == "failed")
     cancelled = sum(row["total"] for row in conversions if row["status"] == "cancelled")
+    unknown = sum(row["total"] for row in conversions if row["status"] == "delivery_unknown")
     lines = [
         f"📊 <b>Аналитика за {period}</b>",
         (f"👥 Активных: <b>{audience['active_users']}</b> · новых: "
          f"<b>{audience['new_users']}</b> · вернувшихся: "
          f"<b>{audience['returning_users']}</b>"),
         (f"🎬 Загрузок: <b>{done}</b> успешных · {failed} ошибок · "
-         f"{cancelled} отмен · "
+         f"{cancelled} отмен · {unknown} доставок не подтверждено · "
          f"{_number(sum(row['bytes'] for row in conversions) / 1048576, 1)} МБ"),
         "\n<b>Сервисы</b>",
     ]

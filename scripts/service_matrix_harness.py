@@ -36,6 +36,7 @@ from bot.progress import CancelRegistry
 from bot.proxy import configure_router
 from bot.runtime import config
 from bot.urlcache import UrlCache
+from bot.telegram_outbound import OutgoingLimiter
 
 
 def _probe_local_video(file: FSInputFile) -> dict:
@@ -125,6 +126,10 @@ class _Trace(BaseRequestMiddleware):
                     _probe_local_video, video,
                 )
         began = time.monotonic()
+        if name in {"sendVideo", "sendDocument", "sendAudio", "sendMediaGroup", "sendPhoto", "sendLivePhoto"}:
+            print(json.dumps({"stage": "media_request", "api": name,
+                              "at_s": event["at_s"], "bytes": event.get("upload_bytes")}),
+                  flush=True)
         try:
             result = await make_request(bot, method)
         except Exception as exc:
@@ -186,6 +191,7 @@ async def _run(
     session = AiohttpSession(
         timeout=90, api=TelegramAPIServer.from_base(settings.api_base_url),
     )
+    session.middleware(OutgoingLimiter())
     trace = _Trace(started, platform)
     session.middleware(trace)
     bot = Bot(
@@ -332,8 +338,9 @@ async def _run(
             )
         rows = await db.pool.fetch(
             "SELECT status, source_platform, media_type, file_size, processing_time "
-            "FROM conversions WHERE telegram_id=$1 AND id>$2 ORDER BY id",
-            settings.admin_id, before,
+            "FROM conversions WHERE telegram_id=$1 AND id>$2 "
+            "AND source_platform=$3 ORDER BY id",
+            settings.admin_id, before, platform,
         )
         return {
             "tested_at": datetime.now(timezone.utc).isoformat(),

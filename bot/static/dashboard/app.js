@@ -19,7 +19,7 @@
     bot_start: "Запуск бота", bot_restart: "Перезапуск бота", service_start: "Запуск сервиса", service_stop: "Остановка сервиса",
     description: "Описание", file: "Получить файл", quality: "Выбор качества", timing: "Выбор интервала",
     command: "Команда", callback: "Нажатие кнопки", message: "Сообщение", shutdown: "Остановка", upload: "Отправка",
-    unknown: "Не указано",
+    unknown: "Не указано", delivery_unknown: "Доставка не подтверждена",
   };
   const callbackLabels = {
     desc: "Описание", ttfile: "Исходный файл TikTok", qh: "Выбор качества", ytv: "Видео YouTube", yta: "Аудио YouTube",
@@ -195,14 +195,14 @@
     renderTable();
   }
   function renderKpis(s) {
-    const attempts = num(s.done) + num(s.failed) + num(s.cancelled);
+    const attempts = num(s.done) + num(s.failed) + num(s.cancelled) + num(s.delivery_unknown);
     const success = attempts ? `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(num(s.done) / attempts * 100)}%` : "—";
     const cards = [
       ["Зарегистрировано", count(s.registered), `К концу периода · активных: ${count(s.active)}`, "◉"],
       ["Сделали больше /start", count(s.nonstart), "За период: любое действие, включая /help", "↗"],
       ["Пользователи с загрузками", count(s.converters), "Хотя бы одна отправленная ссылка", "♧"],
       ["Загрузки", count(s.conversions), `Получено данных: ${bytes(s.bytes)}`, "↓"],
-      ["Успешное завершение", success, `Ошибок: ${count(s.failed)} · отмен: ${count(s.cancelled)}`, "✓"],
+      ["Успешное завершение", success, `Ошибок: ${count(s.failed)} · отмен: ${count(s.cancelled)} · без подтверждения: ${count(s.delivery_unknown)}`, "✓"],
       ["События", count(s.events), "Действия и события сервиса за период", "≋"],
     ];
     const fragment = document.createDocumentFragment();

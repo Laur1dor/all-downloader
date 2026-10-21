@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 _progress_call: ContextVar[bool] = ContextVar("telegram_progress_call", default=False)
 _bulk_call: ContextVar[bool] = ContextVar("telegram_bulk_call", default=False)
 _MEDIA_METHODS = frozenset({
-    "sendAnimation", "sendAudio", "sendDocument", "sendMediaGroup",
+    "sendAnimation", "sendAudio", "sendDocument", "sendMediaGroup", "sendLivePhoto",
     "sendPhoto", "sendVideo", "sendVideoNote", "sendVoice",
 })
 _READ_METHODS = frozenset({"getUpdates", "getFile", "getMe"})

@@ -24,6 +24,7 @@ _REPORT_TZ = timezone(timedelta(hours=float(os.getenv("REPORT_UTC_OFFSET", "3"))
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+STATUS_DELIVERY_UNKNOWN = "delivery_unknown"
 
 
 def hash_url(url: str) -> str:
@@ -136,7 +137,8 @@ SELECT
     count(c.id) AS total_conversions,
     count(c.id) FILTER (WHERE c.status = 'done') AS done,
     count(c.id) FILTER (WHERE c.status = 'failed') AS failed,
-    max(c.created_at) AS last_conversion_at
+    max(c.created_at) AS last_conversion_at,
+    count(c.id) FILTER (WHERE c.status = 'delivery_unknown') AS delivery_unknown
 FROM users AS u
 LEFT JOIN conversions AS c ON c.telegram_id = u.telegram_id
 GROUP BY u.id;
@@ -151,6 +153,7 @@ class SummaryStats:
     done: int
     failed: int
     conversions_24h: int
+    delivery_unknown: int = 0
 
 
 class Database:
@@ -380,8 +383,9 @@ class Database:
                    count(*) FILTER (WHERE status = 'done') AS done,
                    count(*) FILTER (WHERE status = 'failed') AS failed,
                    count(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+                   count(*) FILTER (WHERE status = 'delivery_unknown') AS delivery_unknown,
                    count(DISTINCT telegram_id) AS users,
-                   coalesce(sum(file_size), 0) AS bytes,
+                   coalesce(sum(file_size) FILTER (WHERE status = 'done'), 0) AS bytes,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY processing_time)
                        AS median_seconds,
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY processing_time)
@@ -392,7 +396,7 @@ class Database:
             SELECT coalesce(source_platform, '?') AS platform,
                    count(*) AS total,
                    count(*) FILTER (WHERE status = 'done') AS done,
-                   coalesce(sum(file_size), 0) AS bytes,
+                   coalesce(sum(file_size) FILTER (WHERE status = 'done'), 0) AS bytes,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY processing_time)
                        AS median_seconds
             FROM conversions {window}
@@ -437,6 +441,7 @@ class Database:
                 count(*) AS total_conversions,
                 count(*) FILTER (WHERE status = 'done') AS done,
                 count(*) FILTER (WHERE status = 'failed') AS failed,
+                count(*) FILTER (WHERE status = 'delivery_unknown') AS delivery_unknown,
                 count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS conversions_24h
             FROM conversions
             """
@@ -482,7 +487,7 @@ h1{{font-size:20px}}
 table{{border-collapse:collapse;font-size:13px;white-space:nowrap;width:100%}}
 th,td{{padding:5px 8px;border-bottom:1px solid #e3e3e3;text-align:left}}
 th{{background:#f0f0f0;position:sticky;top:0}}
-.n{{text-align:right}}.ok{{color:#188038}}.fail{{color:#d93025}}.cancel{{color:#e8710a}}
+.n{{text-align:right}}.ok{{color:#188038}}.fail{{color:#d93025}}.cancel{{color:#e8710a}}.unknown{{color:#8a6800}}
 </style></head><body>
 <h1>{title}</h1>
 <div class=wrap><table>
@@ -504,12 +509,13 @@ th{{background:#f0f0f0;position:sticky;top:0}}
             f"<td>{Database._local(row['registration_date']):%d.%m.%y %H:%M}</td>"
             f"<td class=n>{row['total_conversions']}</td>"
             f"<td class='n ok'>{row['done']}</td><td class='n fail'>{row['failed']}</td>"
+            f"<td class='n unknown'>{row['delivery_unknown']}</td>"
             f"<td>{last_seen(row)}</td></tr>"
             for row in rows
         )
         header = (
             "<th>Тег (ID)</th><th>Рег.</th>"
-            "<th>Всего</th><th>✅</th><th>❌</th><th>Последняя</th>"
+            "<th>Всего</th><th>✅</th><th>❌</th><th>Не подтверждено</th><th>Последняя</th>"
         )
         return self._html_page(f"👥 Пользователи ({len(rows)})", header, body)
 
@@ -523,7 +529,11 @@ th{{background:#f0f0f0;position:sticky;top:0}}
             ORDER BY c.created_at DESC, c.id DESC
             """
         )
-        status_class = {"done": "ok", "failed": "fail", "cancelled": "cancel"}
+        status_class = {
+            "done": "ok", "failed": "fail", "cancelled": "cancel",
+            "delivery_unknown": "unknown",
+        }
+        status_labels = {"delivery_unknown": "Доставка не подтверждена"}
 
         def mb(row: asyncpg.Record) -> str:
             return f"{row['file_size'] / 1048576:.1f}" if row["file_size"] else "—"
@@ -535,7 +545,8 @@ th{{background:#f0f0f0;position:sticky;top:0}}
             f"<tr><td>{row['id']}</td>"
             f"<td>{self._user_link(row['telegram_id'], row['username'])}</td>"
             f"<td>{Database._local(row['created_at']):%d.%m.%y %H:%M}</td>"
-            f"<td class={status_class.get(row['status'], '')}>{html.escape(row['status'])}</td>"
+            f"<td class={status_class.get(row['status'], '')}>"
+            f"{html.escape(status_labels.get(row['status'], row['status']))}</td>"
             f"<td>{row['source_platform'] or '—'}</td><td>{row['media_type'] or '—'}</td>"
             f"<td class=n>{mb(row)}</td><td class=n>{sec(row)}</td></tr>"
             for row in rows

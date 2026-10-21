@@ -133,6 +133,8 @@ WITH actors AS (
  count(*) FILTER (WHERE a.kind = 'conversion' AND a.outcome = 'done') AS done,
  count(*) FILTER (WHERE a.kind = 'conversion' AND a.outcome = 'failed') AS failed,
  count(*) FILTER (WHERE a.kind = 'conversion' AND a.outcome = 'cancelled') AS cancelled,
+ count(*) FILTER (WHERE a.kind = 'conversion' AND a.outcome = 'delivery_unknown')
+ AS delivery_unknown,
  max(a.created_at) AS last_activity
  FROM population p LEFT JOIN activity a USING (telegram_id)
  GROUP BY p.telegram_id, p.username, p.registration_date
@@ -181,6 +183,7 @@ SELECT (SELECT count(*) FROM population WHERE registration_date < $2) AS registe
  (SELECT count(*) FROM c WHERE status = 'done') AS done,
  (SELECT count(*) FROM c WHERE status = 'failed') AS failed,
  (SELECT count(*) FROM c WHERE status = 'cancelled') AS cancelled,
+ (SELECT count(*) FROM c WHERE status = 'delivery_unknown') AS delivery_unknown,
  (SELECT coalesce(sum(file_size),0) FROM c WHERE status = 'done') AS bytes,
  (SELECT count(*) FROM e) AS events,
  (SELECT count(*) FROM services) AS service_events,
@@ -199,6 +202,7 @@ SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
  count(*) FILTER (WHERE kind='conversion' AND outcome='done') AS done,
  count(*) FILTER (WHERE kind='conversion' AND outcome='failed') AS failed,
  count(*) FILTER (WHERE kind='conversion' AND outcome='cancelled') AS cancelled,
+ count(*) FILTER (WHERE kind='conversion' AND outcome='delivery_unknown') AS delivery_unknown,
  count(*) FILTER (WHERE kind='event') AS events,
  count(*) FILTER (WHERE kind='service') AS service_events
 FROM activity GROUP BY day ORDER BY day
@@ -212,6 +216,7 @@ FROM activity GROUP BY day ORDER BY day
 SELECT coalesce(source_platform,'unknown') AS platform, count(*) AS total,
  count(*) FILTER (WHERE status='done') AS done,
  count(*) FILTER (WHERE status='failed') AS failed,
+ count(*) FILTER (WHERE status='delivery_unknown') AS delivery_unknown,
  coalesce(sum(file_size) FILTER (WHERE status='done'),0) AS bytes
 FROM c GROUP BY source_platform ORDER BY total DESC, platform
 """,

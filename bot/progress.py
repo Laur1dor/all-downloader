@@ -100,7 +100,8 @@ def render_progress(progress: ProgressState, media_kind: str, tick: int = 0) -> 
             f" · часть {progress.part_index}/{progress.part_count}"
             if progress.part_count > 1 else ""
         )
-        return f"📤 Отправляю {media_kind}{part}…{size}\n{''.join(blocks)}"
+        elapsed = max(0, int(time.monotonic() - progress.started_at))
+        return f"📤 Отправляю {media_kind}{part}…{size} · {elapsed} с\n{''.join(blocks)}"
 
     total = progress.total
     speed = f" • {progress.speed / _MB:.1f} МБ/с" if progress.speed else ""

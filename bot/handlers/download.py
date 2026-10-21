@@ -22,11 +22,12 @@ from urllib.parse import urlparse
 import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.exceptions import (
+    TelegramAPIError,
     TelegramBadRequest,
     TelegramNetworkError,
     TelegramRetryAfter,
 )
-from aiogram.methods import TelegramMethod
+from aiogram.methods import SendLivePhoto, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -39,7 +40,14 @@ from aiogram.types import (
 )
 
 from bot.config import Settings
-from bot.db import STATUS_CANCELLED, STATUS_DONE, STATUS_FAILED, Database, hash_url
+from bot.db import (
+    STATUS_CANCELLED,
+    STATUS_DELIVERY_UNKNOWN,
+    STATUS_DONE,
+    STATUS_FAILED,
+    Database,
+    hash_url,
+)
 from bot.downloader import (
     PHOTO_CAPABLE_PLATFORMS,
     ConfirmedVideoError,
@@ -120,21 +128,26 @@ _TIKTOK_PHOTO_DOCUMENT_CACHE_KEY = "tiktok_photo_documents_v2"
 # How long interactive questions (compress? video-or-audio?) stay active.
 _COMPRESS_CHOICE_TIMEOUT = 10.0
 _MEDIA_CHOICE_TIMEOUT = 10.0
-# Upload timeout for large files; the local Bot API hop is local so this is generous.
-# Uploads are bounded by the file's own size rather than by one blanket number.
-# Measured on 16 Sep 2026: the far side of this route hangs up after almost
-# exactly 500s, three separate times, so any budget above that is never reached —
-# the upload dies on someone else's timer and we learn nothing from it. Staying
-# under that line keeps the deadline ours: it ends when we say so, with a message
-# we choose. The slope is deliberately generous — a megabyte every six seconds
-# against the 10-12 MB/s this path actually measures — so a healthy upload never
-# trips it, while a 0.5 MB TikTok clip stops waiting after a minute instead of
-# eight.
+# The local HTTP hop is not the Telegram upload. Once accepted, the local
+# Bot API can continue delivering after the HTTP client disconnects. Keep a
+# bounded confirmation window instead of cancelling small files after 60s.
 _UPLOAD_KILL_SECONDS = 500
 _UPLOAD_FLOOR_SECONDS = 60
 _UPLOAD_SECONDS_PER_MB = 6
-# At 20 Mbit/s, 768 MiB takes ~322s, leaving room before the 480s
-# application deadline and the route's 500s kill.  The encoder targets 75%
+_LOCAL_CONFIRM_SECONDS = 600
+_OUTBOUND_QUEUE_SECONDS = 125
+_DELIVERY_UNKNOWN_TEXT = (
+    "⏳ Telegram пока не подтвердил отправку. Файл может прийти позже. "
+    "Не отправляйте ссылку повторно, чтобы не получить дубликат."
+)
+
+
+class DeliveryUnknownError(RuntimeError):
+    """Telegram may have accepted the media, but its response was lost."""
+
+
+# At 20 Mbit/s, 768 MiB takes ~322s, leaving room in the bounded
+# Telegram confirmation window.  The encoder targets 75%
 # of this limit, so a six-GiB source still fits at most eight parts.
 _UPLOAD_PART_BYTES = 768 * 1024**2
 
@@ -293,11 +306,9 @@ async def _admitted_media(
 # would otherwise halve each other's speed and double the time both spend
 # exposed to a route that drops connections.
 #
-# Raised from two small places to three, and the boundary from 32 to 64 MB. 64
-# is where the per-file deadline still has room: it budgets 60s + 6s/MB and caps
-# at 480s, so a 64 MB file gets 444s of its own while anything past ~70 MB is on
-# the cap and has stopped scaling — which is the honest line between "a clip"
-# and "a big file", rather than a round number.
+# Small clips have three places and large files one; both share the total
+# limit below. Keep an accepted request in its place until Telegram confirms
+# it, rather than freeing capacity while the backend still sends the file.
 _UPLOAD_LANE_BYTES = 64 * 1024 * 1024
 _UPLOAD_LANE_SMALL = 3
 _UPLOAD_LANE_LARGE = 1
@@ -361,8 +372,10 @@ class _UploadCapacity:
             # once" gets answered by the traffic that actually runs here, rather
             # than by a load test against the machine people are using.
             alongside = self._small + self._large + self._admin - 1
+        confirmed = False
         try:
             yield
+            confirmed = True
         finally:
             async with self._cond:
                 if is_admin:
@@ -379,15 +392,15 @@ class _UploadCapacity:
             waited = started_at - queued_at
             megabytes = (size_bytes or 0) / (1024 * 1024)
             logger.info(
-                "upload done: %.2f MB in %.1fs (%.2f MB/s), waited %.1fs, "
+                "upload %s: %.2f MB in %.1fs (%.2f MB/s), waited %.1fs, "
                 "alongside %d, lane=%s%s",
-                megabytes, elapsed,
+                "confirmed" if confirmed else "unconfirmed", megabytes, elapsed,
                 megabytes / elapsed if elapsed > 0.05 else 0.0,
                 waited, alongside,
                 "large" if large else "small",
                 ", admin" if is_admin else "",
             )
-            if db is not None:
+            if db is not None and confirmed:
                 # Kept out of the lock above, and never allowed to fail the
                 # upload it is describing.
                 await db.record_upload(
@@ -431,13 +444,23 @@ async def _send_paced(
 ) -> Any:
     """Keep the media upload deadline; the session admits and retries calls."""
     request = build()
+    deadline = timeout
     if isinstance(request, TelegramMethod) and request.bot is not None:
-        # Message.answer_* binds a method, but awaiting it uses the session's
-        # 90-second default. Pass the per-file deadline into aiogram itself.
-        return await asyncio.wait_for(
-            request.bot(request, request_timeout=timeout), timeout=timeout,
-        )
-    return await asyncio.wait_for(request, timeout=timeout)
+        server = request.bot.session.api
+        if not server.base.startswith("https://api.telegram.org/"):
+            deadline = max(timeout, _LOCAL_CONFIRM_SECONDS)
+        pending = request.bot(request, request_timeout=deadline)
+    else:
+        pending = request
+    try:
+        # Queue admission and flood waits must not eat the HTTP response budget.
+        return await asyncio.wait_for(pending, timeout=deadline + _OUTBOUND_QUEUE_SECONDS)
+    except TimeoutError as exc:
+        raise DeliveryUnknownError("Telegram response timed out") from exc
+    except TelegramNetworkError as exc:
+        if _never_reached_telegram(exc):
+            raise
+        raise DeliveryUnknownError("Telegram response was lost") from exc
 
 # Anti-spam: each non-admin user may have only one link download in flight.
 # A user who pastes more links while busy is warned once and then ignored.
@@ -816,6 +839,16 @@ async def _terminal_edit(message: Message, text: str) -> None:
             await asyncio.sleep(max(0, exc.retry_after))
 
 
+async def _notify_delivery_unknown(message: Message, *, edit: bool = True) -> None:
+    try:
+        if edit:
+            await _terminal_edit(message, _DELIVERY_UNKNOWN_TEXT)
+        else:
+            await message.answer(_DELIVERY_UNKNOWN_TEXT)
+    except (TelegramAPIError, TimeoutError):
+        logger.warning("Could not notify about an unconfirmed delivery", exc_info=True)
+
+
 async def _terminal_delete(message: Message) -> None:
     for attempt in range(2):
         try:
@@ -1188,6 +1221,7 @@ async def _run_link(
                         upload_paths = [media.path]
                     _release_source_after_split(media.path, upload_paths)
                     progress.phase = PHASE_UPLOAD
+                    progress.started_at = time.monotonic()
                     progress.downloaded = sum(path.stat().st_size for path in upload_paths)
                     progress.part_count = len(upload_paths)
                     sent = None
@@ -1233,6 +1267,8 @@ async def _run_link(
                         async with _upload_capacity.slot(
                             part_size, is_admin, db, platform
                         ):
+                            if cancel_event.is_set():
+                                raise DownloadCancelledError
                             sent = await _send_prepared_part(
                                 send_part, message.bot,
                                 _upload_timeout(part_size), upload_path,
@@ -1344,6 +1380,12 @@ async def _run_link(
             db, user_id, STATUS_FAILED, platform, "video", started,
             file_size=getattr(exc, "size_bytes", None),
         )
+    except DeliveryUnknownError:
+        logger.warning("Unconfirmed video delivery: platform=%s", platform)
+        await _stop_progress(progress_task)
+        await _notify_delivery_unknown(status_message)
+        await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, platform, "video",
+                      started, file_size)
     except TelegramNetworkError:
         logger.exception("Network error while sending video for %s", url)
         await _stop_progress(progress_task)
@@ -1772,12 +1814,12 @@ async def _deliver_album(
                         item = batch[0]
                         live_caption = _CAPTION if caption_left else None
                         await _send_paced(
-                            lambda item=item, caption=live_caption: message.bot.send_live_photo(
+                            lambda item=item, caption=live_caption: SendLivePhoto(
                                 chat_id=message.chat.id,
                                 message_thread_id=message.message_thread_id,
                                 live_photo=FSInputFile(item.motion), photo=FSInputFile(item.photo),
                                 caption=caption,
-                            ), _upload_timeout(batch_size),
+                            ).as_(message.bot), _upload_timeout(batch_size),
                         )
                         caption_left = False
                     elif isinstance(batch[0], InputMediaDocument):
@@ -1815,6 +1857,11 @@ async def _deliver_album(
                     album_status.sent += 1
             total_size = album.total_size
             description = album.description
+    except DeliveryUnknownError:
+        await _stop_progress(status_task)
+        await _notify_delivery_unknown(status_message)
+        await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, platform, "album", started)
+        return True
     except Exception:
         await _stop_progress(status_task)
         logger.info("Album delivery failed for %s", url, exc_info=True)
@@ -1937,6 +1984,11 @@ async def _send_cached_video(
                 caption=caption,
                 reply_markup=keyboard,
             ), 90)
+        except DeliveryUnknownError:
+            await _notify_delivery_unknown(message, edit=False)
+            await _record(db, message.from_user.id, STATUS_DELIVERY_UNKNOWN, platform,
+                          "video", time.monotonic(), cached["file_size"])
+            return True
         except TelegramBadRequest:
             # The file_id became invalid — drop it and download normally.
             await db.delete_cached_file(hash_url(url), cache_key)
@@ -1950,6 +2002,7 @@ async def _send_cached_video(
             message.from_user.id, STATUS_DONE, platform, "video",
             file_size=cached["file_size"], processing_time=0.0,
         )
+        mark_outcome(STATUS_DONE)
         return True
     return False
 
@@ -2148,6 +2201,11 @@ async def handle_tiktok_file_request(
                     if sent.document is None:
                         raise DownloadFailedError("Telegram не принял сохранённый файл.")
                     delivered += 1
+            except DeliveryUnknownError:
+                await _notify_delivery_unknown(callback.message, edit=False)
+                await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, "tiktok", "document",
+                              time.monotonic())
+                return
             except (TelegramBadRequest, DownloadFailedError):
                 await db.delete_cached_file(hash_url(url), cache_key)
                 if delivered:
@@ -2155,12 +2213,14 @@ async def handle_tiktok_file_request(
                         "⚠️ Один из сохранённых файлов недоступен. Отправьте ссылку ещё раз."
                     )
                     await db.add_conversion(user_id, STATUS_FAILED, "tiktok", "document")
+                    mark_outcome(STATUS_FAILED)
                     return
             else:
                 await db.add_conversion(user_id, STATUS_DONE, "tiktok", "document",
                                         file_size=sum(item["file_size"] or 0
                                                       for item in cached_items),
                                         processing_time=0.0)
+                mark_outcome(STATUS_DONE)
                 return
         original_path = None if photo_post else _tiktok_original_path(url)
         delay = _rate_delay(user_id) if not is_admin and original_path is None else 0
@@ -2276,6 +2336,10 @@ async def handle_tiktok_file_request(
         except DownloadFailedError as exc:
             await _safe_edit(status, f"⚠️ {exc}")
             await _record(db, user_id, STATUS_FAILED, "tiktok", "document", started)
+        except DeliveryUnknownError:
+            logger.warning("Unconfirmed TikTok document delivery")
+            await _notify_delivery_unknown(status)
+            await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, "tiktok", "document", started)
         except TelegramNetworkError:
             logger.exception("Network error while sending TikTok document for %s", url)
             await _safe_edit(status, "⚠️ Не удалось отправить файл. Попробуйте ещё раз.")
@@ -2302,7 +2366,14 @@ async def _run_audio_flow(
     cached = None if time_range is not None else await db.get_cached_file(hash_url(url), "audio")
     if cached is not None:
         try:
-            await message.answer_audio(cached["file_id"], caption=_CAPTION)
+            await _send_paced(
+                lambda: message.answer_audio(cached["file_id"], caption=_CAPTION), 90,
+            )
+        except DeliveryUnknownError:
+            await _notify_delivery_unknown(message, edit=False)
+            await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, platform, "audio",
+                          time.monotonic(), cached["file_size"])
+            return
         except TelegramBadRequest:
             await db.delete_cached_file(hash_url(url), "audio")
         else:
@@ -2310,6 +2381,7 @@ async def _run_audio_flow(
                 user_id, STATUS_DONE, platform, "audio",
                 file_size=cached["file_size"], processing_time=0.0,
             )
+            mark_outcome(STATUS_DONE)
             if status_message is not None:
                 await _delete_silently(status_message)
             return
@@ -2460,6 +2532,12 @@ async def _run_audio_flow(
             db, user_id, STATUS_FAILED, platform, "audio", started,
             file_size=getattr(exc, "size_bytes", None),
         )
+    except DeliveryUnknownError:
+        logger.warning("Unconfirmed audio delivery: platform=%s", platform)
+        await _stop_progress(progress_task)
+        await _notify_delivery_unknown(status_message)
+        await _record(db, user_id, STATUS_DELIVERY_UNKNOWN, platform, "audio",
+                      started, file_size)
     except TelegramNetworkError:
         logger.exception("Network error while sending audio for %s", url)
         await _stop_progress(progress_task)

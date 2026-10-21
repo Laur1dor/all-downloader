@@ -84,7 +84,8 @@ class DashboardAccess:
         await self.db.pool.execute("DELETE FROM dashboard_access")
         await self.db.pool.execute(
             "INSERT INTO dashboard_access(token_hash,kind,expires_at,access_until) "
-            "VALUES($1,'ticket',$2,$3)", _hash(f"{self.admin_id}:{ticket}:{password}"), until, until,
+            "VALUES($1,'ticket',$2,$3)",
+            _hash(f"{self.admin_id}:{ticket}:{password}"), until, until,
         )
         await self.db.record_event(self.admin_id, "system:stats_access_issued", "ok")
         return {"ticket": ticket, "password": password, "expires_at": until.isoformat(),
@@ -210,7 +211,9 @@ def register_dashboard(app: web.Application, db: Database, admin_id: int) -> Non
         )
         if result is None:
             return web.json_response(
-                {"error": "Неверный пароль, ссылка истекла или уже использована. Запросите /dashboard."}, status=401,
+                {"error": ("Неверный пароль, ссылка истекла или уже использована. "
+                           "Запросите /dashboard.")},
+                status=401,
             )
         token, until = result
         response = web.json_response({"expires_at": until.isoformat()})

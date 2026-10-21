@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from uuid import UUID
 
 import tomllib
 
@@ -58,6 +59,8 @@ def _pinned_services() -> dict[str, str]:
 
 SOCKS_PORT = int(os.getenv("XRAY_SOCKS_PORT", "2080"))
 HTTP_PORT = int(os.getenv("XRAY_HTTP_PORT", "2081"))
+TELEGRAM_NODE_FILE = "/app/data/telegram_node.txt"
+TELEGRAM_SOCKS_PORT = 2069
 PROBE_URL = os.getenv("XRAY_PROBE_URL", "https://www.google.com/generate_204")
 
 # Free public pool (e.g. AvenCores/goida-vpn-configs). Exposed on its own SOCKS
@@ -630,6 +633,35 @@ def vless_to_outbound(link: str, tag: str) -> dict:
     }
 
 
+def _telegram_pinned_outbound() -> dict | None:
+    """An explicit private pin; invalid input never selects another pool."""
+    try:
+        with open(TELEGRAM_NODE_FILE, encoding="utf-8") as source:
+            text = source.read(65537)
+        links = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(text) > 65536 or len(links) != 1:
+            raise ValueError
+        outbound = link_to_outbound(links[0], "telegram-pinned")
+        settings = outbound["settings"]
+        destinations = settings.get("vnext") or settings.get("servers") or []
+        if len(destinations) != 1:
+            raise ValueError
+        destination = destinations[0]
+        if not destination.get("address") or not 1 <= int(destination["port"]) <= 65535:
+            raise ValueError
+        if outbound["protocol"] in ("vless", "vmess"):
+            UUID(destination["users"][0]["id"])
+        elif not destination.get("password"):
+            raise ValueError
+        return outbound
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Parser and OS errors can contain the URI, credentials or private paths.
+        print("WARN: invalid private Telegram node; pin disabled", file=sys.stderr)
+        return None
+
+
 def build_config(
     links: list[str],
     goida_links: list[str] | None = None,
@@ -643,6 +675,9 @@ def build_config(
     outbounds += bypass_outbounds
     tiktok_outbounds, tiktok_tags = _links_to_outbounds(collect_tiktok_links(), "tt-")
     outbounds += tiktok_outbounds
+    telegram_outbound = _telegram_pinned_outbound()
+    if telegram_outbound is not None:
+        outbounds.append(telegram_outbound)
 
     outbounds += [
         {"tag": "direct", "protocol": "freedom"},
@@ -729,6 +764,17 @@ def build_config(
             "type": "field",
             "domain": [f"domain:{d}" for d in domains],
             "outboundTag": tag,
+        })
+
+    if telegram_outbound is not None:
+        inbounds.append({
+            "tag": "telegram-socks", "listen": "0.0.0.0",
+            "port": TELEGRAM_SOCKS_PORT, "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        })
+        pinned_rules.insert(0, {
+            "type": "field", "inboundTag": ["telegram-socks"],
+            "outboundTag": "telegram-pinned",
         })
 
     # Free goida pool on its own inbound. leastLoad over a burst-health-checked

@@ -342,7 +342,12 @@ class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 yield
 
             async def send(build, *_args):
-                return await build()
+                request = build()
+                if isinstance(request, handler.SendLivePhoto):
+                    return await message.bot.send_live_photo(
+                        live_photo=request.live_photo, photo=request.photo,
+                    )
+                return await request
 
             message = MagicMock(spec=Message, chat=SimpleNamespace(id=123),
                                 message_thread_id=None)

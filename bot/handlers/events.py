@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextvars import ContextVar
@@ -15,7 +16,7 @@ _handled_outcome: ContextVar[str | None] = ContextVar("handled_event_outcome", d
 
 def mark_outcome(outcome: str) -> None:
     """Record a handled download result in the current update's event journal."""
-    if outcome in {"done", "failed", "cancelled", "rate_limited"}:
+    if outcome in {"done", "failed", "cancelled", "rate_limited", "delivery_unknown"}:
         _handled_outcome.set(outcome)
 
 
@@ -46,6 +47,9 @@ class EventMiddleware(BaseMiddleware):
         token = _handled_outcome.set(None)
         try:
             return await handler(event, data)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception:
             outcome = "error"
             raise

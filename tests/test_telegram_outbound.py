@@ -20,6 +20,9 @@ class Method:
 
 
 class OutgoingLimiterTests(unittest.IsolatedAsyncioTestCase):
+    def test_live_photo_uses_the_media_lane(self) -> None:
+        self.assertEqual(OutgoingLimiter._priority(Method("sendLivePhoto")), (2, True, 1))
+
     async def test_flood_wait_is_shared_and_retried_once(self) -> None:
         limiter = OutgoingLimiter(media_spacing=0.5)
         media = Method("sendVideo")

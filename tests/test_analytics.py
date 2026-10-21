@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -31,6 +32,8 @@ class FakePool:
                  "avg_seconds": 12.5, "bytes": 1048576},
                 {"platform": "youtube", "status": "failed", "total": 1,
                  "avg_seconds": 2.0, "bytes": 0},
+                {"platform": "youtube", "status": "delivery_unknown", "total": 2,
+                 "avg_seconds": 120.0, "bytes": 0},
             ]
         if "GROUP BY action" in query:
             return [{"action": "callback:quality", "outcome": "ok",
@@ -56,6 +59,7 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Активных: <b>12</b>", output)
         self.assertIn("<b>3</b> успешных · 1 ошибок", output)
         self.assertIn("callback:quality", output)
+        self.assertIn("2 доставок не подтверждено", output)
         self.assertTrue(all(args == (168,) for _, args in pool.calls))
 
     async def test_export_has_only_structured_fields_and_row_limits(self) -> None:
@@ -86,6 +90,31 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         await middleware(failed, TelegramObject(), data)
         await middleware(normal, TelegramObject(), data)
         self.assertEqual(recorded, ["failed", "ok"])
+
+
+    async def test_uncertain_delivery_and_cancellation_are_not_ok_or_failed(self) -> None:
+        recorded = []
+
+        class Db:
+            async def record_event(self, _user, _action, outcome, _duration):
+                recorded.append(outcome)
+
+        async def unknown(_event, _data):
+            mark_outcome("delivery_unknown")
+
+        async def cancelled(_event, _data):
+            raise asyncio.CancelledError
+
+        async def normal(_event, _data):
+            pass
+
+        middleware = EventMiddleware()
+        data = {"event_from_user": SimpleNamespace(id=123), "db": Db()}
+        await middleware(unknown, TelegramObject(), data)
+        with self.assertRaises(asyncio.CancelledError):
+            await middleware(cancelled, TelegramObject(), data)
+        await middleware(normal, TelegramObject(), data)
+        self.assertEqual(recorded, ["delivery_unknown", "cancelled", "ok"])
 
 
 if __name__ == "__main__":

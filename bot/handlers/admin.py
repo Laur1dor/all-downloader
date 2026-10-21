@@ -266,6 +266,7 @@ def _render_stats(label: str, data: dict) -> str:
         f"\U0001f3ac Запросов: <b>{total}</b> "
         f"(\u2705 {done} / \u274c {totals['failed'] or 0} / "
         f"\U0001f6ab {totals['cancelled'] or 0}) — успех <b>{share}</b>",
+        f"Без подтверждения доставки: <b>{totals.get('delivery_unknown', 0) or 0}</b>",
         f"\U0001f465 Активных: <b>{totals['users'] or 0}</b>, "
         f"новых: <b>{data['new_users'] or 0}</b>",
         f"\U0001f4be Отдано: <b>{_gb(totals['bytes'])}</b>",
@@ -372,6 +373,7 @@ def create_router(admin_id: int) -> Router:
             f"🎬 Конвертаций: <b>{stats.total_conversions}</b>\n"
             f"✅ Успешных: {stats.done}\n"
             f"❌ Ошибок: {stats.failed}\n"
+            f"Доставка не подтверждена: {getattr(stats, 'delivery_unknown', 0)}\n"
             f"🕒 За последние 24 часа: {stats.conversions_24h}"
         )
         # Two separate HTML files (full, sorted by date) — easier to open inline

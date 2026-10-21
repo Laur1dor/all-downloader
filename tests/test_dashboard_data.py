@@ -105,6 +105,54 @@ INSERT INTO upload_samples VALUES ('2026-10-19','youtube',false,100,2,1);
         self.assertEqual(result["series"][0]["service_events"], 1)
         self.assertEqual((await self.snapshot(exclude_owner=False))["summary"]["nonstart"], 3)
 
+    async def test_unconfirmed_deliveries_are_separate_and_excluded_from_bytes(self):
+        from types import SimpleNamespace
+
+        from bot.analytics import summary
+        from bot.db import Database
+
+        await self.conn.execute("""
+ALTER TABLE upload_samples ADD COLUMN alongside integer DEFAULT 0;
+UPDATE conversions SET file_size=777 WHERE id=3;
+INSERT INTO conversions VALUES
+ (5,3,'2026-10-19','delivery_unknown','tiktok','video',900,120);
+INSERT INTO user_events VALUES
+ (4,3,'2026-10-19','message:text','delivery_unknown',120000);
+""")
+        result = await self.snapshot()
+        self.assertEqual(result["summary"]["delivery_unknown"], 1)
+        self.assertEqual(result["summary"]["done"], 1)
+        self.assertEqual(result["summary"]["failed"], 1)
+        self.assertEqual(result["summary"]["bytes"], 100)
+        self.assertEqual(result["series"][0]["delivery_unknown"], 1)
+        user = next(row for row in result["users"] if row["telegram_id"] == 3)
+        self.assertEqual(user["delivery_unknown"], 1)
+        platform = next(row for row in result["platforms"] if row["platform"] == "tiktok")
+        self.assertEqual(platform["delivery_unknown"], 1)
+        self.assertEqual(platform["bytes"], 0)
+        filtered = await self.snapshot(status="delivery_unknown")
+        self.assertEqual(filtered["summary"]["conversions"], 1)
+        self.assertEqual(filtered["summary"]["bytes"], 0)
+        self.assertEqual(filtered["activity"][0]["outcome"], "delivery_unknown")
+
+        database = Database("unused")
+        database._pool = self.conn
+        stats = await database.fetch_period_stats(None)
+        self.assertEqual(stats["totals"]["delivery_unknown"], 1)
+        self.assertEqual(stats["totals"]["bytes"], 1099)
+        tiktok = next(row for row in stats["platforms"] if row["platform"] == "tiktok")
+        self.assertEqual(tiktok["bytes"], 999)
+        self.assertEqual((await database.fetch_summary()).delivery_unknown, 1)
+        page = await database.export_conversions_html()
+        self.assertIn("Доставка не подтверждена", page)
+        self.assertIn("class=unknown", page)
+        # A wide period keeps this fixture independent of the execution date.
+        from unittest.mock import patch
+
+        with patch("bot.analytics.PERIODS", {"history": 876000}):
+            report = await summary(SimpleNamespace(pool=self.conn), "history")
+        self.assertIn("1 доставок не подтверждено", report)
+
     async def test_jit_is_disabled_only_inside_dashboard_transaction(self):
         await self.conn.execute("SET jit = on")
         conn = self.conn
