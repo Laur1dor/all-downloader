@@ -50,7 +50,11 @@ jobs:
         # Mounted over the image's own copy so the tests see the checkout,
         # including proxy/ and tests/, exactly as the deploy does on the server.
         run: |
-          docker run --rm -v "$PWD:/src" -w /src \
+          protected_env="$(mktemp)"
+          trap 'sudo rm -f "$protected_env"' EXIT
+          sudo chown root:root "$protected_env"
+          sudo chmod 600 "$protected_env"
+          docker run --rm -v "$PWD:/src" -v "$protected_env:/src/.env:ro" -w /src \
             bot-ci:${{ github.sha }} python -m tests.smoke_test
 
   images:

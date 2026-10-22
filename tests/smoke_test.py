@@ -5,6 +5,7 @@ Run from the project root: python -m tests.smoke_test
 
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.update(
     {
@@ -24,7 +25,10 @@ from bot.legacy import parse_legacy_dump
 from bot.urlcache import UrlCache
 
 # --- config ---
-settings = load_settings()
+# These checks use the explicit fixture above, never the server's .env.
+# A deployment mounts that file read-only with root-only permissions.
+with patch("bot.config.load_dotenv", return_value=False):
+    settings = load_settings()
 assert settings.admin_id == 111111111
 assert settings.database_dsn == "postgresql://x:p%40ss%3Aword%2F%21@localhost:5432/x"
 print("config OK:", settings.database_dsn)
