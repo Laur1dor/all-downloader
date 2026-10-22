@@ -39,6 +39,9 @@ while kill -0 "$xray_pid" 2>/dev/null; do
         sleep "$POLL" &
         wait "$!"
         waited=$((waited + POLL))
+        # HTTPS-only pool probes cannot detect a node blocking MTProto uploads.
+        # Keep a working Telegram pin; replace it only after repeated failures.
+        python3 /app/telegram_health.py || true
         kill -0 "$xray_pid" 2>/dev/null || break
     done
     kill -0 "$xray_pid" 2>/dev/null || break

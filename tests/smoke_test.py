@@ -1020,4 +1020,13 @@ print('tiktok login redirect OK')
 
 
 
+# Real local TCP peers cover accepted-but-stalled Telegram connections, not just
+# mocked API exceptions. Keep this regression in both CI and deployment gates.
+import unittest as _unittest
+
+_telegram_health_checks = _unittest.defaultTestLoader.loadTestsFromName(
+    "tests.test_telegram_health"
+)
+assert _unittest.TextTestRunner().run(_telegram_health_checks).wasSuccessful()
+
 print("\nALL SMOKE TESTS PASSED")

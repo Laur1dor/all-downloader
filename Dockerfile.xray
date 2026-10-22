@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir yt-dlp==2026.8.19
 WORKDIR /app
 COPY proxy/build_config.py /app/build_config.py
 COPY proxy/probe_goida.py /app/probe_goida.py
+COPY proxy/telegram_health.py /app/telegram_health.py
 COPY proxy/entrypoint.sh /usr/local/bin/xray-entrypoint.sh
 COPY scripts/netshape.sh /usr/local/bin/netshape.sh
 RUN chmod +x /usr/local/bin/xray-entrypoint.sh /usr/local/bin/netshape.sh \
