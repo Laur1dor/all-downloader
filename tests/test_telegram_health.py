@@ -16,7 +16,7 @@ from proxy import telegram_health as th
 
 
 class ProtocolTests(unittest.TestCase):
-    def exchange(self, behavior: str) -> tuple[bool, float]:
+    def exchange(self, behavior: str, obfuscated: bool = False) -> tuple[bool, float]:
         with socket.socket() as server:
             server.bind(("127.0.0.1", 0))
             server.listen()
@@ -28,12 +28,26 @@ class ProtocolTests(unittest.TestCase):
                         sock.sendall(b"\x05\x00")
                         sock.recv(10)
                         sock.sendall(b"\x05\x00\x00\x01" + b"\0" * 6)
+                        encrypt = None
+                        if obfuscated:
+                            header = th._exact(sock, 64, time.monotonic() + 1)
+                            decrypt = th._CTR(header[8:40], header[40:56])
+                            decoded = decrypt.update(header)
+                            self.assertEqual(decoded[56:60], b'\xef' * 4)
+                            reverse = header[8:56][::-1]
+                            encrypt = th._CTR(reverse[:32], reverse[32:])
                         request = bytearray()
-                        while len(request) < 42:
-                            chunk = sock.recv(42 - len(request))
+                        length = 41 if obfuscated else 42
+                        while len(request) < length:
+                            chunk = sock.recv(length - len(request))
                             if not chunk:
                                 return
                             request.extend(chunk)
+                        if obfuscated:
+                            request = decrypt.update(bytes(request))
+                        if behavior == "plain_only" and obfuscated:
+                            time.sleep(0.2)
+                            return
                         if behavior == "stall":
                             time.sleep(0.2)
                             return
@@ -47,7 +61,9 @@ class ProtocolTests(unittest.TestCase):
                         response = b"\0" * 8 + struct.pack("<QI", 1, len(body)) + body
                         if behavior == "wrong_nonce":
                             response = response[:24] + b"x" * 16 + response[40:]
-                        sock.sendall(bytes([len(response) // 4]))
+                        response = bytes([len(response) // 4]) + response
+                        if encrypt:
+                            response = encrypt.update(response)
                         for chunk in (response[:7], response[7:]):
                             sock.sendall(chunk)
                     except (OSError, TimeoutError):
@@ -55,7 +71,8 @@ class ProtocolTests(unittest.TestCase):
             worker = threading.Thread(target=peer)
             worker.start()
             began = time.monotonic()
-            result = th.probe(server.getsockname(), "149.154.167.51", timeout=0.12)
+            result = th.probe(server.getsockname(), "149.154.167.51", timeout=0.12,
+                              obfuscated=obfuscated)
             elapsed = time.monotonic() - began
             worker.join(timeout=2)
             self.assertFalse(worker.is_alive())
@@ -63,6 +80,18 @@ class ProtocolTests(unittest.TestCase):
 
     def test_real_fragmented_mtproto_response(self):
         self.assertTrue(self.exchange("good")[0])
+
+    def test_obfuscated_response_and_plain_only_false_positive(self):
+        self.assertTrue(self.exchange("good", True)[0])
+        self.assertTrue(self.exchange("plain_only")[0])
+        self.assertFalse(self.exchange("plain_only", True)[0])
+
+    def test_openssl_ctr_matches_nist_vector(self):
+        cipher = th._CTR(bytes.fromhex('603deb1015ca71be2b73aef0857d7781'
+                                      '1f352c073b6108d72d9810a30914dff4'),
+                         bytes.fromhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff'))
+        self.assertEqual(cipher.update(bytes.fromhex('6bc1bee22e409f96e93d7e117393172a')).hex(),
+                         '601ec313775789a5b7a7f504bbf3d228')
 
     def test_socks_acceptance_with_stalled_telegram_is_not_healthy(self):
         result, elapsed = self.exchange("stall")

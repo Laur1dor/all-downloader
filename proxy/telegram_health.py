@@ -16,6 +16,8 @@ import struct
 import subprocess
 import tempfile
 import time
+import ctypes
+import ctypes.util
 from pathlib import Path
 
 try:
@@ -23,13 +25,45 @@ try:
 except ImportError:  # container entry point
     import build_config as bc
 
-TARGETS = ("149.154.167.41", "149.154.167.51", "149.154.175.50")
+TARGETS = ("149.154.167.50", "149.154.167.51", "149.154.175.50")
 TIMEOUT = 4.0
 FAILURES = 3
 STATE = Path("/app/data/telegram_health.json")
 CONFIG = Path("/etc/xray/config.json")
 REBUILD = Path(os.getenv("XRAY_REBUILD_FILE", "/app/data/rebuild_xray"))
 CANDIDATE_FILES = ("/app/data/tiktok_pool.txt", "/app/data/goida_live.txt")
+
+
+class _CTR:
+    """OpenSSL already shipped with Python's TLS runtime; no new package."""
+    def __init__(self, key: bytes, iv: bytes):
+        library = ctypes.util.find_library("crypto")
+        if not library:
+            import sys
+            library = str(Path(sys.base_prefix) / "DLLs" / "libcrypto-3.dll")
+        self.lib = ctypes.CDLL(library)
+        self.lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+        self.lib.EVP_aes_256_ctr.restype = ctypes.c_void_p
+        self.lib.EVP_EncryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                               ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        self.lib.EVP_EncryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                              ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        self.lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+        self.context = self.lib.EVP_CIPHER_CTX_new()
+        if not self.context or self.lib.EVP_EncryptInit_ex(
+                self.context, self.lib.EVP_aes_256_ctr(), None, key, iv) != 1:
+            raise OSError("AES initialization failed")
+
+    def update(self, data: bytes) -> bytes:
+        output = ctypes.create_string_buffer(len(data) + 16)
+        size = ctypes.c_int()
+        if self.lib.EVP_EncryptUpdate(self.context, output, ctypes.byref(size), data, len(data)) != 1:
+            raise OSError("AES update failed")
+        return output.raw[:size.value]
+
+    def __del__(self):
+        if getattr(self, "context", None):
+            self.lib.EVP_CIPHER_CTX_free(self.context)
 
 
 def _exact(sock: socket.socket, size: int, deadline: float) -> bytes:
@@ -46,7 +80,8 @@ def _exact(sock: socket.socket, size: int, deadline: float) -> bytes:
     return bytes(result)
 
 
-def probe(proxy: tuple[str, int], target: str, timeout: float = TIMEOUT) -> bool:
+def probe(proxy: tuple[str, int], target: str, timeout: float = TIMEOUT,
+          *, obfuscated: bool = False) -> bool:
     """A bounded SOCKS/abridged MTProto exchange, including the echoed nonce."""
     deadline = time.monotonic() + timeout
     try:
@@ -72,7 +107,20 @@ def probe(proxy: tuple[str, int], target: str, timeout: float = TIMEOUT) -> bool
             body = struct.pack("<I", 0xbe7e8ef1) + nonce
             message_id = int(time.time() * 2**32) // 4 * 4
             payload = b"\0" * 8 + struct.pack("<QI", message_id, len(body)) + body
-            sock.sendall(b"\xef" + bytes([len(payload) // 4]) + payload)
+            if obfuscated:
+                header = bytearray(secrets.token_bytes(64))
+                header[0] = 0x42  # exclude HTTP/transport markers
+                header[56:60] = b"\xef" * 4
+                reverse = bytes(header[8:56])[::-1]
+                encrypt = _CTR(bytes(header[8:40]), bytes(header[40:56]))
+                decrypt = _CTR(reverse[:32], reverse[32:])
+                encrypted = encrypt.update(bytes(header))
+                header[56:64] = encrypted[56:64]
+                sock.sendall(header + encrypt.update(bytes([len(payload) // 4]) + payload))
+                raw_receive = receive
+                receive = lambda size: decrypt.update(raw_receive(size))
+            else:
+                sock.sendall(b"\xef" + bytes([len(payload) // 4]) + payload)
             words = receive(1)[0]
             if words == 127:
                 words = int.from_bytes(receive(3), "little")
@@ -88,7 +136,8 @@ def probe(proxy: tuple[str, int], target: str, timeout: float = TIMEOUT) -> bool
 
 def healthy(port: int) -> bool:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGETS)) as pool:
-        return all(pool.map(lambda target: probe(("127.0.0.1", port), target), TARGETS))
+        return all(pool.map(lambda target: probe(("127.0.0.1", port), target,
+                                                 obfuscated=True), TARGETS))
 
 
 def _identity(outbound: dict) -> str:
