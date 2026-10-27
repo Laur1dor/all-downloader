@@ -1901,7 +1901,7 @@ async def _deliver_album(
 def _video_cache_key(platform: str, *, height: int | None = None, capped: bool = False) -> str:
     # Old Twitter file_ids can contain Matroska sent as sendVideo. Never reuse
     # those uploads after switching to validated streaming MP4s.
-    base = {"tiktok": "video_hdr_metadata_v1", "twitter": "video_mp4_v1"}.get(platform, "video")
+    base = {"tiktok": "video_hdr_metadata_v2", "twitter": "video_mp4_v1"}.get(platform, "video")
     if height is not None:
         return f"{base}:{height}"
     return f"{base}_capped" if capped else base
@@ -1926,10 +1926,9 @@ async def _send_cached_video(
     """
     if platform == "tiktok":
         legacy = tuple(
-            "video_validated_capped" if key.endswith("_capped") else "video_validated"
-            for key in keys if key in (
-                _video_cache_key("tiktok"), _video_cache_key("tiktok", capped=True),
-            )
+            old_base + key.removeprefix("video_hdr_metadata_v2")
+            for key in keys if key.startswith("video_hdr_metadata_v2")
+            for old_base in ("video_hdr_metadata_v1", "video_validated")
         )
         keys = tuple(dict.fromkeys((*keys, *legacy)))
     for cache_key in keys:
@@ -1951,20 +1950,24 @@ async def _send_cached_video(
                 source_hdr = await _tiktok_source_hdr_from_cache(
                     db, url, False, source_hdr_checked=checked, cookies_file=cookies_file,
                 )
+            legacy_preview = not cache_key.startswith("video_hdr_metadata_v2")
+            # Old HDR previews may have unbounded NVENC quantization. Rebuild
+            # those (and unverified originals); retain verified SDR file_ids.
+            if legacy_preview and source_hdr is not False:
+                continue
             if source_hdr is not None and (
-                not checked or cache_key.startswith("video_validated")
+                not checked or legacy_preview
                 or source_hdr != cached_source_hdr
             ):
-                store_key = (_video_cache_key("tiktok", capped=cache_key.endswith("_capped"))
-                             if cache_key.startswith("video_validated") else cache_key)
+                store_key = (cache_key.replace("video_hdr_metadata_v1", "video_hdr_metadata_v2", 1)
+                             .replace("video_validated", "video_hdr_metadata_v2", 1))
                 upgraded_description = _tiktok_video_cache_description(
                     description, source_hdr, source_hdr_checked=True,
                 )
             elif source_hdr is None:
                 unknown_description = _tiktok_video_cache_description(description, None)
                 if cached["description"] != unknown_description:
-                    store_key = (_video_cache_key("tiktok", capped=cache_key.endswith("_capped"))
-                                 if cache_key.startswith("video_validated") else cache_key)
+                    store_key = cache_key
                     upgraded_description = unknown_description
         with_description = _description_capable(url, platform) and bool(
             description and description.strip()

@@ -16,6 +16,51 @@ from bot.tiktok_live_photo import PreparedLivePhoto
 
 
 class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_hdr_or_unknown_preview_is_rebuilt_but_sdr_cache_is_reused(self):
+        for old_base in ('video_hdr_metadata_v1', 'video_validated'):
+            for suffix in ('', '_capped', ':720'):
+                for hdr in (True, False, None):
+                    with self.subTest(old_base=old_base, suffix=suffix, hdr=hdr):
+                        old_key = old_base + suffix
+                        current_key = handler._video_cache_key('tiktok') + suffix
+                        preview = {
+                            'file_id': 'old-preview', 'file_size': 100,
+                            'description': handler._tiktok_video_cache_description(
+                                'text', hdr, source_hdr_checked=hdr is not None,
+                            ),
+                        }
+
+                        async def cached(_hash, key):
+                            return preview if key == old_key else None
+
+                        async def send(build, *_args):
+                            return await build()
+
+                        message = MagicMock(spec=Message, from_user=SimpleNamespace(id=123))
+                        message.answer_video = AsyncMock()
+                        db = MagicMock(get_cached_file=AsyncMock(side_effect=cached),
+                                       store_cached_file=AsyncMock(), add_conversion=AsyncMock())
+                        cache = MagicMock()
+                        cache.store.return_value = 'cache-profile-proof'
+                        with (
+                            patch.object(handler, '_send_paced', side_effect=send),
+                            patch('bot.tiktok_hdr.probe_tiktok_source_hdr',
+                                  AsyncMock(return_value=hdr)),
+                        ):
+                            sent = await handler._send_cached_video(
+                                message, db, cache, 'https://www.tiktok.com/@u/video/123',
+                                'tiktok', 1000, (current_key,),
+                            )
+                        self.assertEqual(sent, hdr is False)
+                        if hdr is False:
+                            self.assertEqual(message.answer_video.await_args.args[0], 'old-preview')
+                            self.assertEqual(db.store_cached_file.await_args.args[1], current_key)
+                        else:
+                            message.answer_video.assert_not_awaited()
+                            db.store_cached_file.assert_not_awaited()
+                            db.add_conversion.assert_not_awaited()
+                        handler._album_descriptions.pop('cache-profile-proof', None)
+
     async def test_unknown_probe_clears_legacy_false_confidence_once_without_changing_id(self):
         preview = {'file_id': 'real-preview', 'file_size': 100,
                    'description': '{"tiktok_source_v1":true,"source_hdr":false,'
@@ -241,10 +286,10 @@ class HdrLiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         db.get_cached_file.assert_awaited_once()
         probe.assert_not_awaited()
 
-    async def test_run_link_reads_hdr_key_first_and_repairs_legacy_without_source_fetch(self):
+    async def test_run_link_reads_current_hdr_key_without_source_fetch(self):
         url = 'https://www.tiktok.com/@u/video/7696055072110677268'
         primary = handler._video_cache_key('tiktok')
-        for legacy in (False, True):
+        for legacy in (False,):
             with self.subTest(legacy=legacy):
                 preview = {'file_id': 'preview-id', 'file_size': 100,
                            'description': ('post text' if legacy else

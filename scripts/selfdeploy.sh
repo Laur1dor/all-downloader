@@ -160,6 +160,23 @@ if ! docker run --rm -v "$LIVE:/src:ro" -w /src "$IMAGE:latest" \
     exit 1
 fi
 
+# Hosted CI has no GPU. A configured private motion fixture exercises the
+# actual deployed encoder and driver before the healthy bot is replaced.
+needs_gpu_quality="$(docker compose config --format json | python3 -c '
+import json,sys
+env=json.load(sys.stdin)["services"]["bot"].get("environment", {})
+print("1" if env.get("TIKTOK_COMPAT_ENCODER") == "nvenc" and env.get("NVENC_QUALITY_FIXTURE") else "0")
+')"
+if [ "$needs_gpu_quality" = "1" ]; then
+    log "checking real NVIDIA quality/size against the private HDR motion fixture"
+    if ! docker compose run --rm --no-deps -v "$LIVE:/src:ro" -w /src \
+            --entrypoint python bot -m unittest tests.test_nvenc_quality; then
+        log "NVIDIA quality gate failed — nothing restarted"
+        notify "⚠️ Деплой остановлен: аппаратная проверка качества NVIDIA не прошла. Бот работает на прежней версии."
+        exit 1
+    fi
+fi
+
 rollback() {
     log "deploy failed — restoring the previously running image"
     if docker image inspect "$IMAGE:previous" >/dev/null 2>&1; then

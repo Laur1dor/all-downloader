@@ -58,7 +58,7 @@ class TwitterVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(key, {"video", "video:480", "video_capped"})
         self.assertEqual(handler._video_cache_key("youtube", height=480), "video:480")
         self.assertEqual(handler._video_cache_key("tiktok", capped=True),
-                         "video_hdr_metadata_v1_capped")
+                         "video_hdr_metadata_v2_capped")
 
     def test_cancelled_remux_never_starts_ffmpeg(self):
         cancel = Event()

@@ -1031,7 +1031,8 @@ print('tiktok login redirect OK')
 import unittest as _unittest
 
 _telegram_health_checks = _unittest.defaultTestLoader.loadTestsFromNames(
-    ["tests.test_telegram_health", "tests.test_source_document", "tests.test_tikwm_fallback"]
+    ["tests.test_telegram_health", "tests.test_source_document", "tests.test_tikwm_fallback",
+     "tests.test_nvenc_quality", "tests.test_hdr_live_delivery", "tests.test_twitter_video"]
 )
 assert _unittest.TextTestRunner().run(_telegram_health_checks).wasSuccessful()
 

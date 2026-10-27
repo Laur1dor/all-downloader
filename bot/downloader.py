@@ -2298,6 +2298,17 @@ def _tiktok_validation_budget(
     return min(600, max(floor, sum(_tiktok_conversion_budget(v, duration) / 3 for v in videos)))
 
 
+_TIKTOK_NVENC_ENCODER_ARGS = (
+    "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
+    "-rc", "vbr", "-cq", "22", "-b:v", "0",
+    # CQ alone allowed large errors on complex B-frames in real HDR clips.
+    # FFmpeg enables NVENC's QP ceiling only when qmin is also set.
+    "-qmin", "0", "-qmax", "26",
+    "-multipass", "fullres", "-spatial_aq", "1", "-aq-strength", "8",
+    "-bf", "3", "-fps_mode", "passthrough",
+)
+
+
 def _transcode_tiktok_compatible(
     source: Path, max_bytes: int, cancel_event: threading.Event | None,
 ) -> Path | None:
@@ -2385,12 +2396,7 @@ def _transcode_tiktok_compatible(
             # Only encoding moves to NVIDIA. Keep the same float HDR colour
             # pipeline; tonemap_opencl changes its result. CQ is not x264 CRF:
             # this profile is calibrated against the uncompressed SDR frames.
-            encoders.insert(0, ("nvenc", [
-                "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
-                "-rc", "vbr", "-cq", "22", "-b:v", "0",
-                "-multipass", "fullres", "-spatial_aq", "1", "-aq-strength", "8",
-                "-bf", "3", "-fps_mode", "passthrough",
-            ]))
+            encoders.insert(0, ("nvenc", list(_TIKTOK_NVENC_ENCODER_ARGS)))
         for encoder_name, encoder_args in encoders:
             converted.unlink(missing_ok=True)
             try:
