@@ -29,6 +29,13 @@ class SourceDocumentTests(unittest.TestCase):
             packets = json.loads(subprocess.check_output([
                 'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_packets',
                 '-show_entries', 'packet=pos,size', '-of', 'json', str(path)]))['packets']
+            def frame_hashes(file):
+                result = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(file),
+                    '-map', '0:v:0', '-fps_mode', 'passthrough', '-f', 'framemd5', '-'], capture_output=True,
+                    text=True, check=True, timeout=30)
+                return [line.split(',')[-1].strip() for line in result.stdout.splitlines()
+                        if line and not line.startswith('#')]
+            original_frames = frame_hashes(path)
             packet = packets[len(packets) // 2]
             at, size = int(packet['pos']), int(packet['size'])
             raw = bytearray(path.read_bytes())
@@ -40,7 +47,10 @@ class SourceDocumentTests(unittest.TestCase):
             expected = downloader._source_video_packet_hash(path, remove_unspecified=True)
             result = downloader._prepare_source_document(path, 5_000_000, None)
             self.assertTrue(result.structure_modified)
-            self.assertEqual(downloader._source_video_packet_hash(result.path), expected)
+            self.assertEqual(downloader._source_video_packet_hash(
+                result.path, remove_unspecified=True), expected)
+            self.assertEqual(frame_hashes(result.path),
+                             original_frames[:len(packets) // 2] + original_frames[len(packets) // 2 + 1:])
             downloader._source_document_decode(result.path, None)
 
     def test_movie_header_unknown_duration_is_not_a_healthy_faststart(self):
