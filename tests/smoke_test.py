@@ -1026,14 +1026,16 @@ print('tiktok login redirect OK')
 
 
 
-# Real local TCP peers cover accepted-but-stalled Telegram connections, not just
-# mocked API exceptions. Keep this regression in both CI and deployment gates.
-import unittest as _unittest
+# Discover every regression in a fresh interpreter: smoke constructs global
+# aiogram routers, which must not leak into dispatcher integration tests.
+# Unavailable GPU/private-fixture or isolated-DB checks explicitly report skips.
+import subprocess as _regression_subprocess
+import sys as _regression_sys
 
-_telegram_health_checks = _unittest.defaultTestLoader.loadTestsFromNames(
-    ["tests.test_telegram_health", "tests.test_source_document", "tests.test_tikwm_fallback",
-     "tests.test_nvenc_quality", "tests.test_hdr_live_delivery", "tests.test_twitter_video"]
-)
-assert _unittest.TextTestRunner().run(_telegram_health_checks).wasSuccessful()
+_regression_subprocess.run([
+    _regression_sys.executable, "-m", "unittest", "discover",
+    "-s", str(Path(__file__).parent), "-p", "test_*.py",
+    "-t", str(Path(__file__).parent.parent),
+], check=True)
 
 print("\nALL SMOKE TESTS PASSED")

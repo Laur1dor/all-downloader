@@ -17,11 +17,20 @@ from bot.progress import PHASE_PREPARE, ProgressState
 
 
 def _probe(transfer: str | None = None):
-    video = {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p10le"}
+    video = {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p10le",
+             "width": 720, "height": 1280, "nb_frames": "120", "avg_frame_rate": "60/1"}
     if transfer:
         video["color_transfer"] = transfer
     return MagicMock(returncode=0, stdout=json.dumps({
         "streams": [video], "format": {"duration": "2"},
+    }))
+
+
+def _output_probe(duration="2"):
+    return MagicMock(returncode=0, stdout=json.dumps({
+        "streams": [{"width": 720, "height": 1280, "nb_frames": "120",
+                     "avg_frame_rate": "60/1"}],
+        "format": {"duration": duration},
     }))
 
 
@@ -151,7 +160,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
 
                 with patch.object(downloader.subprocess, "run", side_effect=[
                     _probe("arib-std-b67"),
-                    MagicMock(returncode=0, stdout='{"format":{"duration":"2"}}'),
+                    _output_probe(),
                 ]), patch.object(downloader, "_run_ffmpeg", side_effect=encode) as run:
                     result = downloader._transcode_tiktok_compatible(source, limit, None)
                     self.assertIsNotNone(result)
@@ -282,7 +291,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
 
                 with patch.object(downloader.subprocess, "run", side_effect=[
                     _probe(transfer),
-                    MagicMock(returncode=0, stdout='{"format":{"duration":"2"}}'),
+                    _output_probe(),
                 ]), patch.object(downloader, "_run_ffmpeg", side_effect=encode) as run:
                     result = downloader._transcode_tiktok_compatible(source, 10_000, None)
                 self.assertIsNotNone(result)
@@ -309,7 +318,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"truncated")
 
             with patch.object(downloader.subprocess, "run", side_effect=[
-                _probe(), MagicMock(returncode=0, stdout='{"format":{"duration":"0.2"}}'),
+                _probe(), _output_probe("0.2"),
             ]), patch.object(downloader, "_run_ffmpeg", side_effect=encode):
                 self.assertIsNone(downloader._transcode_tiktok_compatible(source, 10_000, None))
             self.assertFalse(source.with_name("source-telegram.mp4").exists())
@@ -349,7 +358,7 @@ class TikTokCompatibilityTests(unittest.TestCase):
 
             with patch.object(downloader.subprocess, "run", side_effect=[
                 MagicMock(returncode=0, stdout=json.dumps(initial)),
-                MagicMock(returncode=0, stdout='{"format":{"duration":"2"}}'),
+                _output_probe(),
             ]), patch.object(downloader, "_run_ffmpeg", side_effect=encode) as run:
                 self.assertIsNotNone(downloader._transcode_tiktok_compatible(source, 10_000, None))
             self.assertEqual(run.call_count, 2)
