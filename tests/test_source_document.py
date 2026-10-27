@@ -19,6 +19,50 @@ from bot.media_parts import MediaPreparationError
 
 class SourceDocumentTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg required')
+    def test_fused_hdr_preview_is_byte_identical_and_preserves_original(self):
+        old_hdr = ['zscale=t=linear:npl=100', 'format=gbrpf32le', 'zscale=p=bt709',
+                   'tonemap=tonemap=hable:desat=0', 'zscale=t=bt709:m=bt709:r=tv']
+        geometry = ["scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'", 'format=yuv420p']
+        for transfer in ('arib-std-b67', 'smpte2084', 'bt709'):
+            with self.subTest(transfer=transfer), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / 'hdr.mp4'
+                primaries = 1 if transfer == 'bt709' else 9
+                transfer_id = {'arib-std-b67': 18, 'smpte2084': 16, 'bt709': 1}[transfer]
+                subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                    'testsrc2=size=96x192:rate=60:duration=0.2', '-c:v', 'libx265',
+                    '-x265-params', ('pools=1:frame-threads=1:log-level=error:'
+                        f'colorprim={primaries}:transfer={transfer_id}:colormatrix={primaries}'),
+                    '-pix_fmt', 'yuv420p10le', '-color_trc', transfer,
+                    '-color_primaries', 'bt2020' if transfer != 'bt709' else 'bt709',
+                    '-colorspace', 'bt2020nc' if transfer != 'bt709' else 'bt709',
+                    str(source)], capture_output=True, check=True, timeout=30)
+                original = hashlib.sha256(source.read_bytes()).hexdigest()
+                baseline = Path(directory) / 'baseline.mp4'
+                actual_run = downloader._run_ffmpeg
+
+                def compare_pipeline(command, timeout, cancel):
+                    if '-vf' in command:
+                        reference = list(command)
+                        reference[reference.index('-vf') + 1] = ','.join(
+                            ([] if transfer == 'bt709' else old_hdr) + geometry)
+                        reference[-1] = str(baseline)
+                        actual_run(reference, timeout, cancel)
+                    actual_run(command, timeout, cancel)
+
+                with patch.object(downloader, '_run_ffmpeg', side_effect=compare_pipeline):
+                    result = downloader._transcode_tiktok_compatible(source, 5_000_000, None)
+                self.assertIsNotNone(result)
+                self.assertEqual(result.read_bytes(), baseline.read_bytes())
+                self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original)
+                probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error',
+                    '-count_frames', '-select_streams', 'v:0', '-show_entries',
+                    'stream=width,height,nb_read_frames,r_frame_rate', '-of', 'json', str(result)]))
+                video = probe['streams'][0]
+                self.assertEqual((video['width'], video['height']), (96, 192))
+                self.assertEqual(video['r_frame_rate'], '60/1')
+                self.assertEqual(video['nb_read_frames'], '12')
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg required')
     def test_real_unspecified_nal_sample_is_removed_without_changing_valid_frames(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'empty-sample.mp4'

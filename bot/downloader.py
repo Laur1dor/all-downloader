@@ -2365,7 +2365,9 @@ def _transcode_tiktok_compatible(
             # Convert HDR light into SDR before reducing to 8-bit: a pixel-format
             # conversion alone produces washed-out colors on Telegram clients.
             filters.extend([
-                "zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
+                # Let zimg fuse linearisation and the primary-colour matrix.
+                # Keep float precision and the remaining conversion unchanged.
+                "zscale=t=linear:p=bt709:npl=100", "format=gbrpf32le",
                 "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv",
             ])
         filters.extend([
