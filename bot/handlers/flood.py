@@ -54,7 +54,8 @@ class FloodMiddleware(BaseMiddleware):
 
     def _should_tell(self, user_id: int) -> bool:
         now = time.monotonic()
-        if now - self._told.get(user_id, 0.0) < _NOTICE_EVERY_SECONDS:
+        previous = self._told.get(user_id)
+        if previous is not None and now - previous < _NOTICE_EVERY_SECONDS:
             return False
         self._told[user_id] = now
         return True

@@ -514,6 +514,12 @@ assert _flood._allow(4243)
 assert _flood._should_tell(4242)
 assert not _flood._should_tell(4242)
 
+# A fresh runner/server can have monotonic uptime below the notice interval.
+with patch("bot.handlers.flood.time.monotonic", return_value=1):
+    _fresh_flood = FloodMiddleware(admin_id=999)
+    assert _fresh_flood._should_tell(4242)
+    assert not _fresh_flood._should_tell(4242)
+
 # Seven a minute is above anyone typing and far below what the machine notices.
 assert 3 <= FLOOD_MESSAGES <= 30, FLOOD_MESSAGES
 assert FLOOD_WINDOW_SECONDS >= 10, FLOOD_WINDOW_SECONDS
