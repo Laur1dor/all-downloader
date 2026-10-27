@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,60 @@ from bot.media_parts import MediaPreparationError
 
 
 class SourceDocumentTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg required')
+    def test_nvidia_failure_or_incomplete_output_retries_cpu_and_preserves_hdr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'hdr.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                'testsrc2=size=96x192:rate=60:duration=0.4', '-c:v', 'libx265',
+                '-x265-params', 'pools=1:frame-threads=1:log-level=error:colorprim=9:transfer=18:colormatrix=9',
+                '-pix_fmt', 'yuv420p10le', '-color_trc', 'arib-std-b67',
+                '-color_primaries', 'bt2020', '-colorspace', 'bt2020nc', str(source)],
+                capture_output=True, check=True, timeout=30)
+            original = hashlib.sha256(source.read_bytes()).hexdigest()
+            with patch.dict(os.environ, TIKTOK_COMPAT_ENCODER='cpu'):
+                baseline = downloader._transcode_tiktok_compatible(source, 5_000_000, None)
+            expected = baseline.read_bytes()
+            baseline.unlink()
+            actual_run = downloader._run_ffmpeg
+            for failure in ('unavailable', 'missing_frame', 'wrong_dimensions', 'cancelled'):
+                with self.subTest(failure=failure):
+                    cancel = Event()
+                    attempts = []
+
+                    def encode(command, timeout, event):
+                        encoder = command[command.index('-c:v') + 1]
+                        attempts.append(encoder)
+                        if encoder != 'h264_nvenc':
+                            self.assertFalse(Path(command[-1]).exists())
+                            return actual_run(command, timeout, event)
+                        if failure in ('unavailable', 'cancelled'):
+                            if failure == 'cancelled':
+                                cancel.set()
+                            raise MediaPreparationError('GPU unavailable')
+                        # Produce a real decodable MP4 which must nevertheless
+                        # be rejected for a missing frame or changed geometry.
+                        fake = command[:command.index('-c:v')] + [
+                            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+                            '-threads', '2', '-frames:v', '23' if failure == 'missing_frame' else '24',
+                            '-pix_fmt', 'yuv420p', command[-1]]
+                        if failure == 'wrong_dimensions':
+                            fake[fake.index('-vf') + 1] += ',scale=96:190'
+                        actual_run(fake, timeout, event)
+
+                    with patch.dict(os.environ, TIKTOK_COMPAT_ENCODER='nvenc'), \
+                         patch.object(downloader, '_run_ffmpeg', side_effect=encode):
+                        if failure == 'cancelled':
+                            with self.assertRaises(downloader.DownloadCancelledError):
+                                downloader._transcode_tiktok_compatible(source, 5_000_000, cancel)
+                            self.assertEqual(attempts, ['h264_nvenc'])
+                        else:
+                            result = downloader._transcode_tiktok_compatible(source, 5_000_000, cancel)
+                            self.assertEqual(result.read_bytes(), expected)
+                            result.unlink()
+                            self.assertEqual(attempts, ['h264_nvenc', 'libx264'])
+                    self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original)
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg required')
     def test_fused_hdr_preview_is_byte_identical_and_preserves_original(self):
         old_hdr = ['zscale=t=linear:npl=100', 'format=gbrpf32le', 'zscale=p=bt709',

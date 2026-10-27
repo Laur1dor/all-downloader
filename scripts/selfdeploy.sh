@@ -83,6 +83,11 @@ if [ "$actual_subnet" != "$NETWORK_SUBNET" ]; then
 fi
 compose_candidate=(docker compose --project-directory "$LIVE" -f "$candidate" \
     --env-file "$LIVE/.env")
+# Validate the same local device/runtime overrides used by the actual rollout.
+# It is operator configuration, retained in LIVE across source deployments.
+if [ -f "$LIVE/compose.override.yml" ]; then
+    compose_candidate+=(-f "$LIVE/compose.override.yml")
+fi
 if ! "${compose_candidate[@]}" config --quiet; then
     log "refusing deploy: candidate compose is invalid"
     notify "⚠️ Деплой отложен: compose не прошёл проверку. Бот не остановлен."

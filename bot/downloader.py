@@ -2308,7 +2308,7 @@ def _transcode_tiktok_compatible(
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
              "stream=codec_type,codec_name,pix_fmt,color_transfer,width,height,"
-             "avg_frame_rate,r_frame_rate:format=duration",
+             "avg_frame_rate,r_frame_rate,nb_frames:format=duration",
              "-of", "json", str(source)],
             capture_output=True, text=True, timeout=10, check=False,
         )
@@ -2374,33 +2374,70 @@ def _transcode_tiktok_compatible(
             "scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'",
             "format=yuv420p",
         ])
-        _run_ffmpeg(
-            ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-y", "-threads", "2",
-             "-filter_threads", "1", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
-             "-vf", ",".join(filters), "-c:v", "libx264", "-preset", preset,
-             "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
-             "-crf", "18", "-threads", "2", "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "192k", "-color_primaries", "bt709",
-             "-color_trc", "bt709", "-colorspace", "bt709",
-             "-fs", str(output_limit + 1), "-movflags", "+faststart", str(converted)],
-            _tiktok_conversion_budget(video, duration), cancel_event,
-        )
-        if not converted.is_file() or not 0 < converted.stat().st_size <= output_limit:
-            return None
-        # -fs can terminate before the full timeline. Check duration as well as
-        # codec compatibility so a size limit never becomes a successful clip.
-        check = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", str(converted)],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        actual = float(json.loads(check.stdout)["format"]["duration"])
-        if check.returncode or abs(actual - duration) > 1:
-            return None
-        completed = True
-        return converted
+        cpu_encoder = [
+            "-c:v", "libx264", "-preset", preset,
+            "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            "-crf", "18", "-threads", "2",
+        ]
+        encoders = [("cpu", cpu_encoder)]
+        if (hdr and preset == "ultrafast"
+                and os.getenv("TIKTOK_COMPAT_ENCODER", "cpu").lower() == "nvenc"):
+            # Only encoding moves to NVIDIA. Keep the same float HDR colour
+            # pipeline; tonemap_opencl changes its result. CQ is not x264 CRF:
+            # this profile is calibrated against the uncompressed SDR frames.
+            encoders.insert(0, ("nvenc", [
+                "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
+                "-rc", "vbr", "-cq", "22", "-b:v", "0",
+                "-multipass", "fullres", "-spatial_aq", "1", "-aq-strength", "8",
+                "-bf", "3", "-fps_mode", "passthrough",
+            ]))
+        for encoder_name, encoder_args in encoders:
+            converted.unlink(missing_ok=True)
+            try:
+                _run_ffmpeg(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-y", "-threads", "2",
+                     "-filter_threads", "1", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
+                     "-vf", ",".join(filters), *encoder_args, "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "192k", "-color_primaries", "bt709",
+                     "-color_trc", "bt709", "-colorspace", "bt709",
+                     "-fs", str(output_limit + 1), "-movflags", "+faststart", str(converted)],
+                    _tiktok_conversion_budget(video, duration), cancel_event,
+                )
+                if not converted.is_file() or not 0 < converted.stat().st_size <= output_limit:
+                    raise MediaPreparationError("Invalid encoded video size")
+                # -fs can stop early. A partial GPU encode must be discarded
+                # before retrying; never accept fewer frames as a faster encode.
+                check = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                     "stream=width,height,avg_frame_rate,nb_frames:format=duration",
+                     "-of", "json", str(converted)],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                details = json.loads(check.stdout)
+                actual = float(details["format"]["duration"])
+                output_video = details["streams"][0]
+                expected_size = tuple(int(video.get(k, 0)) // 2 * 2 for k in ("width", "height"))
+                if check.returncode or abs(actual - duration) > max(0.1, min(1, duration * 0.01)):
+                    raise MediaPreparationError("Incomplete encoded timeline")
+                if expected_size != (output_video.get("width"), output_video.get("height")):
+                    raise MediaPreparationError("Encoded video dimensions changed")
+                source_frames = str(video.get("nb_frames", ""))
+                if source_frames.isdigit() and int(source_frames) > 0:
+                    if str(output_video.get("nb_frames")) != source_frames:
+                        raise MediaPreparationError("Encoded video frame count changed")
+                completed = True
+                logger.info("TikTok compatibility conversion completed: encoder=%s", encoder_name)
+                return converted
+            except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError,
+                    MediaPreparationError) as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError from None
+                if encoder_name == "cpu":
+                    raise
+                logger.warning("TikTok NVIDIA conversion failed; retrying on CPU: %s", exc)
+        return None
     except (
-        OSError, ValueError, KeyError, subprocess.SubprocessError, MediaPreparationError,
+        OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError, MediaPreparationError,
     ) as exc:
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelledError from None
