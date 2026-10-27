@@ -1024,8 +1024,8 @@ print('tiktok login redirect OK')
 # mocked API exceptions. Keep this regression in both CI and deployment gates.
 import unittest as _unittest
 
-_telegram_health_checks = _unittest.defaultTestLoader.loadTestsFromName(
-    "tests.test_telegram_health"
+_telegram_health_checks = _unittest.defaultTestLoader.loadTestsFromNames(
+    ["tests.test_telegram_health", "tests.test_source_document", "tests.test_tikwm_fallback"]
 )
 assert _unittest.TextTestRunner().run(_telegram_health_checks).wasSuccessful()
 

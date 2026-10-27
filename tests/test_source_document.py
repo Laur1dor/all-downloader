@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import struct
 import unittest
 from pathlib import Path
 from threading import Event
@@ -17,6 +18,46 @@ from bot.media_parts import MediaPreparationError
 
 
 class SourceDocumentTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg required')
+    def test_real_unspecified_nal_sample_is_removed_without_changing_valid_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'empty-sample.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                            'testsrc2=size=96x192:rate=15:duration=1', '-c:v', 'libx264',
+                            '-threads', '1', '-g', '1', '-movflags', '+faststart', str(path)],
+                           capture_output=True, check=True, timeout=30)
+            packets = json.loads(subprocess.check_output([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_packets',
+                '-show_entries', 'packet=pos,size', '-of', 'json', str(path)]))['packets']
+            packet = packets[len(packets) // 2]
+            at, size = int(packet['pos']), int(packet['size'])
+            raw = bytearray(path.read_bytes())
+            raw[at:at + size] = (size - 4).to_bytes(4, 'big') + bytes(size - 4)
+            path.write_bytes(raw)
+            # Reproduce a complete container containing a sample with no picture.
+            with self.assertRaises(MediaPreparationError):
+                downloader._source_document_decode(path, None)
+            expected = downloader._source_video_packet_hash(path, remove_unspecified=True)
+            result = downloader._prepare_source_document(path, 5_000_000, None)
+            self.assertTrue(result.structure_modified)
+            self.assertEqual(downloader._source_video_packet_hash(result.path), expected)
+            downloader._source_document_decode(result.path, None)
+
+    def test_movie_header_unknown_duration_is_not_a_healthy_faststart(self):
+        def box(kind, payload):
+            return struct.pack('>I4s', len(payload) + 8, kind) + payload
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'movie.mp4'
+            for version in (0, 1):
+                for duration, expected in ((48_000, True), (0, False),
+                                           (2 ** (64 if version else 32) - 1, False)):
+                    header = bytes([version, 0, 0, 0]) + bytes(16 if version else 8)
+                    header += struct.pack('>I', 48_000)
+                    header += duration.to_bytes(8 if version else 4, 'big')
+                    path.write_bytes(box(b'ftyp', b'isom') + box(b'moov', box(b'mvhd', header))
+                                     + box(b'mdat', b'packets'))
+                    self.assertEqual(downloader._source_document_faststart(path), expected)
+
     def test_remux_cannot_report_hdr_if_dolby_vision_metadata_was_lost(self) -> None:
         video = {"codec_type": "video", "codec_name": "hevc", "width": 720, "height": 1280,
                  "pix_fmt": "yuv420p10le", "color_transfer": "bt709",
@@ -132,7 +173,9 @@ class SourceDocumentTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "ffmpeg/ffprobe not installed locally")
     def test_real_hdr_source_packets_metadata_and_primary_audio_are_preserved(self) -> None:
-        for transfer, faststart in (("arib-std-b67", True), ("smpte2084", False), ("bt709", False)):
+        for transfer, faststart, bad_duration in (("arib-std-b67", True, False),
+                ("smpte2084", False, False), ("bt709", False, False),
+                ("arib-std-b67", True, True)):
             with self.subTest(transfer=transfer), tempfile.TemporaryDirectory() as directory:
                 source = Path(directory) / "source.mp4"
                 hdr = transfer != "bt709"
@@ -154,11 +197,17 @@ class SourceDocumentTests(unittest.TestCase):
                     command.extend(["-movflags", "+faststart"])
                 command.append(str(source))
                 subprocess.run(command, capture_output=True, check=True, timeout=30)
+                if bad_duration:
+                    raw = bytearray(source.read_bytes())
+                    at = raw.index(b'mvhd')
+                    self.assertEqual(raw[at + 4], 0)
+                    raw[at + 20:at + 24] = b'\xff' * 4
+                    source.write_bytes(raw)
                 original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
                 video_hash = downloader._source_video_packet_hash(source)
                 result = downloader._prepare_source_document(source, 5_000_000, None)
                 self.assertEqual(result.source_hdr, hdr)
-                self.assertEqual(result.structure_modified, not faststart)
+                self.assertEqual(result.structure_modified, not faststart or bad_duration)
                 self.assertEqual(downloader._source_video_packet_hash(result.path), video_hash)
                 self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
                 _, video, actual = downloader._source_document_probe(result.path)

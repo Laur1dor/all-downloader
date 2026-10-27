@@ -238,6 +238,41 @@ class TikwmFallbackTests(unittest.TestCase):
         source.close.assert_not_called()
 
     @patch("curl_cffi.requests.Session")
+    def test_hdr_conversion_uses_repaired_packets_instead_of_broken_original(self, session_class):
+        source = MagicMock(proxies={})
+        item = {"id": "123", "video": {"playAddr": "https://example.com/clip.mp4"}}
+        guard = {}
+
+        def fetch(_session, _url, destination, *_args, **_kwargs):
+            destination.write_bytes(b"HDR with invalid NAL samples")
+            guard["_last_complete_body"] = True
+            return True
+
+        def repair(path, *_args):
+            result = path.with_name('repaired.mp4')
+            result.write_bytes(b"repaired HDR packets")
+            return result
+
+        def convert(path, *_args):
+            self.assertEqual(path.read_bytes(), b"repaired HDR packets")
+            result = path.with_name('preview.mp4')
+            result.write_bytes(b"valid SDR preview")
+            return result
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('bot.downloader._stream_to_file', side_effect=fetch) as stream, \
+             patch('bot.downloader._repair_tiktok_sei', side_effect=repair), \
+             patch('bot.downloader._transcode_tiktok_compatible', side_effect=convert), \
+             patch('bot.downloader._tiktok_playable', side_effect=[False, False, True]), \
+             patch('bot.downloader._source_hdr_state', return_value=True):
+            path, info = _fetch_tiktok_media(item, source, directory, None,
+                                           10_000, None, None, guard, resolver=True)
+            self.assertEqual(path.read_bytes(), b"valid SDR preview")
+            self.assertEqual(info['original_path'].read_bytes(), b"HDR with invalid NAL samples")
+            self.assertFalse(path.with_name('repaired.mp4').exists())
+        stream.assert_called_once()
+
+    @patch("curl_cffi.requests.Session")
     def test_complete_broken_video_uses_repaired_copy_and_keeps_original(self, session_class):
         source = MagicMock()
         source.proxies = {}
@@ -324,7 +359,7 @@ class TikwmFallbackTests(unittest.TestCase):
         command = remux.call_args.args[0]
         self.assertEqual(command[command.index("-c") + 1], "copy")
         self.assertEqual(command[command.index("-bsf:v") + 1],
-                         "filter_units=remove_types=6")
+                         "filter_units=remove_types=0|6")
 
     @patch("curl_cffi.requests.Session")
     def test_confirmed_video_failure_does_not_become_photo(self, session_class):

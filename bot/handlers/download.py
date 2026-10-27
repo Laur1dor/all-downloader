@@ -123,7 +123,7 @@ _YT_AUDIO_PREFIX = "yta:"
 _QUALITY_PREFIX = "qh:"
 _DESCRIPTION_PREFIX = "desc:"
 _TIKTOK_FILE_PREFIX = "ttfile:"
-_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_original_v4"
+_TIKTOK_DOCUMENT_CACHE_KEY = "tiktok_document_original_v5"
 _TIKTOK_PHOTO_DOCUMENT_CACHE_KEY = "tiktok_photo_documents_v2"
 # How long interactive questions (compress? video-or-audio?) stay active.
 _COMPRESS_CHOICE_TIMEOUT = 10.0

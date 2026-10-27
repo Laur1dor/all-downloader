@@ -2207,10 +2207,11 @@ def _tiktok_playable(path: Path) -> bool:
 def _repair_tiktok_sei(
     source: Path, max_bytes: int, cancel_event: threading.Event | None,
 ) -> Path | None:
-    """Strip broken H.264 SEI metadata without re-encoding video or audio.
+    """Strip invalid H.264 type-0 units and broken SEI without re-encoding.
 
     Some complete TikTok MP4s contain malformed SEI access units that make
-    strict decoders abort. This bitstream filter removes only SEI (NAL type 6);
+    strict decoders abort. Some sources also insert thousands of unspecified
+    type-0 samples containing no picture. Remove these and SEI (NAL type 6);
     picture NAL units and audio packets are copied. The caller validates the
     entire result before any upload, and keeps the raw file for the file button.
     """
@@ -2248,7 +2249,7 @@ def _repair_tiktok_sei(
         _run_ffmpeg(
             ["ffmpeg", "-nostdin", "-v", "error", "-y", "-threads", "2",
              "-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
-             "-bsf:v", "filter_units=remove_types=6", "-movflags", "+faststart",
+             "-bsf:v", "filter_units=remove_types=0|6", "-movflags", "+faststart",
              str(repaired)],
             30, cancel_event,
         )
@@ -2451,7 +2452,7 @@ def _source_document_probe(path: Path) -> tuple[dict, dict, float]:
 
 
 def _source_document_faststart(path: Path) -> bool:
-    """Read only top-level MP4 box headers, never scan the large mdat payload."""
+    """Require faststart and a usable movie duration, not only decodable tracks."""
     try:
         import struct
 
@@ -2476,6 +2477,28 @@ def _source_document_faststart(path: Path) -> bool:
                 if size < minimum or position + size > length:
                     return False
                 positions.setdefault(kind, position)
+                if kind == b"moov":
+                    end = position + size
+                    valid_movie = False
+                    while stream.tell() + 8 <= end:
+                        child = stream.tell()
+                        child_size, child_kind = struct.unpack(">I4s", stream.read(8))
+                        if child_size < 8 or child + child_size > end:
+                            return False
+                        if child_kind == b"mvhd":
+                            header = stream.read(min(child_size - 8, 32))
+                            if not header or header[0] not in (0, 1):
+                                return False
+                            offset = 20 if header[0] else 12
+                            width = 8 if header[0] else 4
+                            if len(header) < offset + 4 + width:
+                                return False
+                            timescale = int.from_bytes(header[offset:offset + 4], "big")
+                            duration = int.from_bytes(header[offset + 4:offset + 4 + width], "big")
+                            valid_movie = bool(timescale and 0 < duration <= timescale * 4 * 3600)
+                        stream.seek(child + child_size)
+                    if not valid_movie:
+                        return False
                 stream.seek(position + size)
             return b"moov" in positions and b"mdat" in positions and (
                 positions[b"moov"] < positions[b"mdat"]
@@ -2505,10 +2528,11 @@ def _source_document_audio_decode(
     ], 60, cancel)
 
 
-def _source_video_packet_hash(path: Path) -> str:
+def _source_video_packet_hash(path: Path, *, remove_unspecified: bool = False) -> str:
+    filtering = ["-bsf:v", "filter_units=remove_types=0"] if remove_unspecified else []
     result = subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0",
-         "-c", "copy", "-f", "hash", "-hash", "sha256", "-"],
+         "-c", "copy", *filtering, "-f", "hash", "-hash", "sha256", "-"],
         capture_output=True, text=True, timeout=30, check=False,
     )
     if result.returncode or not result.stdout.strip().startswith("SHA256="):
@@ -2543,10 +2567,22 @@ def _prepare_source_document(
                 if index == 0:
                     raise
                 bad_audio.append(index)
+        repair_unspecified = False
         if not bad_audio and _source_document_faststart(path):
-            _source_document_decode(path, cancel)
-            complete = True
-            return SourceDocument(path, video["width"], video["height"], duration, hdr, False)
+            try:
+                _source_document_decode(path, cancel)
+            except MediaPreparationError:
+                if cancel is not None and cancel.is_set():
+                    raise DownloadCancelledError from None
+                if video.get("codec_name") != "h264":
+                    raise
+                # Unspecified type-0 NAL samples have no picture information.
+                # Try removing only those; validate every remaining packet and
+                # compare the filtered stream hash before accepting the repair.
+                repair_unspecified = True
+            else:
+                complete = True
+                return SourceDocument(path, video["width"], video["height"], duration, hdr, False)
         if shutil.disk_usage(path.parent).free < path.stat().st_size + _DOWNLOAD_DISK_FLOOR_BYTES:
             raise DownloadFailedError("Недостаточно места для подготовки исходного файла.")
         command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path)]
@@ -2554,6 +2590,8 @@ def _prepare_source_document(
         for index in bad_audio:
             command.extend(["-map", f"-0:a:{index}"])
         command.extend(["-map_metadata", "0", "-c", "copy"])
+        if repair_unspecified:
+            command.extend(["-bsf:v", "filter_units=remove_types=0"])
         if video.get("codec_name") == "hevc":
             command.extend(["-tag:v", "hvc1"])
         command.extend(["-movflags", "+faststart", str(output)])
@@ -2569,7 +2607,8 @@ def _prepare_source_document(
             or abs(actual - duration) > 1
         ):
             raise DownloadFailedError("Подготовка изменила параметры исходного видео.")
-        if _source_video_packet_hash(path) != _source_video_packet_hash(output):
+        hash_options = {"remove_unspecified": True} if repair_unspecified else {}
+        if _source_video_packet_hash(path, **hash_options) != _source_video_packet_hash(output, **hash_options):
             raise DownloadFailedError("Подготовка изменила исходный видеопоток.")
         _source_document_decode(output, cancel)
         if not _source_document_faststart(output):
@@ -2703,14 +2742,12 @@ def _fetch_tiktok_media(
                                     selected = repaired
                                     original = destination
                                     logger.info("TikTok media repaired by removing invalid SEI")
-                                else:
-                                    repaired.unlink(missing_ok=True)
                             if selected is None:
                                 if progress is not None:
                                     progress.phase = PHASE_PREPARE
                                     progress.started_at = time.monotonic()
                                 converted = _transcode_tiktok_compatible(
-                                    destination, max_bytes, cancel_event,
+                                    repaired or destination, max_bytes, cancel_event,
                                 )
                                 if converted is not None:
                                     if _tiktok_playable(converted):
@@ -2719,6 +2756,8 @@ def _fetch_tiktok_media(
                                         logger.info("TikTok media converted to H.264/AAC")
                                     else:
                                         converted.unlink(missing_ok=True)
+                            if repaired is not None and repaired != selected:
+                                repaired.unlink(missing_ok=True)
                     if selected is not None:
                         video = item.get("video") or {}
                         actual_hdr = _source_hdr_state(original or selected)
