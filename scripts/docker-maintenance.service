@@ -1,0 +1,11 @@
+[Unit]
+Description=Bound Docker build cache and retire old historical images
+After=docker.service
+ConditionPathExists=/var/run/docker.sock
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/adl/docker-maintenance.py --apply --report /root/tiktok-bot/data/audit/docker-maintenance-last.json
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=idle

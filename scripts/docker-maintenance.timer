@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily bounded Docker maintenance
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 Europe/Moscow
+OnBootSec=15min
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

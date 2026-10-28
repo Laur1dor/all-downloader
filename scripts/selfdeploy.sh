@@ -13,6 +13,14 @@
 # operator's notes, and deploying from a mirror is how the two drift apart.
 set -euo pipefail
 
+# Serialize deployment with disk maintenance. A skipped deployment is retried
+# by the existing timer; cleanup must never race a build or rollback retag.
+exec 9>/run/lock/adl-docker-maintenance.lock
+if ! flock -n 9; then
+    echo "Docker maintenance is running; deployment will retry on the next tick"
+    exit 0
+fi
+
 REPO="${DEPLOY_REPO:-/root/deploy-src}"
 LIVE="${DEPLOY_LIVE:-/root/tiktok-bot}"
 IMAGE="${DEPLOY_IMAGE:-tiktok-bot-bot}"
@@ -220,8 +228,9 @@ mv -f "$marker_tmp" "$DEPLOYED_COMMIT"
 # Keep unused BuildKit cache from accumulating on the small LXC disk.
 # This never touches images, volumes or containers, and a pruning failure must
 # not turn a healthy deployment into a failed one.
-if prune_summary="$(timeout 90s docker builder prune \
-        --reserved-space 2gb --force 2>&1 | tail -n 1)"; then
+if prune_summary="$(timeout 90s docker builder prune --all \
+        --max-used-space 1gb --reserved-space 512mb --min-free-space 5gb \
+        --force 2>&1 | tail -n 1)"; then
     log "build cache cleanup: $prune_summary"
 else
     log "WARN: build cache cleanup failed: $prune_summary"
@@ -242,8 +251,11 @@ if ! cmp -s "$LIVE/scripts/selfdeploy.sh" /usr/local/bin/selfdeploy.sh; then
     install -m 755 "$LIVE/scripts/selfdeploy.sh" /usr/local/bin/selfdeploy.sh
     log "deploy script updated; it takes effect next run"
 fi
+if [ -f "$LIVE/scripts/docker-maintenance.py" ]; then
+    install -D -m 755 "$LIVE/scripts/docker-maintenance.py" /usr/local/lib/adl/docker-maintenance.py
+fi
 units_changed=0
-for unit in selfdeploy.service selfdeploy.timer; do
+for unit in selfdeploy.service selfdeploy.timer docker-maintenance.service docker-maintenance.timer; do
     [ -f "$LIVE/scripts/$unit" ] || continue
     if ! cmp -s "$LIVE/scripts/$unit" "/etc/systemd/system/$unit"; then
         install -m 644 "$LIVE/scripts/$unit" "/etc/systemd/system/$unit"
