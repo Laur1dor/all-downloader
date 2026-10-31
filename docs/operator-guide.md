@@ -160,6 +160,18 @@ PSNR/SSIM относительно несжатых SDR-кадров. Это и�
 может задавать `runtime: nvidia`, `NVIDIA_VISIBLE_DEVICES: all`,
 `NVIDIA_DRIVER_CAPABILITIES: compute,video,utility` и дополнительную группу GPU.
 Самодеплой проверяет этот override вместе с новой основной конфигурацией.
+В LXC с устройствами `root:render` и правами `0660` задайте в
+`/etc/nvidia-container-runtime/config.toml` в секции `[nvidia-container-cli]`
+`user = "root:render"`, сохранив `no-cgroups = true` и режим `legacy`.
+Без явной учётной записи служебный процесс может запускаться от `nobody`:
+тогда после перезапуска Docker контейнер не стартует с ошибкой NVML
+`insufficient permissions`, хотя root внутри LXC открывает `/dev/nvidia*`.
+Это настройка служебного процесса Toolkit, а пользователь самого бота
+остаётся прежним. Открывать GPU-устройства для всех через `chmod 666` не нужно.
+Для диагностики сравните `nvidia-container-cli info` с
+`nvidia-container-cli --user=0:$(getent group render | cut -d: -f3) info`.
+После настройки проверьте новый контейнер с `--runtime=nvidia` и реальным
+`h264_nvenc`: проверка уже запущенного процесса не покрывает prestart hook.
 На серверах без GPU остаётся CPU-вариант. При ошибке NVENC, изменении геометрии,
 неполном файле или потере кадров результат удаляется и обработка повторяется
 на CPU; отмена пользователем не запускает повторную обработку.
