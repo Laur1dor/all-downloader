@@ -2195,6 +2195,7 @@ def _tiktok_playable(path: Path) -> bool:
             stderr = decode.stderr.decode(errors="replace").lower()
             reason = (
                 "invalid H.264 access unit" if "missing picture in access unit" in stderr
+                else "invalid AAC audio packet" if "[aac @" in stderr
                 else "decoder rejected packets"
             )
             logger.warning("TikTok media rejected: %s", reason)
@@ -2266,6 +2267,79 @@ def _repair_tiktok_sei(
     finally:
         if not completed:
             repaired.unlink(missing_ok=True)
+
+
+def _repair_tiktok_auxiliary_audio(
+    source: Path, max_bytes: int, cancel_event: threading.Event | None,
+) -> Path | None:
+    """Copy usable streams while dropping only proven-bad secondary audio.
+
+    A failed primary track is never silently removed. The caller still fully
+    validates video and sound, and may apply the existing NAL repair afterwards.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError
+    output = source.with_name(f"{source.stem}-audio-compatible.mp4")
+    complete = False
+    try:
+        data, video, duration = _source_document_probe(source)
+        audio = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+        if len(audio) < 2:
+            return None
+        bad_audio = []
+        for index in range(len(audio)):
+            try:
+                _source_document_audio_decode(source, index, cancel_event)
+            except MediaPreparationError:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError from None
+                if index == 0:
+                    logger.warning("TikTok audio repair rejected: primary audio is damaged")
+                    return None
+                bad_audio.append(index)
+        if not bad_audio:
+            return None
+        if shutil.disk_usage(source.parent).free < source.stat().st_size + _DOWNLOAD_DISK_FLOOR_BYTES:
+            logger.warning("TikTok audio repair skipped: insufficient disk space")
+            return None
+        output.unlink(missing_ok=True)
+        command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+                   "-map", "0:v:0", "-map", "0:a?"]
+        for index in bad_audio:
+            command.extend(["-map", f"-0:a:{index}"])
+        command.extend(["-map_metadata", "0", "-c", "copy", "-movflags", "+faststart", str(output)])
+        _run_ffmpeg(command, 60, cancel_event)
+        if not output.is_file() or not 0 < output.stat().st_size <= max_bytes:
+            return None
+        _, prepared, actual = _source_document_probe(output)
+        from bot.tiktok_hdr import hdr_state_from_stream
+
+        properties = ("codec_name", "pix_fmt", "width", "height", "color_transfer",
+                      "color_primaries", "color_space", "r_frame_rate")
+        if (any(video.get(key) != prepared.get(key) for key in properties)
+                or hdr_state_from_stream(video) != hdr_state_from_stream(prepared)
+                or abs(actual - duration) > 1):
+            logger.warning("TikTok audio repair rejected: source video metadata changed")
+            return None
+        # Empty H.264 type-0 units carry no picture; the NAL repair may remove
+        # those next. Every valid video packet must already be unchanged here.
+        options = {"remove_unspecified": True} if video.get("codec_name") == "h264" else {}
+        if _source_video_packet_hash(source, **options) != _source_video_packet_hash(output, **options):
+            logger.warning("TikTok audio repair rejected: video packets changed")
+            return None
+        logger.info("TikTok auxiliary audio repaired: dropped tracks=%s", bad_audio)
+        complete = True
+        return output
+    except DownloadCancelledError:
+        raise
+    except (DownloadFailedError, MediaPreparationError, OSError, subprocess.SubprocessError):
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError from None
+        logger.warning("TikTok auxiliary audio repair failed")
+        return None
+    finally:
+        if not complete:
+            output.unlink(missing_ok=True)
 
 
 def _tiktok_conversion_budget(video: dict, duration: float) -> float:
@@ -2779,9 +2853,17 @@ def _fetch_tiktok_media(
                         elif _tiktok_playable(destination):
                             selected = destination
                         else:
-                            repaired = _repair_tiktok_sei(
+                            auxiliary = _repair_tiktok_auxiliary_audio(
                                 destination, max_bytes, cancel_event,
                             )
+                            repaired = None
+                            if auxiliary is not None and _tiktok_playable(auxiliary):
+                                selected = auxiliary
+                                original = destination
+                            if selected is None:
+                                repaired = _repair_tiktok_sei(
+                                    auxiliary or destination, max_bytes, cancel_event,
+                                )
                             if repaired is not None:
                                 if _tiktok_playable(repaired):
                                     selected = repaired
@@ -2792,7 +2874,7 @@ def _fetch_tiktok_media(
                                     progress.phase = PHASE_PREPARE
                                     progress.started_at = time.monotonic()
                                 converted = _transcode_tiktok_compatible(
-                                    repaired or destination, max_bytes, cancel_event,
+                                    repaired or auxiliary or destination, max_bytes, cancel_event,
                                 )
                                 if converted is not None:
                                     if _tiktok_playable(converted):
@@ -2803,6 +2885,8 @@ def _fetch_tiktok_media(
                                         converted.unlink(missing_ok=True)
                             if repaired is not None and repaired != selected:
                                 repaired.unlink(missing_ok=True)
+                            if auxiliary is not None and auxiliary != selected:
+                                auxiliary.unlink(missing_ok=True)
                     if selected is not None:
                         video = item.get("video") or {}
                         actual_hdr = _source_hdr_state(original or selected)
