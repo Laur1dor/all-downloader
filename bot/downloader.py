@@ -2686,19 +2686,19 @@ def _prepare_source_document(
                 if index == 0:
                     raise
                 bad_audio.append(index)
-        repair_unspecified = False
+        # Independent defects can coexist. Whenever H.264 already needs a
+        # remux (bad movie header, moov at end, broken extra audio), remove
+        # empty type-0 units too. They never contain valid pictures. This also
+        # avoids decoding healthy remux-only sources twice before validation.
+        repair_unspecified = video.get("codec_name") == "h264"
         if not bad_audio and _source_document_faststart(path):
             try:
                 _source_document_decode(path, cancel)
             except MediaPreparationError:
                 if cancel is not None and cancel.is_set():
                     raise DownloadCancelledError from None
-                if video.get("codec_name") != "h264":
+                if not repair_unspecified:
                     raise
-                # Unspecified type-0 NAL samples have no picture information.
-                # Try removing only those; validate every remaining packet and
-                # compare the filtered stream hash before accepting the repair.
-                repair_unspecified = True
             else:
                 complete = True
                 return SourceDocument(path, video["width"], video["height"], duration, hdr, False)
@@ -2710,7 +2710,7 @@ def _prepare_source_document(
             command.extend(["-map", f"-0:a:{index}"])
         command.extend(["-map_metadata", "0", "-c", "copy"])
         if repair_unspecified:
-            command.extend(["-bsf:v", "filter_units=remove_types=0"])
+            command.extend(["-bsf:v:0", "filter_units=remove_types=0"])
         if video.get("codec_name") == "hevc":
             command.extend(["-tag:v", "hvc1"])
         command.extend(["-movflags", "+faststart", str(output)])
@@ -2737,6 +2737,7 @@ def _prepare_source_document(
     except MediaPreparationError as exc:
         if cancel is not None and cancel.is_set():
             raise DownloadCancelledError from None
+        logger.warning("TikTok source document validation failed: %s", str(exc)[-1200:])
         raise DownloadFailedError(
             "Исходный файл повреждён; сохранить видео и звук не удалось."
         ) from exc
