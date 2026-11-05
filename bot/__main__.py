@@ -70,6 +70,7 @@ async def _set_command_menus(bot: Bot, settings: Settings) -> None:
         BotCommand(command="events", description="📊 Действия пользователей"),
         BotCommand(command="analytics", description="📊 Активность и надёжность"),
         BotCommand(command="analytics_export", description="📄 Выгрузка событий CSV"),
+        BotCommand(command="errors", description="Ошибки, доставка и восстановление"),
         BotCommand(command="users", description="👥 Найти пользователя"),
         BotCommand(command="tell", description="✉️ Написать пользователю"),
         BotCommand(command="broadcast", description="📣 Создать рассылку"),
@@ -103,6 +104,8 @@ async def _set_command_menus(bot: Bot, settings: Settings) -> None:
 
 async def run() -> None:
     settings = load_settings()
+    from bot import observability
+    journal, audit_log = observability.install(Path('data/operational.sqlite3'))
 
     db = Database(settings.database_dsn)
     await db.connect()
@@ -198,6 +201,7 @@ async def run() -> None:
             await asyncio.sleep(3600)
 
     retention_worker = asyncio.create_task(retain_events())
+    audit_worker = asyncio.create_task(observability.worker(journal,bot,db.pool,settings.admin_id))
     try:
         await _set_command_menus(bot, settings)
         try:
@@ -206,11 +210,11 @@ async def run() -> None:
         except TelegramAPIError as exc:
             logger.warning("Could not notify the admin about startup: %s", exc)
         logger.info("Starting polling")
-        await dispatcher.start_polling(bot)
+        await dispatcher.start_polling(bot, tasks_concurrency_limit=64)
     finally:
         with suppress(Exception):
             await db.record_event(settings.admin_id, "system:shutdown", "ok")
-        for task in (announcement_worker, retention_worker):
+        for task in (announcement_worker, retention_worker, audit_worker):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -218,6 +222,9 @@ async def run() -> None:
         await proxy_router.stop()
         await health_runner.cleanup()
         await db.close()
+        logging.getLogger().removeHandler(audit_log)
+        observability._current = None
+        journal.sql.close()
 
 
 def main() -> None:

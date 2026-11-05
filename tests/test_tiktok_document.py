@@ -136,9 +136,10 @@ class TikTokDocumentTests(unittest.IsolatedAsyncioTestCase):
                     [call.args[0] for call in message.answer_document.await_args_list],
                     [f"doc-id-{i}" for i in range(1, 32)],
                 )
-                self.assertEqual(db.add_conversion.await_args.args[1], handler.STATUS_DONE)
+                self.assertEqual(record.await_count, 2)
+                self.assertEqual(record.await_args.args[2], handler.STATUS_DONE)
                 self.assertEqual(
-                    db.add_conversion.await_args.kwargs["file_size"], sum(range(1, 32)),
+                    record.await_args.args[6], sum(range(1, 32)),
                 )
 
             self.assertEqual(message.answer_document.await_count, 31)

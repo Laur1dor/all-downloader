@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 
 logger = logging.getLogger(__name__)
 
@@ -167,14 +167,46 @@ class OutgoingLimiter(BaseRequestMiddleware):
 
     async def __call__(self, make_request: Callable[..., Any], bot: Any,
                        method: Any) -> Any:
+        from bot import observability as audit
         if method.__api_method__ in _READ_METHODS:
             return await make_request(bot, method)
+        job = audit._job.get()
+        journal = audit.current()
+        chat = getattr(method,'chat_id',None)
+        if (job and chat == job.user and job.blocked) or (
+                journal and isinstance(chat,int) and journal.is_blocked(chat)):
+            raise TelegramForbiddenError(method, 'Chat blocked; remaining work cancelled')
         deadline = time.monotonic() + _MAX_WAIT
         for attempt in range(2):
             await self._admit(method, deadline)
+            if (job and chat == job.user and job.blocked) or (
+                    journal and isinstance(chat,int) and journal.is_blocked(chat)):
+                raise TelegramForbiddenError(method,'Chat became blocked while queued')
             try:
-                return await make_request(bot, method)
+                result = await make_request(bot, method)
+                text = getattr(method,'text',None)
+                if isinstance(text,str) and text.startswith(('⚠','❌')):
+                    audit.record('user_notice')
+                    if job and job.result is None:
+                        job.result='user_notice'
+                if job and method.__api_method__ in _MEDIA_METHODS:
+                    job.delivered += len(result) if isinstance(result,list) else 1
+                    audit.record('delivered',delivered=job.delivered)
+                if journal and chat is not None and method.__api_method__.startswith('send'):
+                    journal.resolve(f'chat:{chat}')
+                return result
+            except TelegramForbiddenError:
+                if journal and isinstance(chat,int):
+                    journal.block(chat)
+                if job and chat == job.user:
+                    job.blocked = True
+                    job.reason = 'TelegramForbiddenError'
+                    for cancel in job.cancels:
+                        cancel.set()
+                audit.record('blocked',delivered=job.delivered if job else 0)
+                raise
             except TelegramRetryAfter as exc:
+                audit.record('telegram_retry_after')
                 seconds = max(0.1, float(exc.retry_after))
                 async with self._condition:
                     self._cooldown_until = max(self._cooldown_until,

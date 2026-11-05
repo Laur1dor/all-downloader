@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import OrderedDict
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message, TelegramObject
@@ -36,11 +37,13 @@ _NOTICE_EVERY_SECONDS = 60.0
 class FloodMiddleware(BaseMiddleware):
     def __init__(self, admin_id: int) -> None:
         self._admin_id = admin_id
-        self._buckets: dict[int, tuple[float, float]] = {}
-        self._told: dict[int, float] = {}
+        self._buckets = OrderedDict()
+        self._told = OrderedDict()
 
     def _allow(self, user_id: int) -> bool:
         now = time.monotonic()
+        if user_id not in self._buckets and len(self._buckets) >= 5000:
+            self._buckets.popitem(last=False)
         tokens, stamp = self._buckets.get(user_id, (FLOOD_MESSAGES, now))
         tokens = min(
             FLOOD_MESSAGES,
@@ -58,6 +61,8 @@ class FloodMiddleware(BaseMiddleware):
         if previous is not None and now - previous < _NOTICE_EVERY_SECONDS:
             return False
         self._told[user_id] = now
+        if len(self._told) > 5000:
+            self._told.popitem(last=False)
         return True
 
     async def __call__(self, handler, event: TelegramObject, data: dict):

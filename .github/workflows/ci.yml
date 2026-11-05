@@ -29,6 +29,18 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +66,8 @@ jobs:
           trap 'sudo rm -f "$protected_env"' EXIT
           sudo chown root:root "$protected_env"
           sudo chmod 600 "$protected_env"
-          docker run --rm -v "$PWD:/src" -v "$protected_env:/src/.env:ro" -w /src \
+          docker run --rm --network host -e OPERATIONAL_TEST_DSN=postgresql://ci:ci@127.0.0.1:5432/ci \
+            -v "$PWD:/src" -v "$protected_env:/src/.env:ro" -w /src \
             bot-ci:${{ github.sha }} python -m tests.smoke_test
 
   images:

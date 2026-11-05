@@ -18,6 +18,13 @@ def mark_outcome(outcome: str) -> None:
     """Record a handled download result in the current update's event journal."""
     if outcome in {"done", "failed", "cancelled", "rate_limited", "delivery_unknown"}:
         _handled_outcome.set(outcome)
+        from bot import observability
+        import sys
+        job = observability._job.get()
+        error = sys.exc_info()[1]
+        if job and error is not None:
+            job.reason = type(error).__name__
+        observability.outcome(outcome)
 
 
 def action_name(event: TelegramObject) -> str:
@@ -41,12 +48,14 @@ class EventMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         db = data.get("db")
         if user is None or db is None:
-            return await handler(event, data)
+            from bot.observability import run_event
+            return await run_event(handler, event, data)
         started = time.monotonic()
         outcome = "ok"
         token = _handled_outcome.set(None)
         try:
-            return await handler(event, data)
+            from bot.observability import run_event
+            return await run_event(handler, event, data)
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
@@ -58,9 +67,10 @@ class EventMiddleware(BaseMiddleware):
                 outcome = _handled_outcome.get()
             _handled_outcome.reset(token)
             try:
-                await db.record_event(
-                    user.id, action_name(event), outcome,
-                    min(int((time.monotonic() - started) * 1000), 2_147_483_647),
-                )
+                if not data.get('_audit_refused') and outcome != 'rate_limited':
+                    await asyncio.wait_for(db.record_event(
+                        user.id, action_name(event), outcome,
+                        min(int((time.monotonic() - started) * 1000), 2_147_483_647),
+                    ),timeout=3)
             except Exception:
                 logger.warning("Could not record user event", exc_info=True)

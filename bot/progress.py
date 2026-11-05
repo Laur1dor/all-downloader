@@ -51,6 +51,19 @@ class ProgressState:
     part_index: int = 1
     part_count: int = 1
 
+    def __setattr__(self, name, value):
+        object.__setattr__(self,name,value)
+        if name == 'phase':
+            # Worker threads only update state; SQLite belongs to the event
+            # loop. The progress reader records their phase on its next tick.
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            from bot.observability import stage
+            stage(value)
+
 
 class CancelRegistry:
     """Maps active download tokens to their cancellation events."""
@@ -60,6 +73,8 @@ class CancelRegistry:
 
     def register(self, token: str) -> threading.Event:
         event = threading.Event()
+        from bot.observability import attach_cancel
+        attach_cancel(event)
         self._events[token] = event
         return event
 
@@ -81,6 +96,8 @@ def _bar(filled: int) -> str:
 
 def render_progress(progress: ProgressState, media_kind: str, tick: int = 0) -> str | None:
     """Build the status message for the current phase; None = keep the previous text."""
+    from bot.observability import stage
+    stage(progress.phase)
     if progress.phase == PHASE_PAUSED:
         return None
     if progress.phase in (PHASE_QUEUE, PHASE_PREPARE, PHASE_RESOLVE):

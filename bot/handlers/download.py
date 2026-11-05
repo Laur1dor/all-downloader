@@ -249,6 +249,8 @@ async def _admitted_media(
 ):
     """Bound retained large sources; release network slots before preparation."""
     global _large_source_waiters
+    from bot.observability import ensure_available
+    ensure_available()
     acquired_large = False
     if large_source:
         if _large_source_slots.locked() and _large_source_waiters >= _MAX_LARGE_SOURCE_WAITERS:
@@ -277,6 +279,7 @@ async def _admitted_media(
     try:
         async with AsyncExitStack() as stack:
             async with (nullcontext() if is_admin else _download_slots):
+                ensure_available()
                 media = await stack.enter_async_context(context)
                 if (
                     not acquired_large and large_if_bytes is not None
@@ -443,6 +446,9 @@ async def _send_paced(
     build: Callable[[], Awaitable[Any] | TelegramMethod[Any]], timeout: int,
 ) -> Any:
     """Keep the media upload deadline; the session admits and retries calls."""
+    from bot.observability import ensure_available, stage
+    ensure_available()
+    stage('upload')
     request = build()
     deadline = timeout
     if isinstance(request, TelegramMethod) and request.bot is not None:
@@ -514,6 +520,8 @@ def _rate_delay(user_id: int) -> float:
         _rate_buckets[user_id] = (tokens, now)
         return (1.0 - tokens) * _RATE_WINDOW_SECONDS / _RATE_TOKENS
     _rate_buckets[user_id] = (tokens - 1.0, now)
+    if len(_rate_buckets) > 5000:
+        _rate_buckets.pop(next(iter(_rate_buckets)))
     return 0.0
 
 
@@ -880,7 +888,7 @@ async def _record(
     status: str,
     platform: str,
     media_type: str,
-    started: float,
+    started: float | None,
     file_size: int | None = None,
 ) -> None:
     if (
@@ -889,12 +897,19 @@ async def _record(
         and _instagram_watch is not None
     ):
         _instagram_watch.nudge()
-    await db.add_conversion(
-        telegram_id, status, platform, media_type,
-        file_size=file_size,
-        processing_time=time.monotonic() - started,
-    )
+    from bot.observability import set_source
+    set_source(platform)
     mark_outcome(status)
+    try:
+        await asyncio.wait_for(db.add_conversion(
+            telegram_id, status, platform, media_type,
+            file_size=file_size,
+            processing_time=time.monotonic() - started if started is not None else 0.0,
+        ), timeout=5)
+    except Exception:
+        # The durable operational journal already has the confirmed result.
+        # A failed statistics write must not change a delivered video to failed.
+        logger.warning("Conversion statistics unavailable", exc_info=True)
 
 
 @router.message(F.text.startswith(("https://", "http://")))
@@ -960,6 +975,9 @@ async def _run_link(
     platform = detect_platform(url)
 
     user_id = message.from_user.id
+    from bot.observability import set_source, stage
+    set_source(platform)
+    stage('resolve')
     is_admin = user_id == settings.admin_id
     await db.upsert_user(user_id, message.from_user.username)
 
@@ -2001,11 +2019,8 @@ async def _send_cached_video(
                 hash_url(url), store_key, cached["file_id"], cached["file_size"],
                 description=upgraded_description,
             )
-        await db.add_conversion(
-            message.from_user.id, STATUS_DONE, platform, "video",
-            file_size=cached["file_size"], processing_time=0.0,
-        )
-        mark_outcome(STATUS_DONE)
+        await _record(db,message.from_user.id,STATUS_DONE,platform,"video",
+                      None,cached["file_size"])
         return True
     return False
 
@@ -2215,15 +2230,11 @@ async def handle_tiktok_file_request(
                     await callback.message.answer(
                         "⚠️ Один из сохранённых файлов недоступен. Отправьте ссылку ещё раз."
                     )
-                    await db.add_conversion(user_id, STATUS_FAILED, "tiktok", "document")
-                    mark_outcome(STATUS_FAILED)
+                    await _record(db,user_id,STATUS_FAILED,"tiktok","document",None)
                     return
             else:
-                await db.add_conversion(user_id, STATUS_DONE, "tiktok", "document",
-                                        file_size=sum(item["file_size"] or 0
-                                                      for item in cached_items),
-                                        processing_time=0.0)
-                mark_outcome(STATUS_DONE)
+                await _record(db,user_id,STATUS_DONE,"tiktok","document",None,
+                              sum(item["file_size"] or 0 for item in cached_items))
                 return
         original_path = None if photo_post else _tiktok_original_path(url)
         delay = _rate_delay(user_id) if not is_admin and original_path is None else 0
@@ -2236,6 +2247,9 @@ async def handle_tiktok_file_request(
         started = time.monotonic()
         try:
             async with (nullcontext() if is_admin else _download_slots):
+                from bot.observability import ensure_available, stage
+                ensure_available()
+                stage('prepare' if original_path is not None else 'download')
                 if original_path is not None:
                     # Lease a second hard link so cache eviction cannot remove
                     # the source while this document is uploading.
@@ -2380,11 +2394,7 @@ async def _run_audio_flow(
         except TelegramBadRequest:
             await db.delete_cached_file(hash_url(url), "audio")
         else:
-            await db.add_conversion(
-                user_id, STATUS_DONE, platform, "audio",
-                file_size=cached["file_size"], processing_time=0.0,
-            )
-            mark_outcome(STATUS_DONE)
+            await _record(db,user_id,STATUS_DONE,platform,"audio",None,cached["file_size"])
             if status_message is not None:
                 await _delete_silently(status_message)
             return

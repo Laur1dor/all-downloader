@@ -99,6 +99,18 @@ async def run_worker(bot: Bot, db: Database) -> None:
             error,
             float(delay),
         )
+        from bot.observability import current, Job
+        journal = current()
+        if journal:
+            job = Job(f"broadcast:{row['broadcast_id']}:{row['telegram_id']}",
+                      f"broadcast:{row['broadcast_id']}:{row['telegram_id']}",
+                      row['telegram_id'],'broadcast','telegram','upload',
+                      delivered=int(state=='sent'),reason=error or state)
+            journal.event(job,state)
+            if state in {'blocked','failed','uncertain'}:
+                journal.incident(job,{'uncertain':'delivery_unknown'}.get(state,state),0)
+            elif state == 'sent':
+                journal.resolve(job.scope)
         await asyncio.sleep(1)
 
 
@@ -110,7 +122,10 @@ async def supervised_worker(bot: Bot, db: Database) -> None:
             raise
         except Exception:
             logger.exception("Announcement worker failed; recovering in 10 seconds")
-            await db.pool.execute(
-                "UPDATE broadcast_recipients SET state='uncertain' WHERE state='sending'"
-            )
+            try:
+                await db.pool.execute(
+                    "UPDATE broadcast_recipients SET state='uncertain' WHERE state='sending'"
+                )
+            except Exception:
+                logger.warning("Announcement recovery database unavailable",exc_info=True)
             await asyncio.sleep(10)

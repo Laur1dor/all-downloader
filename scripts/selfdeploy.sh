@@ -200,6 +200,14 @@ rollback() {
     fi
 }
 
+# The running bot checks this same marker while holding SQLite admission's
+# write lock. New downloads pause; controls/cancellation remain available.
+trap 'rm -f "$LIVE/data/operational.drain"' EXIT
+if ! python3 "$LIVE/scripts/operational-drain.py" "$LIVE/data/operational.sqlite3"; then
+    log "active jobs remain — rollout deferred; the healthy bot was not restarted"
+    exit 0
+fi
+
 if ! docker compose up -d --no-deps --no-build bot; then
     rollback
     exit 1

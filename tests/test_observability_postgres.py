@@ -1,0 +1,44 @@
+"""Real PostgreSQL acknowledgement-loss/recovery check, isolated TEMP tables."""
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from bot.observability import Journal, Job
+
+
+@unittest.skipUnless(os.getenv('OPERATIONAL_TEST_DSN'),'needs isolated PostgreSQL session')
+class OperationalPostgresTests(unittest.IsolatedAsyncioTestCase):
+    async def test_committed_batch_lost_ack_and_database_reconnect(self):
+        import asyncpg
+        conn=await asyncpg.connect(os.environ['OPERATIONAL_TEST_DSN'])
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Journal(Path(temp)/'journal.sqlite3')
+            try:
+                # Always TEMP, even when operator runs this against the runtime
+                # database. No test writes to real operational/conversion rows.
+                await conn.execute('CREATE TEMP TABLE operational_events(id TEXT PRIMARY KEY,ts DOUBLE PRECISION,job TEXT,user_id BIGINT,action TEXT,status TEXT,stage TEXT,source TEXT,details JSONB)')
+                journal.event(Job('a','scope',200,'download'),'delivery_unknown')
+                async def lost_ack(query,rows):
+                    await conn.executemany(query,rows)
+                    raise ConnectionError('simulated acknowledgement loss after commit')
+                with self.assertRaises(ConnectionError):
+                    await journal.mirror(SimpleNamespace(execute=conn.execute,executemany=lost_ack))
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM operational_events'),1)
+                await journal.mirror(conn)
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM operational_events'),1)
+                await conn.close()
+                journal.event(Job('b','scope2',200,'download'),'failed')
+                with self.assertRaises(Exception):await journal.mirror(conn)
+                journal.pg_ready=False
+                conn=await asyncpg.connect(os.environ['OPERATIONAL_TEST_DSN'])
+                await conn.execute('CREATE TEMP TABLE operational_events(id TEXT PRIMARY KEY,ts DOUBLE PRECISION,job TEXT,user_id BIGINT,action TEXT,status TEXT,stage TEXT,source TEXT,details JSONB)')
+                await journal.mirror(conn)
+                self.assertEqual(await conn.fetchval('SELECT status FROM operational_events'),'failed')
+                self.assertEqual(journal.sql.execute('SELECT count(*) FROM events WHERE mirrored=0').fetchone()[0],0)
+                await conn.execute('UPDATE operational_events SET ts=0')
+                await journal.mirror(conn)
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM operational_events'),0)
+            finally:
+                journal.sql.close()
+                await conn.close()

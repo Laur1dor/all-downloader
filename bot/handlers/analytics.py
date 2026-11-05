@@ -74,6 +74,28 @@ def create_router(admin_id: int) -> Router:
     router.message.filter(F.from_user.id == admin_id, F.chat.type == "private")
     router.callback_query.filter(F.from_user.id == admin_id, F.message.chat.type == "private")
 
+    @router.message(Command("errors"))
+    async def errors(message: Message) -> None:
+        from bot.observability import current, format_incident
+        journal = current()
+        if journal is None:
+            await message.answer("Операционный журнал пока не подключён.")
+            return
+        parts = (message.text or '').split(maxsplit=1)
+        if len(parts) == 2:
+            ident = parts[1].strip()
+            if len(ident) != 24 or any(c not in '0123456789abcdef' for c in ident):
+                await message.answer("/errors или /errors диагностический_ID")
+                return
+            await message.answer_document(BufferedInputFile(journal.export(ident),filename=f'incident-{ident}.json'))
+            return
+        rows = journal.rows(4)
+        counters = journal.sql.execute("SELECT name,value FROM counters ORDER BY value DESC LIMIT 12").fetchall()
+        text = 'Операционный журнал · последние 4 группы\n' + '\n'.join(f'{r[0]}: {r[1]}' for r in counters)
+        await message.answer(text)
+        for row in rows:
+            await message.answer(format_incident(row,admin_id))
+
     @router.message(Command("dashboard"))
     async def show_dashboard(message: Message, db: Database) -> None:
         parts = (message.text or "").split(maxsplit=1)
