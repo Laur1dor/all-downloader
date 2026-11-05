@@ -276,7 +276,7 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
             except BlockedAddressError:mark_outcome('failed')
         await audit.run_event(handler,message(),dict(self.data))
         self.assertEqual(len(self.journal.rows()),0)
-        self.assertEqual(self.journal.sql.execute("SELECT value FROM counters WHERE name='failed'").fetchone()[0],1)
+        self.assertEqual(self.journal.sql.execute("SELECT value FROM counters WHERE name='rejected'").fetchone()[0],1)
 
     async def test_cancel_preserves_interrupted_outcome_and_releases_capacity(self):
         async def handler(*_):await asyncio.Event().wait()
@@ -355,7 +355,7 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_network_await_does_not_lock_other_writers(self):
         import sqlite3
         self.journal.incident(audit.Job('id','scope',200,'download'),'failed',100)
-        async def send(*_):
+        async def send(*_,**__):
             other=sqlite3.connect(self.path,timeout=.05)
             try:other.execute('BEGIN IMMEDIATE');other.commit()
             finally:other.close()

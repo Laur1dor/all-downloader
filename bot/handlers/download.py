@@ -450,6 +450,8 @@ async def _send_paced(
     ensure_available()
     stage('upload')
     request = build()
+    from bot.observability import request_context
+    request_context(telegram_method=getattr(request,'__api_method__',None))
     deadline = timeout
     if isinstance(request, TelegramMethod) and request.bot is not None:
         server = request.bot.session.api
@@ -891,15 +893,16 @@ async def _record(
     started: float | None,
     file_size: int | None = None,
 ) -> None:
+    from bot.observability import set_source, request_context
+    set_source(platform)
+    request_context(operation={'document':'file'}.get(media_type,media_type))
+    status=mark_outcome(status)
     if (
         status == STATUS_FAILED
         and platform == "instagram"
         and _instagram_watch is not None
     ):
         _instagram_watch.nudge()
-    from bot.observability import set_source
-    set_source(platform)
-    mark_outcome(status)
     try:
         await asyncio.wait_for(db.add_conversion(
             telegram_id, status, platform, media_type,
@@ -1001,6 +1004,9 @@ async def _run_link(
     if platform == "pinterest" and not re.fullmatch(r"/pin/\d+/?", urlparse(url).path):
         await message.answer("⚠️ Пришлите ссылку на отдельный пин Pinterest, не доску или профиль.")
         return
+
+    from bot.observability import request_context
+    request_context(resolved_url=url,time_range=time_range)
 
     try:
         ensure_public_url(url)
@@ -1152,6 +1158,7 @@ async def _run_link(
             )
             return
         if chosen is not None:
+            request_context(height=chosen.height)
             estimated_size = chosen.estimated_size
             format_override = quality_selector(chosen)
             cache_key = _video_cache_key(platform, height=chosen.height)
@@ -2380,6 +2387,8 @@ async def _run_audio_flow(
     time_range: tuple[int, int] | None = None,
 ) -> None:
     """Extract and send the audio track; shared by the button and the YouTube choice."""
+    from bot.observability import request_context
+    request_context(operation='audio',time_range=time_range)
     cached = None if time_range is not None else await db.get_cached_file(hash_url(url), "audio")
     if cached is not None:
         try:

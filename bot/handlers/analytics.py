@@ -94,7 +94,8 @@ def create_router(admin_id: int) -> Router:
         text = 'Операционный журнал · последние 4 группы\n' + '\n'.join(f'{r[0]}: {r[1]}' for r in counters)
         await message.answer(text)
         for row in rows:
-            await message.answer(format_incident(row,admin_id))
+            await message.answer(format_incident(row,admin_id),parse_mode='HTML',
+                                 link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     @router.message(Command("dashboard"))
     async def show_dashboard(message: Message, db: Database) -> None:

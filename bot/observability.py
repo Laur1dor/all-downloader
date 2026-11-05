@@ -1,4 +1,4 @@
-"""Bounded local operational journal; no message bodies, credentials or URLs.
+"""Bounded journal; only sanitized public entry links, never bodies/credentials.
 
 SQLite is authoritative for admission and incidents. PostgreSQL is an idempotent
 mirror, never a prerequisite for telemetry. No model or automatic code repair.
@@ -16,6 +16,7 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from bot.incident_context import clean_context, expected_input_error, public_entry_url, reproduction, user_link
 
 _current = None
 _job: ContextVar[Job | None] = ContextVar("operational_job", default=None)
@@ -53,6 +54,8 @@ class Job:
     reason: str = ""
     blocked: bool = False
     cancels: list = field(default_factory=list)
+    context: dict = field(default_factory=dict)
+    input_kind: str = 'unknown'
 
 
 def digest(value: str) -> str:
@@ -82,7 +85,8 @@ class Journal:
           stage TEXT, source TEXT, user INTEGER, own INTEGER, state TEXT, count INTEGER,
           first REAL, last REAL, restored REAL, delivered INTEGER, reason TEXT,
           revision INTEGER DEFAULT 1, sent_revision INTEGER DEFAULT 0,
-          message INTEGER, next_notice REAL DEFAULT 0, attempts INTEGER DEFAULT 0);
+          message INTEGER, next_notice REAL DEFAULT 0, attempts INTEGER DEFAULT 0,
+          context TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS claims(id TEXT PRIMARY KEY, work TEXT, user INTEGER,
           state TEXT, ts REAL);
         CREATE INDEX IF NOT EXISTS claim_work ON claims(work,state);
@@ -100,16 +104,28 @@ class Journal:
         self.logs = queue.Queue(maxsize=256)
         self.log_overflow = 0
         self._writes = 0
+        if 'context' not in {r['name'] for r in self.sql.execute('PRAGMA table_info(incidents)')}:
+            self.sql.execute("ALTER TABLE incidents ADD COLUMN context TEXT NOT NULL DEFAULT '{}'")
+            # Refresh existing owner messages with real profile anchors. Missing
+            # historic URLs stay explicitly unknown, never guessed or fabricated.
+            self.sql.execute('UPDATE incidents SET revision=revision+1 WHERE message>0')
+            self.sql.commit()
         # Never replay uncertain work after restart. Stable claims still suppress
         # the same Telegram update; a new user request is a new operation.
         for row in self.sql.execute("SELECT * FROM claims WHERE state='running'").fetchall():
             job = Job(row['id'], row['work'], row['user'], 'restart')
-            last = self.sql.execute('SELECT action,source,stage FROM events WHERE job=? ORDER BY ts DESC LIMIT 1',(row['id'],)).fetchone()
+            last = self.sql.execute('SELECT action,source,stage,details FROM events WHERE job=? ORDER BY ts DESC LIMIT 1',(row['id'],)).fetchone()
             if last:
                 job.action,job.source,job.stage = last['action'],last['source'],last['stage']
+                details=json.loads(last['details'])
+                job.context=clean_context(details.get('context',{}))
+                job.input_kind=details.get('input_kind','unknown')
                 job.delivered = self.sql.execute("SELECT coalesce(max(CAST(json_extract(details,'$.delivered') AS INTEGER)),0) FROM events WHERE job=?",(row['id'],)).fetchone()[0]
             job.reason = 'ProcessRestart'
-            self.incident(job, 'interrupted', admin_id=0)
+            if not job.delivered and expected_input_error(None,kind=job.input_kind,stage=job.stage):
+                self.event(job,'rejected',result='interrupted')
+                self.sql.execute("UPDATE claims SET state='rejected' WHERE id=?",(row['id'],))
+            else:self.incident(job, 'interrupted', admin_id=0)
         self.sql.execute("UPDATE claims SET state='interrupted' WHERE state='running'")
         self.sql.execute("UPDATE incidents SET message=-1 WHERE message=-2")
         self.sql.commit()
@@ -122,6 +138,10 @@ class Journal:
         allowed = {k: v for k, v in details.items() if k in {'delivered', 'duration_ms', 'error_class', 'location', 'parts', 'bytes', 'result'}
                    and isinstance(v, (int, float, str, bool))}
         allowed = {k: safe_code(v) if isinstance(v, str) else v for k, v in allowed.items()}
+        context=clean_context(job.context)
+        if context:allowed['context']=context
+        if job.input_kind in {'supported_link','unsupported_link','invalid_link','text','command','callback'}:
+            allowed['input_kind']=job.input_kind
         self.sql.execute("INSERT INTO events(id,ts,job,user,action,status,stage,source,details) VALUES(?,?,?,?,?,?,?,?,?)",
                          (uuid.uuid4().hex, time.time(), job.id, job.user, safe_code(job.action),
                           safe_code(status), safe_code(job.stage), safe_code(job.source), json.dumps(allowed)))
@@ -240,13 +260,13 @@ class Journal:
             self.sql.commit()
             return
         now = time.time()
-        self.sql.execute("""INSERT INTO incidents(id,scope,category,stage,source,user,own,state,count,first,last,delivered,reason)
-          VALUES(?,?,?,?,?,?,?,'open',1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        self.sql.execute("""INSERT INTO incidents(id,scope,category,stage,source,user,own,state,count,first,last,delivered,reason,context)
+          VALUES(?,?,?,?,?,?,?,'open',1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
           state=CASE WHEN incidents.state='resolved' THEN 'reopened' ELSE incidents.state END,
           count=count+1,last=excluded.last,user=excluded.user,delivered=excluded.delivered,
-          reason=excluded.reason,revision=revision+1""",
+          reason=excluded.reason,context=excluded.context,revision=revision+1""",
           (ident,scope,category,job.stage,safe_code(job.source),job.user,int(job.user==admin_id),
-           now,now,job.delivered,safe_code(job.reason)))
+           now,now,job.delivered,safe_code(job.reason),json.dumps(clean_context(job.context))))
         peer = self.sql.execute("SELECT message,next_notice FROM incidents WHERE id!=? AND category=? "
                                 "AND stage=? AND source=? AND reason=? AND message IS NOT NULL ORDER BY last DESC LIMIT 1",
                                 (ident,category,job.stage,safe_code(job.source),safe_code(job.reason))).fetchone()
@@ -268,6 +288,10 @@ class Journal:
         if not row:
             return b'{}'
         result = dict(row)
+        result['context']=clean_context(json.loads(result['context']))
+        cohort=(row['category'],row['stage'],row['source'],row['reason'])
+        result['related']=[{**dict(r),'context':clean_context(json.loads(r['context']))}
+                           for r in self.sql.execute('SELECT id,user,state,count,context FROM incidents WHERE category=? AND stage=? AND source=? AND reason=? ORDER BY last DESC',cohort)]
         # Safe future handoff only: no code execution/model network calls.
         result['automatic_repair'] = False
         result['required_gates'] = ['isolated_patch', 'regressions', 'CI', 'owner_release', 'rollback']
@@ -294,6 +318,7 @@ class Journal:
                            "ORDER BY ts DESC OFFSET 100000 LIMIT 1000)")
 
     async def notify(self, bot, admin_id: int):
+        from aiogram.types import LinkPreviewOptions
         if time.time() < self.next_alert:
             return
         now = time.time()
@@ -313,24 +338,29 @@ class Journal:
             pending = self.sql.execute("SELECT count(*) FROM incidents WHERE revision>sent_revision").fetchone()[0]
             members = self.sql.execute("SELECT * FROM incidents WHERE category=? AND stage=? AND source=? AND reason=?",cohort).fetchall()
             opened = sum(m['state']!='resolved' for m in members)
-            grouped = dict(row)
+            examples=[m for m in members if m['state']!='resolved'] or members
+            grouped = dict(max(examples,key=lambda m:m['last']))
             grouped.update(count=sum(m['count'] for m in members),first=min(m['first'] for m in members),
                            last=max(m['last'] for m in members),delivered=sum(m['delivered'] for m in members),
                            state='open' if opened else 'resolved')
             text = format_incident(grouped,admin_id)+f'\nОпераций с этой причиной: {len(members)}; открыто {opened}, восстановлено {len(members)-opened}.'
             text += f'\nГрупп в очереди сводки: {pending}. /errors — журнал и счётчики.'
+            if len(members)>1:
+                text+=f"\nВсе ссылки и участники: /errors {row['id']}"
             overflow = self.sql.execute("SELECT value FROM counters WHERE name='incident_overflow'").fetchone()
             if overflow:
                 text += f'\nОтказов сверх лимита отдельных групп: {overflow[0]} (сохранены в счётчиках).'
             if row['message']:
-                await bot.edit_message_text(text,chat_id=admin_id,message_id=row['message'])
+                await bot.edit_message_text(text,chat_id=admin_id,message_id=row['message'],
+                                           parse_mode='HTML',link_preview_options=LinkPreviewOptions(is_disabled=True))
                 message = row['message']
             else:
                 # Reserve the durable budget BEFORE the ambiguous network call.
                 self.sql.execute("INSERT INTO notice_new VALUES(?)",(time.time(),))
                 self.sql.execute("UPDATE incidents SET message=-2 WHERE category=? AND stage=? AND source=? AND reason=?",cohort)
                 self.sql.commit()
-                sent = await bot.send_message(admin_id,text)
+                sent = await bot.send_message(admin_id,text,parse_mode='HTML',
+                                              link_preview_options=LinkPreviewOptions(is_disabled=True))
                 message = sent.message_id
         except asyncio.CancelledError:
             if not row['message']:
@@ -382,9 +412,14 @@ def format_incident(row, admin_id=0):
                else f"Подтверждено отправок медиа: {row['delivered']}. " +
                ('Итоговая доставка неизвестна; повтор автоматически не запускается.' if row['category'] in {'delivery_unknown','interrupted'}
                 else 'Полный успешный результат не подтверждён.'))
+    data=dict(row)
+    request=clean_context(json.loads(data.get('context') or '{}'))
+    service=row['user']==0 or row['scope'].startswith('system:')
+    person='' if service else '; '+user_link(row['user'],request.get('username',''))
+    replay='' if service or (row['source'] in {'other','telegram'} and not request.get('operation')) else '\n'+reproduction(request)
     return (f"{state} · {REASONS[row['category']]}\n"
             f"Этап: {STAGES.get(row['stage'],'обработка действия')}. Источник: {safe_code(row['source'])}.\n"
-            f"Контекст: {context}; ID пользователя {row['user']}.\n{outcome}\n"
+            f"Контекст: {context}{person}.\n{outcome}{replay}\n"
             f"Повторений: {row['count']}. Первое: {stamp(row['first'])}; последнее: {stamp(row['last'])} МСК.\n"
             f"Причина: {CAUSES.get(row['reason'],'Обработанный отказ; точная причина не подтверждена.')} "
             f"Класс: {safe_code(row['reason']) or 'не указан'}.\n"
@@ -444,6 +479,20 @@ def set_source(source):
         job.source = safe_code(source or 'other')
 
 
+def request_context(**values):
+    job=_job.get()
+    if job:
+        job.context=clean_context({**job.context,**values})
+        if job.context.get('url'):job.input_kind='supported_link'
+        record('request_context')
+
+
+def refused_input(error) -> bool:
+    job=_job.get()
+    return bool(job and expected_input_error(error,kind=job.input_kind,
+                url=job.context.get('url',''),resolved_url=job.context.get('resolved_url',''),stage=job.stage))
+
+
 async def run_event(handler, event, data):
     """Called before router handlers. Control callbacks bypass the work quota."""
     from aiogram.types import CallbackQuery, Message
@@ -479,8 +528,11 @@ async def run_event(handler, event, data):
     if callback:
         cache = data.get('url_cache')
         url = cache.get(payload.split(':',1)[-1]) if cache else ''
-    source = _platform(urlparse(url or '').hostname or '')
-    material = canonical_key(url) if url else payload
+    try:
+        source = _platform(urlparse(url or '').hostname or '')
+        material = canonical_key(url) if url else payload
+    except ValueError:
+        source='other';material=payload
     # Timing/quality suffix must not collide with the whole video operation.
     if not callback and ' ' in payload:
         material += ':'+payload.split(maxsplit=1)[1]
@@ -488,6 +540,12 @@ async def run_event(handler, event, data):
     settings = data.get('settings')
     admin = getattr(settings,'admin_id',0)
     job = Job(ident,scope,user.id,action,source or 'other')
+    link=public_entry_url(url or '')
+    job.input_kind=('supported_link' if link else 'invalid_link' if source and source!='other'
+                    else 'unsupported_link' if work else 'callback' if callback
+                    else 'command' if payload.startswith('/') else 'text')
+    job.context=clean_context({'url':link,'username':getattr(user,'username',None),
+                              'operation':{'ttfile':'file','audio':'audio','desc':'description'}.get(payload.split(':',1)[0],'video') if work or link else None})
     token = _job.set(job)
     admitted = False
     started = time.monotonic()
@@ -523,7 +581,12 @@ async def run_event(handler, event, data):
             raise
         except Exception as exc:
             job.reason = type(exc).__name__
+            if refused_input(exc):
+                job.result='rejected'
+                record('rejected',error_class=job.reason)
+                return None
             job.result = 'blocked' if isinstance(exc,(ChatBlocked,TelegramForbiddenError)) else 'failed'
+            if exc.__cause__:request_context(cause_class=type(exc.__cause__).__name__)
             record(job.result,delivered=job.delivered,error_class=job.reason)
             raise
     finally:
@@ -531,9 +594,7 @@ async def run_event(handler, event, data):
             result = 'blocked' if job.blocked else job.result or 'ok'
             data['_operational_outcome'] = result
             record('finished',duration_ms=int((time.monotonic()-started)*1000),delivered=job.delivered,result=result)
-            expected = job.reason in {'BlockedAddressError','FileTooLargeError','OversizedError',
-                                      'AgeRestrictedError','TelegramBadRequest','TelegramRetryAfter'}
-            if result in {'failed','delivery_unknown','interrupted','blocked'} and not expected:
+            if result in {'failed','delivery_unknown','interrupted','blocked'}:
                 journal.incident(job,result,admin)
             elif result == 'done':
                 journal.resolve(job.scope)
@@ -573,7 +634,7 @@ class AuditLog(logging.Handler):
                     # Keep the stage at warning time, not the later stage when
                     # the worker drains its bounded logging queue.
                     job = Job(job.id,job.scope,job.user,job.action,job.source,
-                              job.stage,job.delivered,reason=reason)
+                              job.stage,job.delivered,reason=reason,context=clean_context(job.context))
                 try:
                     _current.logs.put_nowait((job,reason,location,entry.levelno))
                 except queue.Full:

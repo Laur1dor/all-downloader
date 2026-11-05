@@ -14,17 +14,22 @@ logger = logging.getLogger(__name__)
 _handled_outcome: ContextVar[str | None] = ContextVar("handled_event_outcome", default=None)
 
 
-def mark_outcome(outcome: str) -> None:
+def mark_outcome(outcome: str) -> str:
     """Record a handled download result in the current update's event journal."""
     if outcome in {"done", "failed", "cancelled", "rate_limited", "delivery_unknown"}:
-        _handled_outcome.set(outcome)
         from bot import observability
         import sys
         job = observability._job.get()
         error = sys.exc_info()[1]
         if job and error is not None:
             job.reason = type(error).__name__
+            if error.__cause__:
+                observability.request_context(cause_class=type(error.__cause__).__name__)
+        if outcome=='failed' and observability.refused_input(error):
+            outcome='rejected'
+        _handled_outcome.set(outcome)
         observability.outcome(outcome)
+    return outcome
 
 
 def action_name(event: TelegramObject) -> str:
@@ -64,7 +69,7 @@ class EventMiddleware(BaseMiddleware):
             raise
         finally:
             reported = data.get('_operational_outcome') or _handled_outcome.get()
-            if outcome == "ok" and reported in {"done","failed","cancelled","rate_limited","delivery_unknown"}:
+            if outcome == "ok" and reported in {"done","failed","cancelled","rate_limited","delivery_unknown","rejected"}:
                 outcome = reported
             _handled_outcome.reset(token)
             try:

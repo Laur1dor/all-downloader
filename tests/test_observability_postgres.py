@@ -20,7 +20,7 @@ class OperationalPostgresTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'journal.sqlite3'
             journal=Journal(path)
-            async def send(*_):
+            async def send(*_,**__):
                 # This independent writer reproduces actual cross-process use.
                 import sqlite3
                 other=sqlite3.connect(path,timeout=.1)
@@ -69,13 +69,17 @@ class OperationalPostgresTests(unittest.IsolatedAsyncioTestCase):
                 # Always TEMP, even when operator runs this against the runtime
                 # database. No test writes to real operational/conversion rows.
                 await conn.execute('CREATE TEMP TABLE operational_events(id TEXT PRIMARY KEY,ts DOUBLE PRECISION,job TEXT,user_id BIGINT,action TEXT,status TEXT,stage TEXT,source TEXT,details JSONB)')
-                journal.event(Job('a','scope',200,'download'),'delivery_unknown')
+                journal.event(Job('a','scope',200,'download',context={
+                    'url':'https://www.tiktok.com/@author/video/12345?signature=PRIVATE',
+                    'operation':'video','username':'test_user'}),'delivery_unknown')
                 async def lost_ack(query,rows):
                     await conn.executemany(query,rows)
                     raise ConnectionError('simulated acknowledgement loss after commit')
                 with self.assertRaises(ConnectionError):
                     await journal.mirror(SimpleNamespace(execute=conn.execute,executemany=lost_ack))
                 self.assertEqual(await conn.fetchval('SELECT count(*) FROM operational_events'),1)
+                self.assertEqual(await conn.fetchval("SELECT details->'context'->>'url' FROM operational_events"),
+                                 'https://www.tiktok.com/@author/video/12345')
                 await journal.mirror(conn)
                 self.assertEqual(await conn.fetchval('SELECT count(*) FROM operational_events'),1)
                 await conn.close()
