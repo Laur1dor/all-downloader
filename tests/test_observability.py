@@ -318,3 +318,11 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
             cb=CallbackQuery(id='cancel2',from_user=message().from_user,chat_instance='x',data='cancel:x',message=message())
             await audit.run_event(handler,cb,dict(self.data))
         handler.assert_awaited_once()
+
+    async def test_deadline_child_task_preserves_outcome_in_legacy_statistics(self):
+        from bot.handlers.events import EventMiddleware
+        db=SimpleNamespace(record_event=AsyncMock())
+        data={**self.data,'db':db}
+        async def handler(*_):mark_outcome('failed')
+        await EventMiddleware()(handler,message(),data)
+        self.assertEqual(db.record_event.await_args.args[2],'failed')

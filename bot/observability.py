@@ -523,6 +523,7 @@ async def run_event(handler, event, data):
     finally:
         try:
             result = 'blocked' if job.blocked else job.result or 'ok'
+            data['_operational_outcome'] = result
             record('finished',duration_ms=int((time.monotonic()-started)*1000),delivered=job.delivered,result=result)
             expected = job.reason in {'BlockedAddressError','FileTooLargeError','OversizedError',
                                       'AgeRestrictedError','TelegramBadRequest','TelegramRetryAfter'}
@@ -562,6 +563,11 @@ class AuditLog(logging.Handler):
                 location = safe_code(f'{entry.name}:{entry.funcName}:{entry.lineno}')
                 if not job:
                     job = Job('system',digest(f'{entry.name}:{entry.funcName}'),0,'system',reason=reason)
+                else:
+                    # Keep the stage at warning time, not the later stage when
+                    # the worker drains its bounded logging queue.
+                    job = Job(job.id,job.scope,job.user,job.action,job.source,
+                              job.stage,job.delivered,reason=reason)
                 try:
                     _current.logs.put_nowait((job,reason,location,entry.levelno))
                 except queue.Full:

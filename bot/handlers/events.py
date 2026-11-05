@@ -63,8 +63,9 @@ class EventMiddleware(BaseMiddleware):
             outcome = "error"
             raise
         finally:
-            if outcome == "ok" and _handled_outcome.get() is not None:
-                outcome = _handled_outcome.get()
+            reported = data.get('_operational_outcome') or _handled_outcome.get()
+            if outcome == "ok" and reported in {"done","failed","cancelled","rate_limited","delivery_unknown"}:
+                outcome = reported
             _handled_outcome.reset(token)
             try:
                 if not data.get('_audit_refused') and outcome != 'rate_limited':
