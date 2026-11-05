@@ -108,6 +108,8 @@ class FailoverTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        transfer=patch.object(th,'transfer_healthy',return_value=True)
+        transfer.start();self.addCleanup(transfer.stop)
         root = Path(self.directory.name)
         self.pin = th.bc.link_to_outbound(
             "vless://22222222-2222-4222-8222-222222222222@pin.example:443?security=tls", "telegram-pinned")
@@ -117,7 +119,7 @@ class FailoverTests(unittest.TestCase):
         self.config = root / "config.json"
         self.config.write_text(json.dumps({"outbounds": [self.pin]}))
         self.rebuild = root / "rebuild"
-        for name, value in (("STATE", self.state), ("CONFIG", self.config), ("REBUILD", self.rebuild)):
+        for name, value in (("STATE", self.state), ("CONFIG", self.config), ("REBUILD", self.rebuild), ("CANDIDATE_CURSOR", root / "cursor")):
             item = patch.object(th, name, value)
             item.start(); self.addCleanup(item.stop)
         item = patch.object(th.bc, "TELEGRAM_NODE_FILE", str(self.source))
@@ -168,5 +170,48 @@ class FailoverTests(unittest.TestCase):
         self.assertFalse(self.rebuild.exists())
 
 
+    def test_small_mtproto_success_with_stalled_payload_rotates_after_three_confirmed_failures(self):
+        with patch.object(th,'healthy',return_value=True), \
+             patch.object(th,'transfer_healthy',side_effect=lambda port:port==2080), \
+             patch.object(th,'choose_candidate',return_value='verified-free-backup'):
+            self.assertEqual([th.check_once() for _ in range(3)],['unhealthy','unhealthy','switched'])
+        self.assertEqual(self.source.read_text(),'verified-free-backup\n')
+
+    def test_benchmark_outage_does_not_rotate_working_mtproto_route(self):
+        with patch.object(th,'healthy',return_value=True),patch.object(th,'transfer_healthy',return_value=False), \
+             patch.object(th,'choose_candidate') as choose:
+            self.assertEqual([th.check_once() for _ in range(3)],['healthy']*3)
+        choose.assert_not_called()
+        self.assertFalse(self.rebuild.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CandidateCoverageTests(unittest.TestCase):
+    def test_bounded_candidate_rotation_reaches_past_first_sixteen_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'pool';cursor=Path(directory)/'cursor'
+            links=['vless://node'+str(i) for i in range(23)]
+            source.write_text('\n'.join(links))
+            with patch.object(th,'CANDIDATE_FILES',(str(source),)), patch.object(th,'CANDIDATE_CURSOR',cursor), \
+                 patch.object(th.bc,'link_to_outbound',side_effect=ValueError) as parse:
+                self.assertIsNone(th.choose_candidate({}))
+                self.assertEqual([c.args[0] for c in parse.call_args_list],links[:16])
+                parse.reset_mock();self.assertIsNone(th.choose_candidate({}))
+                self.assertEqual([c.args[0] for c in parse.call_args_list],links[16:]+links[:9])
+                self.assertEqual(cursor.read_text(),'9')
+
+    def test_health_includes_active_file_session_dc_endpoints(self):
+        with patch.object(th,'probe',side_effect=lambda peer,target,**kw:target!='95.161.76.100'):
+            self.assertFalse(th.healthy(2069))
+        self.assertIn('149.154.167.41',th.TARGETS)
+
+
+class TransferHealthTests(unittest.TestCase):
+    def test_stalled_or_truncated_transfer_is_not_a_healthy_upload_route(self):
+        from types import SimpleNamespace
+        for code,value,expected in [(0,'1048576 524288',True),(0,'20 10',False),(28,'0 0',False),(0,'1048576 1000',False)]:
+            with patch.object(th.subprocess,'run',return_value=SimpleNamespace(returncode=code,stdout=value)):
+                self.assertEqual(th.transfer_healthy(2069),expected)

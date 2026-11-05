@@ -70,16 +70,35 @@ def _period(text: str | None, default: str) -> str:
 
 
 def create_router(admin_id: int) -> Router:
-    router = Router(name="analytics")
+    root = Router(name="analytics")
+    incidents = Router(name="incidents")
+    incidents.message.filter(F.from_user.id == admin_id)
+    router = Router(name="analytics_private")
     router.message.filter(F.from_user.id == admin_id, F.chat.type == "private")
     router.callback_query.filter(F.from_user.id == admin_id, F.message.chat.type == "private")
 
-    @router.message(Command("errors"))
+    @incidents.message(Command("errors_here"))
+    async def errors_here(message: Message) -> None:
+        from bot.observability import current
+        journal = current()
+        if journal is None:
+            return
+        if message.chat.type != 'private':
+            member = await message.bot.get_chat_member(message.chat.id,admin_id)
+            if member.status != 'creator' or await message.bot.get_chat_member_count(message.chat.id) != 2:
+                await message.answer('Нужна приватная группа только с вами и ботом.')
+                return
+        journal.set_alert_chat(message.chat.id,admin_id)
+        await message.answer('Журнал ошибок подключён. 🔴 — открыт, ✅ — восстановлен после подтверждённого успеха. Сообщения обновляются автоматически.')
+
+    @incidents.message(Command("errors"))
     async def errors(message: Message) -> None:
         from bot.observability import current, format_incident
         journal = current()
         if journal is None:
             await message.answer("Операционный журнал пока не подключён.")
+            return
+        if message.chat.type != 'private' and message.chat.id != journal.alert_chat(admin_id):
             return
         parts = (message.text or '').split(maxsplit=1)
         if len(parts) == 2:
@@ -135,4 +154,6 @@ def create_router(admin_id: int) -> Router:
             ),
         )
 
-    return router
+    root.include_router(incidents)
+    root.include_router(router)
+    return root

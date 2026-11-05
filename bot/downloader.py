@@ -3460,6 +3460,7 @@ async def download_album(
     url: str, cookies_file: Path | None, force_proxy: bool = False
 ) -> AsyncIterator[AlbumMedia]:
     """Async context manager yielding album media; temp files are always removed."""
+    from curl_cffi.requests.exceptions import RequestException as CurlRequestException
     tmpdir = tempfile.mkdtemp(prefix="tg-album-")
     host = (urlparse(url).hostname or "").lower()
     _plat = detect_platform(url)
@@ -3587,7 +3588,7 @@ async def download_album(
                 )
                 last_error.__cause__ = exc
                 continue
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, CurlRequestException) as exc:
                 last_error = DownloadFailedError("Не удалось скачать пост: сетевая ошибка.")
                 last_error.__cause__ = exc
                 continue
@@ -3841,10 +3842,9 @@ def _clear_directory(path: str) -> None:
 def _album_exits(platform: str, proxy: str | None) -> list[str | None]:
     """Exits to try for a carousel, first one first.
 
-    Only TikTok has more than one: it is the platform whose exits are refused
-    or die mid-session, and the only one with a ladder of them to walk.
+    TikTok and Instagram retain bounded independent exits when a route fails.
     """
-    if platform != "tiktok":
+    if platform not in {"tiktok", "instagram"}:
         return [proxy]
     ladder = [exit_proxy for exit_proxy in proxy_ladder(platform) if exit_proxy != proxy]
     # Four at most: gallery-dl is a subprocess with a timeout of its own, so the

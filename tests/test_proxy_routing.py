@@ -73,3 +73,37 @@ class PoolProbeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstagramFallbackTests(unittest.TestCase):
+    def test_failed_pinned_exit_has_distinct_live_album_and_video_fallbacks(self):
+        from bot.downloader import _album_exits
+        router=proxy.ProxyRouter('socks5h://main:2080','socks5h://goida:2079','socks5h://bypass:2078')
+        router._routing={'services':{'instagram':'socks5h://warp:1080'}}
+        router._pool_ok['bypass']=False
+        with patch.object(proxy,'_router',router),patch.object(router,'_load_routing'):
+            expected=['socks5h://warp:1080','socks5h://goida:2079','socks5h://main:2080']
+            self.assertEqual(proxy.proxy_ladder('instagram'),expected)
+            self.assertEqual(_album_exits('instagram',expected[0]),expected)
+
+
+
+class InstagramNetworkRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_request_exception_moves_album_to_next_route(self):
+        from bot import downloader
+        from curl_cffi.requests.exceptions import SSLError
+        calls=[]
+        def fetch(url,tmpdir,exit_proxy,*args):
+            calls.append(exit_proxy)
+            if len(calls)==1:
+                (Path(tmpdir)/'partial.jpg').write_bytes(b'partial')
+                raise SSLError('SSL_ERROR_SYSCALL')
+            self.assertFalse((Path(tmpdir)/'partial.jpg').exists())
+            image=Path(tmpdir)/'image.jpg';image.write_bytes(b'complete')
+            return [image],'caption'
+        with patch.object(downloader,'proxy_for',return_value='warp'), \
+             patch.object(downloader,'proxy_ladder',return_value=['warp','goida']), \
+             patch.object(downloader,'_instagram_items_sync',side_effect=fetch):
+            async with downloader.download_album('https://www.instagram.com/p/DfSJ06iEZ5I/',None) as album:
+                self.assertEqual(album.items[0].read_bytes(),b'complete')
+        self.assertEqual(calls,['warp','goida'])

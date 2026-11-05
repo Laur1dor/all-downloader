@@ -362,3 +362,73 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(message_id=77)
         await self.journal.notify(SimpleNamespace(send_message=send),100)
         self.assertFalse(self.journal.sql.in_transaction)
+
+
+    async def test_separate_alert_chat_persists_and_does_not_reuse_private_message_ids(self):
+        self.journal.incident(audit.Job('id','scope',200,'download'),'failed',100)
+        bot=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),edit_message_text=AsyncMock())
+        await self.journal.notify(bot,100)
+        self.journal.set_alert_chat(-123,100)
+        await self.journal.notify(bot,100)
+        self.assertEqual(bot.send_message.await_args.args[0],-123)
+        bot.edit_message_text.assert_not_awaited()
+        self.journal.sql.close();self.journal=audit.Journal(self.path);audit._current=self.journal
+        self.assertEqual(self.journal.alert_chat(100),-123)
+        self.journal.resolve('scope');self.journal.next_alert=0
+        await self.journal.notify(bot,100)
+        self.assertEqual(bot.edit_message_text.await_args.kwargs['chat_id'],-123)
+        self.assertIn('✅ Восстановлено',bot.edit_message_text.await_args.args[0])
+        self.assertEqual(bot.send_message.await_count,2)
+
+    async def test_successful_edit_lost_ack_then_not_modified_never_creates_duplicate(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.methods import EditMessageText
+        self.journal.incident(audit.Job('id','scope',200,'download'),'failed',100)
+        bot=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),edit_message_text=AsyncMock())
+        await self.journal.notify(bot,100)
+        self.journal.resolve('scope');self.journal.next_alert=0
+        bot.edit_message_text.side_effect=TelegramBadRequest(EditMessageText(text='x',chat_id=100,message_id=77),'Bad Request: message is not modified')
+        await self.journal.notify(bot,100)
+        row=self.journal.rows()[0]
+        self.assertEqual(row['revision'],row['sent_revision'])
+        self.assertEqual(row['message'],77)
+        self.assertEqual(bot.send_message.await_count,1)
+
+
+    async def test_group_binding_is_owner_only_and_does_not_expose_dashboard(self):
+        from aiogram import Bot,Dispatcher
+        from aiogram.types import Update,ChatMemberOwner
+        from aiogram.dispatcher.event.bases import UNHANDLED
+        from bot.handlers.analytics import create_router
+        bot=Bot('123456:'+'a'*35)
+        async def response(_bot,method,**kwargs):
+            if method.__api_method__=='getChatMember':
+                return ChatMemberOwner(user=User(id=100,is_bot=False,first_name='Owner'),is_anonymous=False)
+            if method.__api_method__=='getChatMemberCount':return 2
+            return Message(message_id=77,date=int(time.time()),chat=Chat(id=-123,type='group'))
+        bot.session.make_request=AsyncMock(side_effect=response)
+        dispatcher=Dispatcher();dispatcher.include_router(create_router(100))
+        def update(ident,user,text):
+            return Update(update_id=ident,message=Message(message_id=ident,date=int(time.time()),chat=Chat(id=-123,type='group'),from_user=User(id=user,is_bot=False,first_name='Test'),text=text))
+        try:
+            self.assertIs(await dispatcher.feed_update(bot,update(1,200,'/errors_here')),UNHANDLED)
+            self.assertEqual(self.journal.alert_chat(100),100)
+            await dispatcher.feed_update(bot,update(2,100,'/errors_here'))
+            self.assertEqual(self.journal.alert_chat(100),-123)
+            self.assertIs(await dispatcher.feed_update(bot,update(3,100,'/dashboard')),UNHANDLED)
+            await dispatcher.feed_update(bot,update(4,100,'/errors'))
+            self.assertTrue(bot.session.make_request.await_args.args[1].text.startswith('Операционный журнал'))
+        finally:await bot.session.close()
+
+
+    async def test_chat_change_during_notification_cannot_attach_old_chat_message_id(self):
+        self.journal.incident(audit.Job('id','scope',200,'download'),'failed',100)
+        async def send(*args,**kwargs):
+            if args[0]==100:self.journal.set_alert_chat(-123,100)
+            return SimpleNamespace(message_id=77)
+        bot=SimpleNamespace(send_message=AsyncMock(side_effect=send),edit_message_text=AsyncMock())
+        await self.journal.notify(bot,100)
+        self.assertIsNone(self.journal.rows()[0]['message'])
+        await self.journal.notify(bot,100)
+        self.assertEqual(bot.send_message.await_args.args[0],-123)
+        bot.edit_message_text.assert_not_awaited()

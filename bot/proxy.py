@@ -369,6 +369,14 @@ def proxy_ladder(platform: str) -> list[str]:
     proxy is the whole ladder.
     """
     first = _router.proxy_for(platform)
+    if platform == "instagram" and first:
+        # TLS failures of a pinned WARP exit must try independent live pools.
+        exits = [first]
+        for name in ('goida','bypass','main'):
+            alternate = _router._pool_url(name)
+            if alternate and _router._pool_ok.get(name) and alternate not in exits:
+                exits.append(alternate)
+        return exits
     if platform != "tiktok" or not first:
         return [first] if first else []
     if _tiktok_own_vpn():

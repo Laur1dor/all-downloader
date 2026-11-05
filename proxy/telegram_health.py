@@ -25,7 +25,11 @@ try:
 except ImportError:  # container entry point
     import build_config as bc
 
-TARGETS = ("149.154.167.50", "149.154.167.51", "149.154.175.50")
+# Include the DC endpoints actually used by this Bot API's file sessions.
+# Reachability of the three auth endpoints alone did not cover those sessions.
+TARGETS = ("149.154.167.50", "149.154.167.51", "149.154.175.50",
+           "149.154.167.41", "95.161.76.100")
+CANDIDATE_CURSOR = Path("/app/data/telegram_candidate_cursor")
 TIMEOUT = 4.0
 FAILURES = 3
 STATE = Path("/app/data/telegram_health.json")
@@ -140,6 +144,20 @@ def healthy(port: int) -> bool:
                                                  obfuscated=True), TARGETS))
 
 
+def transfer_healthy(port: int) -> bool:
+    """Bounded 1 MiB transfer: a nonce reply alone misses blackholed payloads."""
+    try:
+        result = subprocess.run(['curl','--proxy',f'socks5h://127.0.0.1:{port}',
+            '--connect-timeout','3','--max-time','8','--fail','--silent',
+            '--output',os.devnull,'--write-out','%{size_download} %{speed_download}',
+            'https://speed.cloudflare.com/__down?bytes=1048576'],
+            capture_output=True,text=True,timeout=10)
+        size,speed=map(float,result.stdout.split())
+        return result.returncode == 0 and size >= 1048576 and speed >= 131072
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return False
+
+
 def _identity(outbound: dict) -> str:
     return json.dumps({k: v for k, v in outbound.items() if k != "tag"}, sort_keys=True)
 
@@ -155,7 +173,23 @@ def choose_candidate(current: dict) -> str | None:
         except OSError:
             pass
     outbounds, candidates = [], []
-    for link in links[:16]:
+    # Rotate bounded batches: a permanently bad first sixteen must not starve
+    # a usable backup later in the same verified free pool, even after restart.
+    try:
+        offset = max(0,int(CANDIDATE_CURSOR.read_text()))
+    except (OSError,ValueError):
+        offset = 0
+    if links:
+        offset %= len(links)
+        batch = (links[offset:] + links[:offset])[:16]
+        temporary = CANDIDATE_CURSOR.with_suffix('.next')
+        descriptor = os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(descriptor,'w') as output:
+            output.write(str((offset+len(batch))%len(links)))
+        os.replace(temporary,CANDIDATE_CURSOR)
+    else:
+        batch = []
+    for link in batch:
         try:
             outbound = bc.link_to_outbound(link, "candidate-" + str(len(outbounds)))
             if _identity(outbound) != _identity(current):
@@ -195,7 +229,7 @@ def choose_candidate(current: dict) -> str | None:
                 passing = list(pool.map(healthy, ports))
             for link, port, passed in zip(candidates, ports, passing):
                 # A single lucky reply is insufficient for replacing a live route.
-                if passed and healthy(port) and healthy(port):
+                if passed and healthy(port) and healthy(port) and transfer_healthy(port):
                     return link
         finally:
             process.terminate()
@@ -224,10 +258,19 @@ def check_once() -> str:
     except (OSError, ValueError):
         previous = {}
     good = healthy(bc.TELEGRAM_SOCKS_PORT)
+    transfer_checked = previous.get('transfer_checked_at',0) if previous.get('identity') == identity else 0
+    if good and time.time()-transfer_checked >= 600:
+        transfer_checked = time.time()
+        if not transfer_healthy(bc.TELEGRAM_SOCKS_PORT):
+            # An independent control must succeed before blaming the pin for
+            # an unavailable benchmark service. Never rotate on that alone.
+            if transfer_healthy(2080):
+                good = False
+                transfer_checked = 0  # recheck to require repeated failures
     failures = 0 if good else (previous.get("failures", 0)
                               if previous.get("identity") == identity else 0) + 1
     state = {"checked_at": time.time(), "identity": identity, "healthy": good,
-             "failures": failures}
+             "failures": failures,"transfer_checked_at":transfer_checked}
     result = "healthy" if good else "unhealthy"
     if failures >= FAILURES:
         candidate = choose_candidate(pin)

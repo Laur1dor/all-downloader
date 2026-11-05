@@ -87,6 +87,7 @@ class Journal:
           revision INTEGER DEFAULT 1, sent_revision INTEGER DEFAULT 0,
           message INTEGER, next_notice REAL DEFAULT 0, attempts INTEGER DEFAULT 0,
           context TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS alert_destination(id INTEGER PRIMARY KEY CHECK(id=1), chat INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS claims(id TEXT PRIMARY KEY, work TEXT, user INTEGER,
           state TEXT, ts REAL);
         CREATE INDEX IF NOT EXISTS claim_work ON claims(work,state);
@@ -276,9 +277,22 @@ class Journal:
         self.sql.commit()
 
     def resolve(self, scope: str):
-        self.sql.execute("UPDATE incidents SET state='resolved',restored=?,revision=revision+1 "
+        self.sql.execute("UPDATE incidents SET state='resolved',restored=?,revision=revision+1,next_notice=0 "
                          "WHERE scope=? AND state!='resolved'", (time.time(),scope))
         self.sql.commit()
+
+    def alert_chat(self, admin_id: int) -> int:
+        row = self.sql.execute('SELECT chat FROM alert_destination WHERE id=1').fetchone()
+        return row['chat'] if row else admin_id
+
+    def set_alert_chat(self, chat_id: int, admin_id: int):
+        if self.alert_chat(admin_id) == chat_id:
+            return
+        # Message IDs belong to their chat. Never edit an old ID in a new chat.
+        self.sql.execute('INSERT INTO alert_destination VALUES(1,?) ON CONFLICT(id) DO UPDATE SET chat=excluded.chat',(chat_id,))
+        self.sql.execute('UPDATE incidents SET message=NULL,revision=revision+1,next_notice=0,attempts=0')
+        self.sql.commit()
+        self.next_alert = 0
 
     def rows(self, limit=10):
         return self.sql.execute("SELECT * FROM incidents ORDER BY last DESC LIMIT ?", (min(limit,50),)).fetchall()
@@ -319,6 +333,7 @@ class Journal:
 
     async def notify(self, bot, admin_id: int):
         from aiogram.types import LinkPreviewOptions
+        destination = self.alert_chat(admin_id)
         if time.time() < self.next_alert:
             return
         now = time.time()
@@ -335,7 +350,7 @@ class Journal:
         revision = row['revision']
         cohort = (row['category'],row['stage'],row['source'],row['reason'])
         try:
-            pending = self.sql.execute("SELECT count(*) FROM incidents WHERE revision>sent_revision").fetchone()[0]
+            pending = self.sql.execute("SELECT count(*) FROM (SELECT 1 FROM incidents WHERE revision>sent_revision GROUP BY category,stage,source,reason)").fetchone()[0]
             members = self.sql.execute("SELECT * FROM incidents WHERE category=? AND stage=? AND source=? AND reason=?",cohort).fetchall()
             opened = sum(m['state']!='resolved' for m in members)
             examples=[m for m in members if m['state']!='resolved'] or members
@@ -351,7 +366,7 @@ class Journal:
             if overflow:
                 text += f'\nОтказов сверх лимита отдельных групп: {overflow[0]} (сохранены в счётчиках).'
             if row['message']:
-                await bot.edit_message_text(text,chat_id=admin_id,message_id=row['message'],
+                await bot.edit_message_text(text,chat_id=destination,message_id=row['message'],
                                            parse_mode='HTML',link_preview_options=LinkPreviewOptions(is_disabled=True))
                 message = row['message']
             else:
@@ -359,7 +374,7 @@ class Journal:
                 self.sql.execute("INSERT INTO notice_new VALUES(?)",(time.time(),))
                 self.sql.execute("UPDATE incidents SET message=-2 WHERE category=? AND stage=? AND source=? AND reason=?",cohort)
                 self.sql.commit()
-                sent = await bot.send_message(admin_id,text,parse_mode='HTML',
+                sent = await bot.send_message(destination,text,parse_mode='HTML',
                                               link_preview_options=LinkPreviewOptions(is_disabled=True))
                 message = sent.message_id
         except asyncio.CancelledError:
@@ -369,9 +384,16 @@ class Journal:
                 self.sql.commit()
             raise
         except Exception as exc:
+            if destination != self.alert_chat(admin_id):
+                return
             # Update a deleted original on next pass. No immediate send fallback,
             # and no automatic retry of an ambiguous network send.
             from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+            if isinstance(exc,TelegramBadRequest) and row['message'] and 'message is not modified' in str(exc).lower():
+                self.sql.executemany('UPDATE incidents SET sent_revision=?,attempts=0,next_notice=? WHERE id=?',
+                                     [(m['revision'],time.time()+300,m['id']) for m in members])
+                self.sql.commit()
+                return
             if isinstance(exc,TelegramBadRequest):
                 self.sql.execute("UPDATE incidents SET message=NULL WHERE category=? AND stage=? AND source=? AND reason=?",cohort)
             delay = min(3600,30*2**min(row['attempts'],7))
@@ -389,6 +411,8 @@ class Journal:
             self.sql.execute("UPDATE incidents SET next_notice=?,attempts=attempts+1 WHERE category=? AND stage=? AND source=? AND reason=?", (time.time()+delay,*cohort))
             self.count('notification_failed')
         else:
+            if destination != self.alert_chat(admin_id):
+                return
             # Only acknowledge the cohort snapshot rendered above; a new error
             # during the network await must still result in a subsequent edit.
             self.sql.executemany("UPDATE incidents SET sent_revision=?,message=?,attempts=0,next_notice=? WHERE id=?",
@@ -402,7 +426,7 @@ def format_incident(row, admin_id=0):
     from datetime import datetime
     from zoneinfo import ZoneInfo
     stamp = lambda t: datetime.fromtimestamp(t,ZoneInfo('Europe/Moscow')).strftime('%d.%m %H:%M:%S')
-    state = {'open':'Открыт','resolved':'Восстановлено','reopened':'Повторился'}[row['state']]
+    state = {'open':'🔴 Открыт','resolved':'✅ Восстановлено','reopened':'🔴 Повторился'}[row['state']]
     context = ('служебная операция' if row['user']==0 or row['scope'].startswith('system:')
                else 'ваша задача' if row['user']==admin_id else 'задача другого пользователя')
     restored = ('PostgreSQL снова отвечает на запросы журнала.' if row['scope']=='system:postgres'
