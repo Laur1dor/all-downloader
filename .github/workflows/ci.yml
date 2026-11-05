@@ -67,8 +67,20 @@ jobs:
           sudo chown root:root "$protected_env"
           sudo chmod 600 "$protected_env"
           docker run --rm --network host -e OPERATIONAL_TEST_DSN=postgresql://ci:ci@127.0.0.1:5432/ci \
+            -e DASHBOARD_TEST_DSN=postgresql://ci:ci@127.0.0.1:5432/ci \
+            -e OPERATOR_DB_INTEGRATION=1 -e OPERATOR_TEST_DSN=postgresql://ci:ci@127.0.0.1:5432/ci \
             -v "$PWD:/src" -v "$protected_env:/src/.env:ro" -w /src \
             bot-ci:${{ github.sha }} python -m tests.smoke_test
+
+      - name: Offline ASR regression with test-only NumPy
+        # Same NumPy as the installed iglogin image. Only this disposable test
+        # container gains the dependency; production bot requirements stay lean.
+        run: |
+          docker run --rm --user 0 -e PYTHON_DOTENV_DISABLED=1 \
+            -v "$PWD:/src:ro" -w /src --entrypoint sh bot-ci:${{ github.sha }} -c '
+              python -m pip install --no-cache-dir numpy==2.5.4 &&
+              python -m unittest tests.test_ig_audio_transcribe.AudioTranscribeTests.test_uses_only_local_tiny_model_and_clean_json_stdout -v
+            '
 
   images:
     # The bot image is covered by the job above; these are the ones that would

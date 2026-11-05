@@ -102,6 +102,7 @@ class AudioTranscribeTests(unittest.TestCase):
                 def __init__(self, name, **kwargs):
                     seen["name"] = name
                     seen["kwargs"] = kwargs
+                    seen["offline_at_model_start"] = os.environ.get("HF_HUB_OFFLINE")
                     print("model startup noise")
 
                 def transcribe(self, audio, **kwargs):
@@ -115,7 +116,7 @@ class AudioTranscribeTests(unittest.TestCase):
             output = io.StringIO()
             with patch.dict(sys.modules, {"faster_whisper": SimpleNamespace(WhisperModel=FakeModel)}), \
                  patch.dict(sys.modules, {"av": _fake_av(1)}), \
-                 patch.dict(os.environ, {"IG_CAPTCHA_MODEL_DIR": str(models)}), \
+                 patch.dict(os.environ, {"IG_CAPTCHA_MODEL_DIR": str(models), "HF_HUB_OFFLINE": "0"}), \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(worker.main([str(path)]), 0)
 
@@ -131,7 +132,7 @@ class AudioTranscribeTests(unittest.TestCase):
             self.assertEqual(seen["audio_dtype"], np.dtype("float32"))
             self.assertEqual(seen["audio_samples"], worker.SAMPLE_RATE)
             self.assertEqual(seen["audio_amplitude"], 0.0)
-            self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+            self.assertEqual(seen["offline_at_model_start"], "1")
 
 
 if __name__ == "__main__":

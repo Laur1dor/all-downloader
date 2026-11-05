@@ -42,7 +42,9 @@ class _ConnectionPool:
 @unittest.skipUnless(os.getenv("OPERATOR_DB_INTEGRATION") == "1", "opt-in database test")
 class OperatorDatabaseIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_migration_snapshot_unknown_and_completion(self) -> None:
-        connection = await asyncpg.connect(load_settings().database_dsn, timeout=10)
+        connection = await asyncpg.connect(
+            os.getenv("OPERATOR_TEST_DSN") or load_settings().database_dsn, timeout=10,
+        )
         transaction = connection.transaction()
         await transaction.start()
         try:
