@@ -368,7 +368,8 @@ def format_incident(row, admin_id=0):
     from zoneinfo import ZoneInfo
     stamp = lambda t: datetime.fromtimestamp(t,ZoneInfo('Europe/Moscow')).strftime('%d.%m %H:%M:%S')
     state = {'open':'Открыт','resolved':'Восстановлено','reopened':'Повторился'}[row['state']]
-    context = 'ваша задача' if row['user']==admin_id else 'задача другого пользователя'
+    context = ('служебная операция' if row['user']==0 or row['scope'].startswith('system:')
+               else 'ваша задача' if row['user']==admin_id else 'задача другого пользователя')
     restored = ('PostgreSQL снова отвечает на запросы журнала.' if row['scope']=='system:postgres'
                 else 'Telegram подтвердил отправку сообщения в этот чат.' if row['category']=='blocked'
                 else 'Доставка подтверждена повторной успешной операцией.')

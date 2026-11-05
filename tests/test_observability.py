@@ -326,3 +326,7 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
         async def handler(*_):mark_outcome('failed')
         await EventMiddleware()(handler,message(),data)
         self.assertEqual(db.record_event.await_args.args[2],'failed')
+
+    def test_database_monitor_is_labelled_service_operation_not_owner_download(self):
+        self.journal.incident(audit.Job('mirror','system:postgres',100,'mirror'),'failed',100)
+        self.assertIn('Контекст: служебная операция',audit.format_incident(self.journal.rows()[0],100))
