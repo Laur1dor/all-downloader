@@ -53,6 +53,7 @@ from bot.downloader import (
     ConfirmedVideoError,
     DownloadCancelledError,
     DownloadFailedError,
+    InstagramLoginRequiredError,
     FileTooLargeError,
     NotAVideoPostError,
     OversizedError,
@@ -1092,7 +1093,8 @@ async def _run_link(
 
     # Carousel/photo posts go straight to gallery-dl: yt-dlp would either fail
     # (TikTok /photo/) or silently drop the photos of a mixed Instagram post.
-    if is_photo_post_url(url) and time_range is None:
+    album_attempted = is_photo_post_url(url) and time_range is None
+    if album_attempted:
         album_started = time.monotonic()
         album_status = await message.answer("📸 Скачиваю пост…")
         if await _deliver_album(
@@ -1381,6 +1383,7 @@ async def _run_link(
         if (
             time_range is None
             and platform in PHOTO_CAPABLE_PLATFORMS
+            and not (platform == "instagram" and album_attempted)
             and not isinstance(exc, FileTooLargeError | ConfirmedVideoError)
         ):
             await _terminal_edit(status_message, "🔍 Видео не нашлось — проверяю, нет ли там фото…")
@@ -1882,6 +1885,11 @@ async def _deliver_album(
                     album_status.sent += 1
             total_size = album.total_size
             description = album.description
+    except InstagramLoginRequiredError as exc:
+        await _stop_progress(status_task)
+        await _terminal_edit(status_message, f"⚠️ {exc}")
+        await _record(db, user_id, STATUS_FAILED, platform, "album", started)
+        return True
     except DeliveryUnknownError:
         await _stop_progress(status_task)
         await _notify_delivery_unknown(status_message)

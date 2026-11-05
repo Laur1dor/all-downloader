@@ -107,3 +107,43 @@ class InstagramNetworkRecoveryTests(unittest.IsolatedAsyncioTestCase):
             async with downloader.download_album('https://www.instagram.com/p/DfSJ06iEZ5I/',None) as album:
                 self.assertEqual(album.items[0].read_bytes(),b'complete')
         self.assertEqual(calls,['warp','goida'])
+
+
+class InstagramBlockedAccountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_redirect_skips_more_session_attempts_but_keeps_public_fallback(self):
+        from bot import downloader as d
+        from unittest.mock import AsyncMock
+        url='https://www.instagram.com/p/Example/'
+        for public_success in (False, True):
+            with self.subTest(public_success=public_success):
+                def anonymous(_url,tmpdir,route,*_):
+                    if route=='second' and public_success:
+                        photo=Path(tmpdir)/'image.jpg';photo.write_bytes(b'complete')
+                        return [photo],None
+                    return [],None
+                with patch.object(d,'proxy_for',return_value='first'), patch.object(d,'proxy_ladder',return_value=['first','second']), \
+                     patch.object(d,'_instagram_items_sync',side_effect=anonymous) as fetch, \
+                     patch.object(d,'_download_album_sync',side_effect=d.InstagramLoginRequiredError()) as session, \
+                     patch.object(d,'_instagram_browser_album',AsyncMock(return_value=None)) as browser:
+                    if public_success:
+                        async with d.download_album(url,None) as album:
+                            self.assertEqual(len(album.items),1)
+                    else:
+                        with self.assertRaises(d.InstagramLoginRequiredError):
+                            async with d.download_album(url,None):self.fail('unexpected media')
+                    self.assertEqual(fetch.call_count,2)
+                    session.assert_called_once();browser.assert_awaited_once()
+
+    def test_only_confirmed_login_redirect_with_account_marker_is_typed(self):
+        from bot import downloader as d
+        from types import SimpleNamespace
+        url='https://www.instagram.com/p/Example/'
+        with tempfile.TemporaryDirectory() as folder, patch.dict(environ,{'IG_REQUEST_FILE':str(Path(folder)/'iglogin_request')}):
+            marker=Path(folder)/'ig_account_blocked.json'
+            result=SimpleNamespace(returncode=4,stderr='[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/)')
+            with patch.object(d.subprocess,'run',return_value=result):
+                self.assertEqual(d._download_album_sync(url,folder,None).items,[])
+                marker.write_text('{"reason":"suspended"}')
+                with self.assertRaises(d.InstagramLoginRequiredError):d._download_album_sync(url,folder,None)
+                result.stderr='[instagram][error] SSL connection closed'
+                self.assertEqual(d._download_album_sync(url,folder,None).items,[])

@@ -196,6 +196,11 @@ class AgeRestrictedError(DownloadFailedError):
     """Instagram said the post is age-restricted, so only the account can fetch it."""
 
 
+class InstagramLoginRequiredError(DownloadFailedError):
+    def __init__(self) -> None:
+        super().__init__('Instagram запросил вход, а аккаунт бота сейчас недоступен.')
+
+
 class NotAVideoPostError(DownloadFailedError):
     """The link is a real post, but a carousel rather than a video.
 
@@ -3190,6 +3195,15 @@ def _download_album_sync(
         command, capture_output=True, text=True, timeout=timeout or 180
     )
     if result.returncode != 0:
+        if (detect_platform(url) == 'instagram'
+                and '[instagram][error] HTTP redirect to login page (https://www.instagram.com/accounts/login/' in result.stderr):
+            marker = Path(os.getenv('IG_REQUEST_FILE', 'data/iglogin_request')).with_name('ig_account_blocked.json')
+            try:
+                blocked = json.loads(marker.read_text(encoding='utf-8')).get('reason') in ('suspended', 'phone_required')
+            except (OSError, ValueError, AttributeError):
+                blocked = False
+            if blocked:
+                raise InstagramLoginRequiredError()
         logger.info("gallery-dl exited with %d: %s", result.returncode, result.stderr.strip())
 
     # gallery-dl may nest output in per-site subdirectories — collect recursively.
@@ -3504,6 +3518,7 @@ async def download_album(
         # exit ladder changes nothing for it. It used to run once per exit -
         # twenty seconds each, twice over, for the same answer.
         browser_tried = False
+        login_error: InstagramLoginRequiredError | None = None
         for attempt, exit_proxy in enumerate(exits):
             if attempt:
                 # Each attempt starts from an empty directory: a half-finished
@@ -3546,6 +3561,9 @@ async def download_album(
                                 _download_album_sync, url, tmpdir, cookies_file,
                                 exit_proxy, None,
                             )
+                        except InstagramLoginRequiredError as exc:
+                            login_error = exc
+                            album = None
                         except DownloadFailedError:
                             album = None
                         if (album is None or not album.items) and not browser_tried:
@@ -3563,14 +3581,18 @@ async def download_album(
                             description=caption,
                         )
                     else:
-                        try:
-                            album = await asyncio.to_thread(
-                                _download_album_sync, url, tmpdir, cookies_file,
-                                exit_proxy,
-                                _ALBUM_RETRY_TIMEOUT if attempt else None,
-                            )
-                        except DownloadFailedError:
-                            album = None
+                        album = None
+                        if login_error is None:
+                            try:
+                                album = await asyncio.to_thread(
+                                    _download_album_sync, url, tmpdir, cookies_file,
+                                    exit_proxy,
+                                    _ALBUM_RETRY_TIMEOUT if attempt else None,
+                                )
+                            except InstagramLoginRequiredError as exc:
+                                login_error = exc
+                            except DownloadFailedError:
+                                pass
                         if (album is None or not album.items) and not browser_tried:
                             # Both cheaper roads came back with nothing, which
                             # is the state the browser path exists for.
@@ -3606,6 +3628,8 @@ async def download_album(
             except Exception as exc:  # noqa: BLE001 - gallery-dl's error is more useful
                 logger.warning("TikTok photo fallback failed: %s", exc)
         if album is None or not album.items:
+            if login_error is not None:
+                raise login_error
             if last_error is not None:
                 raise last_error
             raise DownloadFailedError("По этой ссылке не нашлось ни видео, ни фото.")

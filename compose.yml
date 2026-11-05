@@ -111,8 +111,16 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     environment:
       WARP_SLEEP: "5"
+    entrypoint: ["/bin/bash", "/opt/adl/warp-supervise.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --proxy socks5h://127.0.0.1:1080 -fsS --max-time 4 https://www.cloudflare.com/cdn-cgi/trace | grep -qxE 'warp=(on|plus)'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     volumes:
       - warp-data:/var/lib/cloudflare-warp
+      - ./scripts/warp-supervise.sh:/opt/adl/warp-supervise.sh:ro
     restart: unless-stopped
 
   # AmneziaWG as a SOCKS5 proxy (awg:1080). The provider's VLESS endpoint on the
