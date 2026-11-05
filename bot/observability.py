@@ -185,6 +185,7 @@ class Journal:
     def tell_rejection(self,user):
         now=time.time()
         self.sql.execute('DELETE FROM rejection_notices WHERE ts<?',(now-60,))
+        self.sql.commit()
         if self.sql.execute('SELECT count(*) FROM rejection_notices').fetchone()[0]>=10:
             return False
         if self.sql.execute('SELECT 1 FROM rejection_notices WHERE user=?',(user,)).fetchone():
@@ -201,6 +202,7 @@ class Journal:
         now = time.time()
         self.sql.execute("DELETE FROM seen WHERE ts<?", (now-86400,))
         if self.sql.execute("SELECT 1 FROM seen WHERE id=?",(ident,)).fetchone():
+            self.sql.commit()
             return True
         if self.sql.execute("SELECT count(*) FROM seen").fetchone()[0] >= 10000:
             self.sql.execute("DELETE FROM seen WHERE id IN (SELECT id FROM seen ORDER BY ts LIMIT 1)")
@@ -296,6 +298,9 @@ class Journal:
             return
         now = time.time()
         self.sql.execute("DELETE FROM notice_new WHERE ts<?",(now-600,))
+        # Even a DELETE matching zero rows starts a SQLite write transaction.
+        # Never retain it across an empty-queue return or a network await.
+        self.sql.commit()
         new_allowed = self.sql.execute("SELECT count(*) FROM notice_new").fetchone()[0] < 6
         row = self.sql.execute("SELECT * FROM incidents WHERE revision>sent_revision AND next_notice<=? "
                                "AND (message>0 OR (message IS NULL AND ?)) ORDER BY last LIMIT 1", (now,new_allowed)).fetchone()

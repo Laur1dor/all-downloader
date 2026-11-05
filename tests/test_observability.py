@@ -330,3 +330,35 @@ class OperationalTests(unittest.IsolatedAsyncioTestCase):
     def test_database_monitor_is_labelled_service_operation_not_owner_download(self):
         self.journal.incident(audit.Job('mirror','system:postgres',100,'mirror'),'failed',100)
         self.assertIn('Контекст: служебная операция',audit.format_incident(self.journal.rows()[0],100))
+
+    async def test_idle_worker_and_rejection_paths_release_transaction_for_other_connection(self):
+        import sqlite3
+        bot=SimpleNamespace(send_message=AsyncMock(),edit_message_text=AsyncMock())
+        # This exact empty-notification path held a write transaction in the
+        # first live rollout, blocking both BEGIN IMMEDIATE and other writers.
+        await self.journal.notify(bot,100)
+        self.assertFalse(self.journal.sql.in_transaction)
+        other=sqlite3.connect(self.path,timeout=.05)
+        try:
+            other.execute('BEGIN IMMEDIATE');other.commit()
+            self.assertEqual(self.journal.admit('id','scope',200),'accepted')
+            self.journal.finish('id','done')
+            self.assertFalse(self.journal.seen('x'))
+            self.assertTrue(self.journal.seen('x'))
+            self.assertFalse(self.journal.sql.in_transaction)
+            self.assertTrue(self.journal.tell_rejection(200))
+            self.assertFalse(self.journal.tell_rejection(200))
+            self.assertFalse(self.journal.sql.in_transaction)
+            other.execute('BEGIN IMMEDIATE');other.commit()
+        finally:other.close()
+
+    async def test_notification_network_await_does_not_lock_other_writers(self):
+        import sqlite3
+        self.journal.incident(audit.Job('id','scope',200,'download'),'failed',100)
+        async def send(*_):
+            other=sqlite3.connect(self.path,timeout=.05)
+            try:other.execute('BEGIN IMMEDIATE');other.commit()
+            finally:other.close()
+            return SimpleNamespace(message_id=77)
+        await self.journal.notify(SimpleNamespace(send_message=send),100)
+        self.assertFalse(self.journal.sql.in_transaction)
