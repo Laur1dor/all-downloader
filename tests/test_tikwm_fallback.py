@@ -361,27 +361,47 @@ class TikwmFallbackTests(unittest.TestCase):
         self.assertEqual(command[command.index("-bsf:v") + 1],
                          "filter_units=remove_types=0|6")
 
-    @patch("curl_cffi.requests.Session")
-    def test_confirmed_video_failure_does_not_become_photo(self, session_class):
-        resolver, warp = MagicMock(), MagicMock()
-        resolver.proxies = {}
-        session_class.return_value = warp
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            patch("bot.downloader._tiktok_item", side_effect=DownloadFailedError("geo")),
-            patch("bot.downloader._tikwm_data", return_value=({
-                "id": "7686099879466224916",
-                "play": "https://v16m.tiktokcdn-us.com/video.mp4",
-            }, resolver)),
-            patch("bot.downloader._stream_to_file", return_value=False),
-            self.assertRaises(ConfirmedVideoError),
+    def test_confirmed_video_failure_does_not_become_photo(self):
+        from bot import proxy
+
+        warp = "socks5h://warp:1080"
+        backup_exit = "socks5h://xray:2080"
+        for primary, expected_routes in (
+            (warp, [warp]),
+            (backup_exit, [warp, backup_exit]),
         ):
-            _download_tiktok_sync(
-                "https://vt.tiktok.com/ZSb6B6Cef/", tmpdir,
-                "socks5h://warp:1080", 10_000, None, None, {},
-            )
-        resolver.close.assert_called_once()
-        warp.close.assert_called_once()
+            with self.subTest(primary=primary), tempfile.TemporaryDirectory() as tmpdir:
+                routing = Path(tmpdir) / "routing.toml"
+                routing.write_text(f'[services]\ntiktok = "{primary}"\n', encoding="utf-8")
+                resolver = MagicMock(proxies={})
+                media_sessions = [MagicMock() for _ in expected_routes]
+                with (
+                    patch.object(proxy, "_ROUTING_FILE", routing),
+                    patch.object(proxy, "_tiktok_own_vpn", return_value=False),
+                    patch("bot.downloader._tiktok_item", side_effect=DownloadFailedError("geo")),
+                    patch("bot.downloader._tikwm_data", return_value=({
+                        "id": "7686099879466224916",
+                        "play": "https://v16m.tiktokcdn-us.com/video.mp4",
+                    }, resolver)),
+                    patch("curl_cffi.requests.Session", side_effect=media_sessions) as session_class,
+                    patch("bot.downloader._stream_to_file", return_value=False) as stream,
+                ):
+                    with patch.object(proxy, "_router", proxy.ProxyRouter(None)):
+                        with self.assertRaises(ConfirmedVideoError):
+                            _download_tiktok_sync(
+                                "https://vt.tiktok.com/ZSb6B6Cef/", tmpdir,
+                                warp, 10_000, None, None, {},
+                            )
+                self.assertEqual(
+                    [call.kwargs["proxies"]["https"] for call in session_class.call_args_list],
+                    expected_routes,
+                )
+                self.assertEqual(
+                    [call.args[0] for call in stream.call_args_list],
+                    [resolver, *media_sessions],
+                )
+                for session in [resolver, *media_sessions]:
+                    session.close.assert_called_once()
 
     def test_real_photo_stays_on_album_path(self):
         session = MagicMock()

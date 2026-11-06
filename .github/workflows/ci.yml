@@ -58,6 +58,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Nightly backup routing regression
+        # Private backup commits can replace data/routing.toml. Exercise both
+        # route shapes on every run using synthetic configuration.
+        run: |
+          docker run --rm --network none -e PYTHON_DOTENV_DISABLED=1 -e ROUTING_FILE=/dev/null \
+            -v "$PWD:/src:ro" -w /src bot-ci:${{ github.sha }} python -m unittest \
+            tests.test_tikwm_fallback.TikwmFallbackTests.test_confirmed_video_failure_does_not_become_photo
+
       - name: Smoke tests
         # Mounted over the image's own copy so the tests see the checkout,
         # including proxy/ and tests/, exactly as the deploy does on the server.
