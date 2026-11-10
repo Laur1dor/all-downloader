@@ -148,6 +148,20 @@ class OperatorDatabaseIntegration(unittest.IsolatedAsyncioTestCase):
                 await connection.fetchval("SELECT state FROM broadcasts WHERE id=$1", broadcast_id),
                 "done",
             )
+            # Exercise actual worker SQL, JSONB decoding and localized keyboards.
+            import json
+            variants={lang:{"message_id":mid,"reply_markup":{"inline_keyboard":[[{"text":lang,"url":"https://t.me/klenvpnbot?start=c_dk8phj"}]]}} for lang,mid in [("ru",11),("en",22)]}
+            await connection.execute("UPDATE users SET language_code='ru-RU' WHERE telegram_id=101")
+            localized_id=await connection.fetchval("INSERT INTO broadcasts(source_chat,source_message,variants) VALUES(7,11,$1::jsonb) RETURNING id",json.dumps(variants))
+            self.assertTrue(await launch(db,localized_id))
+            for uid,mid,label in [(101,11,"ru"),(102,22,"en")]:
+                bot.copy_message.reset_mock()
+                with patch("bot.broadcasts.asyncio.sleep",stop), self.assertRaises(asyncio.CancelledError):
+                    await run_worker(bot,db)
+                self.assertEqual(bot.copy_message.await_args.args,(uid,7,mid))
+                button=bot.copy_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+                self.assertEqual(button.text,label)
+                self.assertEqual(button.url,"https://t.me/klenvpnbot?start=c_dk8phj")
         finally:
             await transaction.rollback()
             await connection.close()

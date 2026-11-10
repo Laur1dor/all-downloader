@@ -93,7 +93,7 @@ async def run_worker(bot: Bot, db: Database) -> None:
                     source_chat, source_message, markup = localized_source(row)
                     await bot.copy_message(
                         row["telegram_id"], source_chat, source_message,
-                        reply_markup=markup,
+                        **({"reply_markup": markup} if markup is not None else {}),
                     )
         except TelegramForbiddenError:
             state = "blocked"
