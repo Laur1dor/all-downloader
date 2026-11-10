@@ -610,7 +610,7 @@ def browser_proxy() -> dict[str, str] | None:
     return {"server": url} if url.startswith(("socks5://", "http://", "https://")) else None
 
 
-def _run_browser() -> int:
+def _run_browser(*, check_only: bool = False) -> int:
     username = os.getenv("IG_USERNAME", "")
     password = os.getenv("IG_PASSWORD", "")
     if not (username and password):
@@ -642,6 +642,14 @@ def _run_browser() -> int:
         try:
             page.goto("https://www.instagram.com/", timeout=60000)
             page.wait_for_timeout(3000)
+
+            if check_only:
+                if _logged_in(page):
+                    written = write_cookies(context.cookies())
+                    log(f"scheduled session check: signed in; {written} cookies refreshed")
+                    return 0 if written else 3
+                log("scheduled session check inconclusive; no login attempted")
+                return 3
 
             _dismiss_save_login(page)
             if _restricted(page):
@@ -696,12 +704,12 @@ def _run_browser() -> int:
             context.close()
 
 
-def run() -> int:
+def run(*, check_only: bool = False) -> int:
     from ig_profile import ProfileBusy, profile_lock
 
     try:
-        with profile_lock(timeout=20):
-            return _run_browser()
+        with profile_lock(timeout=0 if check_only else 20):
+            return _run_browser(check_only=check_only)
     except ProfileBusy:
         log("Instagram browser profile is busy; login deferred")
         return 3
@@ -709,9 +717,11 @@ def run() -> int:
 
 if __name__ == "__main__":
     code = 1
+    check_only = sys.argv[1:] == ["--check-only"]
     try:
-        code = run()
+        code = run(check_only=check_only)
     except Exception as exc:
         log(f"failed: {type(exc).__name__}: {exc}")
-    report(code == 0)
+    if not check_only:
+        report(code == 0)
     sys.exit(code)

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check saved Instagram browser session without logging in
+Requires=docker.service
+After=docker.service
+ConditionPathExists=/root/tiktok-bot/data/ig-profile
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/tiktok-bot
+ExecStart=/usr/bin/docker exec iglogin python /app/scripts/iglogin_browser.py --check-only
+TimeoutStartSec=90
+SuccessExitStatus=3

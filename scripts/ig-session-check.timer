@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Instagram session twice daily
+
+[Timer]
+OnCalendar=*-*-* 10,18:00:00 Europe/Moscow
+Persistent=false
+Unit=ig-session-check.service
+
+[Install]
+WantedBy=timers.target
