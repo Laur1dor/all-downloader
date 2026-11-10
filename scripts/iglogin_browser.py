@@ -39,7 +39,6 @@ RESULT_FILE = Path(os.getenv("IG_RESULT_FILE", "/app/data/iglogin_result.txt"))
 BLOCKED_FILE = RESULT_FILE.with_name("ig_account_blocked.json")
 
 _CODE_RE = re.compile(r"\b(\d{6})\b")
-_FROM_HINTS = ("instagram", "facebookmail", "mail.instagram.com")
 _CODE_WAIT_SECONDS = int(os.getenv("IG_CODE_WAIT", "180"))
 _CODE_POLL_SECONDS = 10
 
@@ -88,6 +87,28 @@ def _code_from(raw: bytes) -> str | None:
     return found[0] if found else None
 
 
+def _mail_code(raw: bytes, since: float, recipient: str, handle: str) -> str | None:
+    """Only a fresh verification for this mailbox and Instagram profile."""
+    message = email.message_from_bytes(raw)
+    sender = email.utils.parseaddr(message.get("From", ""))[1].lower()
+    domain = sender.rpartition("@")[2]
+    if domain not in ("instagram.com", "mail.instagram.com", "facebookmail.com", "account.meta.com"):
+        return None
+    addresses = {address.lower() for _, address in email.utils.getaddresses(message.get_all("To", []) + message.get_all("Delivered-To", []))}
+    if recipient.lower() not in addresses:
+        return None
+    try:
+        stamp = email.utils.parsedate_to_datetime(message.get("Date", ""))
+        if stamp.tzinfo is None or not since <= stamp.timestamp() <= time.time() + 300:
+            return None
+    except (ValueError, TypeError, OverflowError):
+        return None
+    body = "\n".join((part.get_payload(decode=True) or b"").decode(part.get_content_charset() or "utf-8", "replace") for part in message.walk() if part.get_content_type() in ("text/plain", "text/html"))
+    if handle and not re.search(r"(?<![a-z0-9_.])" + re.escape(handle) + r"(?![a-z0-9_.])", body, re.I):
+        return None
+    return _code_from(raw)
+
+
 def code_from_mail(since: float) -> str | None:
     host = os.getenv("IG_IMAP_HOST", "")
     user = os.getenv("IG_IMAP_USER", "")
@@ -101,28 +122,21 @@ def code_from_mail(since: float) -> str | None:
         try:
             with imaplib.IMAP4_SSL(host, timeout=20) as box:
                 box.login(user, password)
-                box.select("INBOX")
+                box.select("INBOX", readonly=True)
                 day = time.strftime("%d-%b-%Y", time.gmtime(since))
                 status, data = box.search(None, f'(SINCE "{day}")')
                 if status == "OK" and data and data[0]:
                     for num in reversed(data[0].split()[-40:]):
-                        status, payload = box.fetch(num, "(RFC822)")
+                        status, payload = box.fetch(num, "(BODY.PEEK[])")
                         if status != "OK" or not payload or not payload[0]:
                             continue
                         raw = payload[0][1]
-                        parsed = email.message_from_bytes(raw)
-                        sender = str(parsed.get("From", "")).lower()
-                        if not any(hint in sender for hint in _FROM_HINTS):
-                            continue
-                        stamp = email.utils.parsedate_to_datetime(parsed.get("Date"))
-                        if stamp and stamp.timestamp() < since:
-                            continue
-                        code = _code_from(raw)
+                        code = _mail_code(raw, since, user, os.getenv("IG_HANDLE", ""))
                         if code:
                             log("code found in the mailbox")
                             return code
         except Exception as exc:
-            log(f"mailbox read failed: {type(exc).__name__}: {exc}")
+            log(f"mailbox read failed: {type(exc).__name__}; check mailbox credentials")
             return None
         log("code has not arrived yet, waiting")
         time.sleep(_CODE_POLL_SECONDS)
@@ -216,6 +230,25 @@ def _describe(page) -> None:
 # from it authenticated nothing - gallery-dl got 400 from the media API with it.
 # So the question is asked of the site, using an endpoint that answers only for
 # a session that is really signed in.
+def _visible_authenticated_profile(page) -> bool | None:
+    """Positive UI evidence only; an inconclusive endpoint never means logout."""
+    from urllib.parse import urlsplit
+    handle = os.getenv("IG_HANDLE", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", handle) or not isinstance(page.url, str):
+        return None
+    url = urlsplit(page.url)
+    if url.scheme != "https" or url.hostname != "www.instagram.com" or url.path != "/":
+        return None
+    try:
+        if (page.locator(f'a[href="/{handle}/"] img').count() > 0
+                and page.locator('a[href="/direct/inbox/"]').count() > 0
+                and _first_visible(page, _PASS_FIELDS) is None):
+            return True
+    except Exception:
+        pass
+    return None
+
+
 def _authentication_state(page) -> bool | None:
     """Whether this browser is signed in, asked of Instagram rather than assumed.
 
@@ -251,11 +284,11 @@ def _authentication_state(page) -> bool | None:
             }"""
         )
     except Exception:
-        return None
+        return _visible_authenticated_profile(page)
     if not isinstance(result, dict) or result.get("unknown"):
-        return None
+        return _visible_authenticated_profile(page)
     if result.get("status") != 200:
-        return None
+        return _visible_authenticated_profile(page)
     return bool(result.get("user"))
 
 
@@ -301,9 +334,16 @@ _CODE_FIELDS = (
 )
 
 
+def _checkpoint_code_fields(page) -> tuple[str, ...]:
+    from urllib.parse import urlsplit
+    if urlsplit(page.url).path.rstrip("/") == "/auth_platform/codeentry":
+        return (*_CODE_FIELDS, 'input[name="email"]')
+    return _CODE_FIELDS
+
+
 def _fill_code(page, code: str) -> bool:
     """Type the verification code into whichever box the flow is showing."""
-    for selector in _CODE_FIELDS:
+    for selector in _checkpoint_code_fields(page):
         box = page.locator(selector).first
         try:
             if box.count() and box.is_visible():
@@ -431,6 +471,18 @@ _CHECKPOINT_WAIT = int(os.getenv("IG_CHECKPOINT_WAIT", "300"))
 _CONFIRM_LABELS = ("This Was Me", "Это я", "Continue", "Продолжить", "Dismiss")
 
 
+def _dismiss_save_login(page) -> None:
+    from urllib.parse import urlsplit
+    if not isinstance(page.url, str):
+        return
+    url = urlsplit(page.url)
+    if (url.scheme == "https" and url.hostname == "www.instagram.com"
+            and url.path == "/accounts/onetap/"
+            and _click_named(page, ("Not now", "Не сейчас"))):
+        log("dismissed save-login prompt after authentication")
+        page.wait_for_timeout(3000)
+
+
 def _clear_checkpoint(page, since: float) -> None:
     """Answer whatever Instagram put between the password and the session.
 
@@ -447,6 +499,7 @@ def _clear_checkpoint(page, since: float) -> None:
     tried_captcha = False
 
     while time.monotonic() < deadline:
+        _dismiss_save_login(page)
         if _restricted(page):
             return
         if _needs_phone(page):
@@ -493,7 +546,7 @@ def _clear_checkpoint(page, since: float) -> None:
             page.wait_for_timeout(5000)
             continue
 
-        if not tried_code and _first_visible(page, _CODE_FIELDS) is not None:
+        if not tried_code and _first_visible(page, _checkpoint_code_fields(page)) is not None:
             tried_code = True
             code = code_from_mail(since)
             if code and _fill_code(page, code):
@@ -590,6 +643,7 @@ def _run_browser() -> int:
             page.goto("https://www.instagram.com/", timeout=60000)
             page.wait_for_timeout(3000)
 
+            _dismiss_save_login(page)
             if _restricted(page):
                 return 4
             if _needs_phone(page):
