@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+
+from aiogram.types import InlineKeyboardMarkup
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -17,6 +20,20 @@ from bot.db import Database
 from bot.telegram_outbound import bulk_call
 
 logger = logging.getLogger(__name__)
+
+
+def localized_source(row):
+    """Russian Telegram locales use RU; unknown and other locales use EN."""
+    variants = row.get("variants")
+    if isinstance(variants, str):
+        variants = json.loads(variants)
+    if not variants:
+        return row["source_chat"], row["source_message"], None
+    language = (row.get("language_code") or "").lower().replace("_", "-").split("-")[0]
+    variant = variants["ru" if language == "ru" else "en"]
+    markup = variant.get("reply_markup")
+    return (row["source_chat"], int(variant["message_id"]),
+            InlineKeyboardMarkup.model_validate(markup) if markup else None)
 
 
 async def launch(db: Database, broadcast_id: int) -> bool:
@@ -46,7 +63,8 @@ async def run_worker(bot: Bot, db: Database) -> None:
             "UPDATE broadcast_recipients r SET state='sending',attempts=attempts+1 "
             "FROM picked p,broadcasts b WHERE r.broadcast_id=p.broadcast_id "
             "AND r.telegram_id=p.telegram_id AND b.id=p.broadcast_id "
-            "RETURNING r.*,b.source_chat,b.source_message"
+            "RETURNING r.*,b.source_chat,b.source_message,b.variants,"
+            "(SELECT language_code FROM users WHERE telegram_id=r.telegram_id) AS language_code"
         )
         if row is None:
             await db.pool.execute(
@@ -72,8 +90,10 @@ async def run_worker(bot: Bot, db: Database) -> None:
                 if not allowed:
                     state = "skipped"
                 else:
+                    source_chat, source_message, markup = localized_source(row)
                     await bot.copy_message(
-                        row["telegram_id"], row["source_chat"], row["source_message"]
+                        row["telegram_id"], source_chat, source_message,
+                        reply_markup=markup,
                     )
         except TelegramForbiddenError:
             state = "blocked"

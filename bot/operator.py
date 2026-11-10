@@ -6,6 +6,7 @@ from bot.db import Database
 
 SCHEMA = """
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS language_code TEXT;
 CREATE TABLE IF NOT EXISTS support_sessions (
  telegram_id BIGINT PRIMARY KEY, opened_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS broadcasts (
  source_chat BIGINT NOT NULL, source_message BIGINT NOT NULL,
  state TEXT NOT NULL DEFAULT 'draft', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS variants JSONB;
 CREATE TABLE IF NOT EXISTS broadcast_recipients (
  broadcast_id BIGINT NOT NULL REFERENCES broadcasts(id), telegram_id BIGINT NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
