@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS broadcast_recipients (
  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(), error TEXT,
  PRIMARY KEY(broadcast_id,telegram_id)
 );
+ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS message_id BIGINT;
+ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS broadcast_pending ON broadcast_recipients(state,next_attempt_at);
 -- Restore former opt-outs once. Keep Telegram-forbidden recipients disabled;
 -- notifications_enabled now records delivery availability, not a preference.

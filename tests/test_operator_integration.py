@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, patch
 
 import asyncpg
 
+from aiogram.types import MessageId
+
 from bot.broadcasts import launch, run_worker
 from bot.config import load_settings
 from bot.operator import prepare, recipient
@@ -110,7 +112,7 @@ class OperatorDatabaseIntegration(unittest.IsolatedAsyncioTestCase):
             async def stop(_seconds):
                 raise asyncio.CancelledError
 
-            bot = SimpleNamespace(copy_message=AsyncMock())
+            bot = SimpleNamespace(copy_message=AsyncMock(return_value=MessageId(message_id=987)))
             with (
                 patch("bot.broadcasts.asyncio.sleep", stop),
                 self.assertRaises(asyncio.CancelledError),
@@ -124,6 +126,12 @@ class OperatorDatabaseIntegration(unittest.IsolatedAsyncioTestCase):
                 ),
                 "sent",
             )
+
+            saved=await connection.fetchrow("SELECT message_id,sent_at FROM broadcast_recipients WHERE broadcast_id=$1 AND telegram_id=101",broadcast_id)
+            self.assertEqual(saved['message_id'],987)
+            self.assertIsNotNone(saved['sent_at'])
+            await prepare(db)
+            self.assertEqual(await connection.fetchval("SELECT message_id FROM broadcast_recipients WHERE broadcast_id=$1 AND telegram_id=101",broadcast_id),987)
 
             await connection.execute(
                 "UPDATE broadcast_recipients SET state='sending' "

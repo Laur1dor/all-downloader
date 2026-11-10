@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import CopyMessage
+from aiogram.types import MessageId
 
 from bot.broadcasts import launch, run_worker
 from bot.operator import prepare, recipient
@@ -54,12 +55,17 @@ class OperatorTests(unittest.IsolatedAsyncioTestCase):
                "source_message": 8, "attempts": attempts}
         pool = SimpleNamespace(fetchrow=AsyncMock(return_value=row),
                                fetchval=AsyncMock(return_value=allowed), execute=AsyncMock())
-        bot = SimpleNamespace(copy_message=AsyncMock(side_effect=failure))
+        bot = SimpleNamespace(copy_message=AsyncMock(side_effect=failure, return_value=MessageId(message_id=987)))
         async def stop(_seconds):
             raise asyncio.CancelledError
         with patch("bot.broadcasts.asyncio.sleep", stop), self.assertRaises(asyncio.CancelledError):
             await run_worker(bot, SimpleNamespace(pool=pool))
         return bot, pool.execute.call_args.args
+
+    async def test_confirmed_delivery_saves_message_id(self):
+        _, update = await self.delivery()
+        self.assertEqual(update[3], "sent")
+        self.assertEqual(update[6], 987)
 
     async def test_cancel_or_blocked_delivery_before_send_skips_recipient(self):
         bot, update = await self.delivery(allowed=False)
@@ -71,6 +77,7 @@ class OperatorTests(unittest.IsolatedAsyncioTestCase):
         bot, update = await self.delivery(failure=TelegramNetworkError(method, "timeout"))
         self.assertEqual(bot.copy_message.await_count, 1)
         self.assertEqual(update[3], "uncertain")
+        self.assertIsNone(update[6])
 
     async def test_explicit_rate_limit_has_bounded_retries(self):
         method = CopyMessage(chat_id=42, from_chat_id=7, message_id=8)

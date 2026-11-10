@@ -76,6 +76,7 @@ async def run_worker(bot: Bot, db: Database) -> None:
             await asyncio.sleep(2)
             continue
         state, error, delay = "sent", None, 0
+        delivered_message_id = None
         try:
             with bulk_call():
                 # Recheck after claim: cancellation and blocked delivery take effect before
@@ -91,10 +92,11 @@ async def run_worker(bot: Bot, db: Database) -> None:
                     state = "skipped"
                 else:
                     source_chat, source_message, markup = localized_source(row)
-                    await bot.copy_message(
+                    delivered = await bot.copy_message(
                         row["telegram_id"], source_chat, source_message,
                         **({"reply_markup": markup} if markup is not None else {}),
                     )
+                    delivered_message_id = delivered.message_id
         except TelegramForbiddenError:
             state = "blocked"
             await db.pool.execute(
@@ -111,6 +113,8 @@ async def run_worker(bot: Bot, db: Database) -> None:
             state, error = "uncertain", "delivery_unknown"
         await db.pool.execute(
             "UPDATE broadcast_recipients SET state=$3,error=$4,"
+            "message_id=COALESCE($6,message_id),"
+            "sent_at=CASE WHEN $6::bigint IS NOT NULL THEN now() ELSE sent_at END,"
             "next_attempt_at=now()+make_interval(secs=>$5) "
             "WHERE broadcast_id=$1 AND telegram_id=$2",
             row["broadcast_id"],
@@ -118,6 +122,7 @@ async def run_worker(bot: Bot, db: Database) -> None:
             state,
             error,
             float(delay),
+            delivered_message_id,
         )
         from bot.observability import current, Job
         journal = current()
