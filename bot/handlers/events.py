@@ -74,13 +74,18 @@ class EventMiddleware(BaseMiddleware):
             _handled_outcome.reset(token)
             try:
                 if not data.get('_audit_refused') and outcome != 'rate_limited':
-                    await asyncio.wait_for(db.pool.execute(
-                        "UPDATE users SET language_code=$2 WHERE telegram_id=$1",
-                        user.id, user.language_code,
-                    ), timeout=3)
                     await asyncio.wait_for(db.record_event(
                         user.id, action_name(event), outcome,
                         min(int((time.monotonic() - started) * 1000), 2_147_483_647),
                     ),timeout=3)
             except Exception:
                 logger.warning("Could not record user event", exc_info=True)
+            # Language persistence must never suppress the operational event journal.
+            if not data.get('_audit_refused') and hasattr(db, "pool"):
+                try:
+                    await asyncio.wait_for(db.pool.execute(
+                        "UPDATE users SET language_code=$2 WHERE telegram_id=$1",
+                        user.id, getattr(user, "language_code", None),
+                    ), timeout=3)
+                except Exception:
+                    logger.warning("Could not update Telegram language", exc_info=True)
