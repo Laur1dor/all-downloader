@@ -321,7 +321,7 @@ assert _upload_timeout(None) == 60
 assert _upload_timeout(50 * 1024 * 1024) == 360
 assert _upload_timeout(768 * 1024**2) == _UPLOAD_KILL_SECONDS - 20
 assert _upload_timeout(1_500_000_000) >= 1_290
-assert _upload_timeout(50 * 1024 * 1024 * 1024) < _UPLOAD_KILL_SECONDS
+assert _upload_timeout(50 * 1024**3) == _upload_timeout(1_500_000_000)
 
 
 def _wrapped(cause: BaseException) -> _TelegramNetworkError:

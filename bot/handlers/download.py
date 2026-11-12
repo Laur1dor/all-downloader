@@ -157,7 +157,7 @@ def _upload_timeout(size_bytes: int | None) -> int:
     """Seconds to allow for one upload of this size."""
     if size_bytes and size_bytes > _LARGE_UPLOAD_BYTES:
         # Allow for a 10 Mbit/s uplink plus time for Telegram confirmation.
-        return 90 + (size_bytes + 1_249_999) // 1_250_000
+        return 90 + (min(size_bytes, _UPLOAD_PART_BYTES) + 1_249_999) // 1_250_000
     megabytes = (size_bytes or 0) / (1024 * 1024)
     budget = _UPLOAD_FLOOR_SECONDS + megabytes * _UPLOAD_SECONDS_PER_MB
     return int(min(budget, _UPLOAD_KILL_SECONDS - 20))
