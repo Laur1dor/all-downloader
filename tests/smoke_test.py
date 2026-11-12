@@ -319,7 +319,8 @@ assert _upload_timeout(None) == 60
 # A large file gets proportionally longer, but never past the point where the
 # far side hangs up on its own - beyond that the deadline would never be ours.
 assert _upload_timeout(50 * 1024 * 1024) == 360
-assert _upload_timeout(2000 * 1024 * 1024) == _UPLOAD_KILL_SECONDS - 20
+assert _upload_timeout(768 * 1024**2) == _UPLOAD_KILL_SECONDS - 20
+assert _upload_timeout(1_500_000_000) >= 1_290
 assert _upload_timeout(50 * 1024 * 1024 * 1024) < _UPLOAD_KILL_SECONDS
 
 
