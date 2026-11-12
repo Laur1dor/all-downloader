@@ -1435,15 +1435,30 @@ async def _temporary_download(
     capped: bool,
 ) -> AsyncIterator[Media]:
     tmpdir = tempfile.mkdtemp(prefix=tmp_prefix)
+    cleanup_deferred = False
     try:
         options["outtmpl"] = str(Path(tmpdir) / "%(id)s.%(ext)s")
         try:
-            if capped:
-                path, info = await _download_capped(
-                    url, options, capped_format, max_bytes, size_guard
-                )
-            else:
-                path, info = await _download_best(url, options, max_bytes, size_guard)
+            download = (
+                _download_capped(url, options, capped_format, max_bytes, size_guard)
+                if capped else _download_best(url, options, max_bytes, size_guard)
+            )
+            worker = asyncio.create_task(download)
+            try:
+                path, info = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                if cancel_event is not None:
+                    cancel_event.set()
+                # Cancelling an await on to_thread does not stop its writer.
+                # Keep the directory until the worker has released it.
+                def cleanup_when_done(task):
+                    if not task.cancelled():
+                        task.exception()
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+                worker.add_done_callback(cleanup_when_done)
+                cleanup_deferred = True
+                raise
         except DownloadCancelledError:
             raise
         except (OversizedError, FileTooLargeError, YoutubeDLError) as exc:
@@ -1477,7 +1492,8 @@ async def _temporary_download(
             info = dict(info, duration=_ffprobe_duration(path) or info.get("duration"))
         yield _build_media(path, info)
     finally:
-        await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
+        if not cleanup_deferred:
+            await asyncio.to_thread(shutil.rmtree, tmpdir, ignore_errors=True)
 
 
 def _ranged_temp_bytes(directory: Path) -> int:
@@ -1645,6 +1661,8 @@ def download_video(
         return _rule34_video_download(
             url, cookies_file, max_bytes, cancel_event, force_proxy,
         )
+    if cancel_event is None:
+        cancel_event = threading.Event()
     size_guard = {"limit": max_bytes, "tripped": None,
                   "deadline": time.monotonic() + 30 * 60}
     options = _base_options(cookies_file, url, force_proxy) | {
