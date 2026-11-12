@@ -205,3 +205,17 @@ class Rule34VideoExitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Rule34VideoPrivacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_proxy_refuses_video_and_album(self):
+        url = "https://rule34video.com/video/123/"
+        with patch.object(downloader, "proxy_for", return_value=None):
+            with self.assertRaisesRegex(downloader.DownloadFailedError, "прокси"):
+                downloader.download_video(url, None)
+            with self.assertRaisesRegex(downloader.DownloadFailedError, "прокси"):
+                async with downloader.download_album(url, None):
+                    self.fail("Rule34Video album started without a proxy")
+
+    def test_periodic_direct_probes_exclude_rule34video(self):
+        self.assertNotIn("rule34video", proxy._PROBE_URLS)

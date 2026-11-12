@@ -627,6 +627,8 @@ def _base_options(cookies_file: Path | None, url: str = "", force_proxy: bool = 
         detect_platform(url) if url else ""
     )
     proxy = forced_proxy(_plat) if force_proxy else (proxy_for(_plat) if url else None)
+    if _plat == "rule34video" and not proxy:
+        raise DownloadFailedError("Rule34Video: прокси недоступен.")
     if proxy:
         options["proxy"] = proxy
     return options
@@ -3493,10 +3495,12 @@ async def download_album(
 ) -> AsyncIterator[AlbumMedia]:
     """Async context manager yielding album media; temp files are always removed."""
     from curl_cffi.requests.exceptions import RequestException as CurlRequestException
-    tmpdir = tempfile.mkdtemp(prefix="tg-album-")
     host = (urlparse(url).hostname or "").lower()
     _plat = detect_platform(url)
     proxy = forced_proxy(_plat) if force_proxy else proxy_for(_plat)
+    if _plat == "rule34video" and not proxy:
+        raise DownloadFailedError("Rule34Video: прокси недоступен.")
+    tmpdir = tempfile.mkdtemp(prefix="tg-album-")
     # A dead exit makes gallery-dl come back empty, and "no video and no photos
     # here" is then a claim about the post that simply is not true. TikTok is
     # the platform where exits die under us, and it is the one with a ladder of

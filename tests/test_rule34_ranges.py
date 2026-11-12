@@ -21,9 +21,11 @@ class Rule34RangeTests(unittest.IsolatedAsyncioTestCase):
         url = "https://rule34video.com/video/123/example/"
         marker = object()
         with patch.object(downloader, "_temporary_download", return_value=marker) as temporary, \
+                patch.object(downloader, "proxy_for", return_value="socks5h://warp:1080"), \
                 patch.object(downloader, "_ranged_download") as ranged:
             self.assertIs(downloader.download_video(url, None, time_range=(10, 20)), marker)
         options = temporary.call_args.args[1]
+        self.assertEqual(options["proxy"], "socks5h://warp:1080")
         self.assertNotIn("download_ranges", options)
         ranged.assert_not_called()
 

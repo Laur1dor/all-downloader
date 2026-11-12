@@ -208,14 +208,14 @@ class DownloadSchedulingTests(unittest.IsolatedAsyncioTestCase):
                 pass
         self.assertEqual(cleaned, [800, 100])
 
-    def test_network_part_limit_matches_upload_deadline(self) -> None:
+    def test_upload_part_limit_keeps_960_mb_whole(self) -> None:
         settings = SimpleNamespace(admin_id=1, max_upload_bytes=2000 * 1024**2)
-        with patch.object(download.config, "upload_bytes", return_value=2000 * 1024**2), \
-             patch.object(download.config, "get", return_value=100):
-            self.assertEqual(download._part_upload_limit(settings, 2), 768 * 1024**2)
-        with patch.object(download.config, "upload_bytes", return_value=2000 * 1024**2), \
-             patch.object(download.config, "get", return_value=10):
-            self.assertEqual(download._part_upload_limit(settings, 2), 384 * 1024**2)
+        with patch.object(download.config, "upload_bytes", return_value=2000 * 1024**2):
+            self.assertEqual(download._part_upload_limit(settings, 2), 1_500_000_000)
+            self.assertLess(960 * 1024**2, download._part_upload_limit(settings, 2))
+        with patch.object(download.config, "upload_bytes", return_value=50 * 1024**2):
+            self.assertEqual(download._part_upload_limit(settings, 2), 50 * 1024**2)
+        self.assertGreater(download._upload_timeout(1_500_000_000), 600)
         self.assertLess(download._upload_timeout(768 * 1024**2), 500)
 
     def test_unknown_download_and_preparation_show_honest_state(self) -> None:

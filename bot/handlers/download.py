@@ -147,14 +147,17 @@ class DeliveryUnknownError(RuntimeError):
     """Telegram may have accepted the media, but its response was lost."""
 
 
-# At 20 Mbit/s, 768 MiB takes ~322s, leaving room in the bounded
-# Telegram confirmation window.  The encoder targets 75%
-# of this limit, so a six-GiB source still fits at most eight parts.
-_UPLOAD_PART_BYTES = 768 * 1024**2
+# Keep normal uploads in one message up to 1500 MB. Operator limits and
+# the Bot API ceiling may be lower.
+_UPLOAD_PART_BYTES = 1_500_000_000
+_LARGE_UPLOAD_BYTES = 768 * 1024**2
 
 
 def _upload_timeout(size_bytes: int | None) -> int:
     """Seconds to allow for one upload of this size."""
+    if size_bytes and size_bytes > _LARGE_UPLOAD_BYTES:
+        # Allow for a 10 Mbit/s uplink plus time for Telegram confirmation.
+        return 90 + (size_bytes + 1_249_999) // 1_250_000
     megabytes = (size_bytes or 0) / (1024 * 1024)
     budget = _UPLOAD_FLOOR_SECONDS + megabytes * _UPLOAD_SECONDS_PER_MB
     return int(min(budget, _UPLOAD_KILL_SECONDS - 20))
@@ -555,13 +558,8 @@ def _user_limit(settings: Settings, user_id: int) -> int:
 
 
 def _part_upload_limit(settings: Settings, user_id: int) -> int:
-    """Keep one network upload below the route deadline at home uplink rates."""
-    configured_mbit = config.get("bandwidth_mbit")
-    effective_mbit = min(20, configured_mbit) if configured_mbit > 0 else 20
-    return min(
-        _user_limit(settings, user_id),
-        max(10 * 1024**2, _UPLOAD_PART_BYTES * effective_mbit // 20),
-    )
+    """Cap one part by the server ceiling and the user's configured limit."""
+    return min(_user_limit(settings, user_id), _UPLOAD_PART_BYTES)
 
 
 def _download_limit(settings: Settings, user_id: int) -> int:

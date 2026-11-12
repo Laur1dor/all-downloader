@@ -44,7 +44,6 @@ _PROBE_URLS = {
     "tiktok": "https://www.tiktok.com/",
     "instagram": "https://www.instagram.com/",
     "pornhub": "https://www.pornhub.com/",
-    "rule34video": "https://rule34video.com/",
     "rule34": "https://rule34.xxx/",
     "joidb": "https://www.the-joi-database.com/",
     "other": "https://www.google.com/generate_204",
