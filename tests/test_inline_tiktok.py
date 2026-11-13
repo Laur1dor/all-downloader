@@ -80,6 +80,10 @@ class InlineTikTokTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.edit_message_media.await_args.kwargs["media"].media, "new-id")
 
     def test_share_link_accepts_only_tiktok_video_or_short_link(self):
+        self.assertEqual(
+            download._inline_tiktok_link("https://\nvt.tiktok.com/ZSpQLDYac/"),
+            "https://vt.tiktok.com/ZSpQLDYac/",
+        )
         self.assertEqual(download._inline_tiktok_link(LINK + "?utm_source=share"), LINK)
         self.assertIsNone(download._inline_tiktok_link(LINK.replace("/video/", "/photo/")))
         self.assertIsNone(download._inline_tiktok_link(LINK.replace("www.tiktok.com", "www.tiktok.com.example.org")))

@@ -1965,6 +1965,7 @@ def _inline_cache_chat() -> int | None:
 
 
 def _inline_tiktok_link(value: str) -> str | None:
+    value = re.sub(r"^(https://)[ \t]*\r?\n[ \t]*", r"\1", value, count=1)
     if len(value) > 256 or any(char.isspace() for char in value):
         return None
     try:
@@ -2041,7 +2042,10 @@ async def _prepare_inline_tiktok(
 async def handle_inline_tiktok(query: InlineQuery, db: Database, settings: Settings) -> None:
     url = _inline_tiktok_link(query.query.strip())
     if not url:
-        await query.answer([], cache_time=0, is_personal=True)
+        button = InlineQueryResultsButton(
+            text="Нужна ссылка на видео TikTok", start_parameter="inline",
+        ) if query.query.strip() else None
+        await query.answer([], cache_time=0, is_personal=True, button=button)
         return
     resolved = _expanded_links.get(url, url)
     url_hash = hash_url(resolved)
