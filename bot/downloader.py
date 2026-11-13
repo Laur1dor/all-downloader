@@ -3491,7 +3491,8 @@ def _youtube_photo_album(url: str, tmpdir: str, proxy: str | None) -> AlbumMedia
 
 @asynccontextmanager
 async def download_album(
-    url: str, cookies_file: Path | None, force_proxy: bool = False
+    url: str, cookies_file: Path | None, force_proxy: bool = False, *,
+    allow_instagram_browser: bool = True,
 ) -> AsyncIterator[AlbumMedia]:
     """Async context manager yielding album media; temp files are always removed."""
     from curl_cffi.requests.exceptions import RequestException as CurlRequestException
@@ -3539,7 +3540,7 @@ async def download_album(
         # The browser has its own network in its own container, so walking the
         # exit ladder changes nothing for it. It used to run once per exit -
         # twenty seconds each, twice over, for the same answer.
-        browser_tried = False
+        browser_tried = not allow_instagram_browser
         login_error: InstagramLoginRequiredError | None = None
         for attempt, exit_proxy in enumerate(exits):
             if attempt:

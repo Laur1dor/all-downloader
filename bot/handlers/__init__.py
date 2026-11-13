@@ -25,7 +25,7 @@ def create_root_router(admin_id: int) -> Router:
     root.include_router(analytics.create_router(admin_id))
     root.include_router(broadcasts.create_router(admin_id))
     root.include_router(support.create_router(admin_id))
-    root.include_router(user.router)
     root.include_router(download.router)
+    root.include_router(user.router)
     root.include_router(user.fallback_router)
     return root
