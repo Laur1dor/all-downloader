@@ -109,7 +109,7 @@ router = create_root_router(admin_id=111111111)
 names = [r.name for r in router.sub_routers]
 assert names == [
     "admin", "suggestions_admin", "analytics", "broadcasts", "support",
-    "user", "download", "fallback",
+    "download", "user", "fallback",
 ], names
 print("routers OK:", names)
 
