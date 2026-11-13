@@ -30,12 +30,18 @@ from aiogram.exceptions import (
 from aiogram.methods import SendLivePhoto, TelegramMethod
 from aiogram.types import (
     CallbackQuery,
+    ChosenInlineResult,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InlineQueryResultCachedVideo,
+    InlineQueryResultsButton,
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
+    InputTextMessageContent,
     Message,
 )
 
@@ -672,6 +678,7 @@ def _description_capable(url: str, platform: str) -> bool:
 
 def _video_keyboard(
     token: str, with_description: bool = False, tiktok_file: bool = False,
+    *, share_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Buttons under a delivered video: audio always, description when present."""
     buttons = [
@@ -689,7 +696,12 @@ def _video_keyboard(
         buttons.append(InlineKeyboardButton(
             text="📁 Файл", callback_data=f"{_TIKTOK_FILE_PREFIX}{token}"
         ))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    rows = [buttons]
+    if share_url and (link := _inline_tiktok_link(share_url)) and _inline_cache_chat():
+        rows.append([InlineKeyboardButton(
+            text="Поделиться в другом чате", switch_inline_query=link,
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _description_keyboard(token: str, tiktok_file: bool = False) -> InlineKeyboardMarkup:
@@ -1272,8 +1284,10 @@ async def _run_link(
                             else None
                         )
                         part_keyboard = (
-                            _video_keyboard(token, with_description,
-                                            platform == "tiktok")
+                            _video_keyboard(
+                                token, with_description, platform == "tiktok",
+                                share_url=url if one_part and time_range is None else None,
+                            )
                             if part_index == 1 else None
                         )
 
@@ -1938,6 +1952,182 @@ def _video_cache_key(platform: str, *, height: int | None = None, capped: bool =
     return f"{base}_capped" if capped else base
 
 
+_INLINE_CACHE_KEY = "tiktok_inline_video"
+_INLINE_MAX_BYTES = 50 * 1024**2
+_inline_jobs: dict[str, tuple[int, asyncio.Task]] = {}
+_inline_progress: dict[str, ProgressState] = {}
+_inline_failed: OrderedDict[str, float] = OrderedDict()
+
+
+def _inline_cache_chat() -> int | None:
+    value = os.getenv("TIKTOK_INLINE_CACHE_CHAT_ID", "")
+    return int(value) if re.fullmatch(r"-100[0-9]{6,16}", value) else None
+
+
+def _inline_tiktok_link(value: str) -> str | None:
+    if len(value) > 256 or any(char.isspace() for char in value):
+        return None
+    try:
+        parts = urlparse(value)
+    except ValueError:
+        return None
+    if parts.scheme != "https":
+        return None
+    host = parts.netloc.lower()
+    if host in ("www.tiktok.com", "tiktok.com", "m.tiktok.com"):
+        match = re.fullmatch(r"/(@[\w.%-]+/video/[0-9]{10,25})/?", parts.path)
+        return f"https://www.tiktok.com/{match[1]}" if match else None
+    if host in ("vt.tiktok.com", "vm.tiktok.com", "t.tiktok.com"):
+        if re.fullmatch(r"/[A-Za-z0-9]{4,40}/?", parts.path):
+            return f"https://{host}/{parts.path.strip('/')}/"
+    return None
+
+
+async def _prepare_inline_tiktok(
+    bot: Bot, db: Database, url: str, settings: Settings, user_id: int, chat_id: int,
+) -> None:
+    cancel_event = Event()
+    progress = ProgressState()
+    _inline_progress[url] = progress
+    cancellation = asyncio.get_running_loop().call_later(90, cancel_event.set)
+    try:
+        ensure_public_url(url)
+        expanded = _inline_tiktok_link(await expand_short_link(url))
+        if not expanded or "/video/" not in expanded:
+            raise DownloadFailedError("Не удалось открыть ссылку на видео.")
+        if expanded != url:
+            _remember_expansion(url, expanded)
+        ensure_public_url(expanded)
+        if await db.get_cached_file(hash_url(expanded), _INLINE_CACHE_KEY):
+            return
+        limit = min(_INLINE_MAX_BYTES, _download_limit(settings, user_id))
+        if limit <= 0 or cancel_event.is_set():
+            raise DownloadFailedError("Загрузка сейчас недоступна.")
+        async with _admitted_media(download_video(
+            expanded, None, max_bytes=limit, capped=True, cancel_event=cancel_event,
+            progress=progress,
+        ), False, progress=progress, cancel_event=cancel_event) as media:
+            if media.file_size > limit or cancel_event.is_set():
+                raise DownloadFailedError("Видео превышает лимит или время подготовки.")
+            progress.phase = PHASE_UPLOAD
+            progress.downloaded = media.file_size
+            async with _upload_capacity.slot(media.file_size, False, db, "tiktok"):
+                sent = await _send_paced(
+                    lambda: bot.send_video(
+                        chat_id, FSInputFile(media.path), supports_streaming=True,
+                        duration=media.duration, width=media.width, height=media.height,
+                        disable_notification=True,
+                    ),
+                    _upload_timeout(media.file_size),
+                )
+            if not sent.video:
+                raise DownloadFailedError("Telegram не принял файл как видео.")
+            await db.store_cached_file(
+                hash_url(expanded), _INLINE_CACHE_KEY, sent.video.file_id, media.file_size,
+            )
+    except Exception:
+        logger.info("TikTok inline preparation failed", exc_info=True)
+        _inline_failed[url] = time.monotonic() + 30
+        _inline_failed.move_to_end(url)
+        if len(_inline_failed) > 256:
+            _inline_failed.popitem(last=False)
+    finally:
+        cancellation.cancel()
+        _inline_progress.pop(url, None)
+        _inline_jobs.pop(url, None)
+
+
+@router.inline_query()
+async def handle_inline_tiktok(query: InlineQuery, db: Database, settings: Settings) -> None:
+    url = _inline_tiktok_link(query.query.strip())
+    if not url:
+        await query.answer([], cache_time=0, is_personal=True)
+        return
+    resolved = _expanded_links.get(url, url)
+    url_hash = hash_url(resolved)
+    limit = _user_limit(settings, query.from_user.id)
+    for key in (_INLINE_CACHE_KEY, _video_cache_key("tiktok"), _video_cache_key("tiktok", capped=True)):
+        cached = await db.get_cached_file(url_hash, key)
+        if cached and cached["file_size"] is not None and cached["file_size"] <= limit:
+            try:
+                await query.answer([InlineQueryResultCachedVideo(
+                    id=url_hash, video_file_id=cached["file_id"],
+                    title="Видео TikTok", caption=_CAPTION,
+                )], cache_time=30, is_personal=True)
+                return
+            except TelegramBadRequest as exc:
+                if "file" not in exc.message.lower():
+                    raise
+
+    chat_id = _inline_cache_chat()
+    if chat_id and time.monotonic() >= _inline_failed.get(url, 0):
+        if (url not in _inline_jobs and len(_inline_jobs) < 2
+                and all(owner != query.from_user.id for owner, _ in _inline_jobs.values())):
+            task = asyncio.create_task(
+                _prepare_inline_tiktok(query.bot, db, url, settings, query.from_user.id, chat_id)
+            )
+            _inline_jobs[url] = (query.from_user.id, task)
+    if url in _inline_jobs:
+        await query.answer([InlineQueryResultArticle(
+            id="prepare:" + url_hash[:48],
+            title="Отправить видео TikTok",
+            description="Бот покажет ход загрузки и заменит сообщение видео",
+            input_message_content=InputTextMessageContent(message_text="Готовлю видео TikTok…"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Открыть оригинал", url=url),
+            ]]),
+        )], cache_time=0, is_personal=True)
+        return
+    await query.answer([], cache_time=0, is_personal=True, button=InlineQueryResultsButton(
+        text="Открыть бота", start_parameter="inline",
+    ))
+
+
+@router.chosen_inline_result(F.result_id.startswith("prepare:"))
+async def finish_inline_tiktok(result: ChosenInlineResult, db: Database, settings: Settings) -> None:
+    url = _inline_tiktok_link(result.query.strip())
+    message_id = result.inline_message_id
+    if not url or not message_id:
+        return
+    bot = result.bot
+    job = _inline_jobs.get(url)
+    last_text = "Готовлю видео TikTok…"
+    deadline = time.monotonic() + 180
+    while job and not job[1].done() and time.monotonic() < deadline:
+        progress = _inline_progress.get(url)
+        if progress is None or not progress.downloaded:
+            text = "Получаю видео из TikTok…"
+        elif progress.phase == PHASE_UPLOAD:
+            text = "Загружаю видео в Telegram…"
+        elif progress.total:
+            percent = min(100, progress.downloaded * 100 // progress.total)
+            text = f"Скачиваю видео TikTok… {percent}%"
+        else:
+            text = f"Скачиваю видео TikTok… {progress.downloaded / 1024**2:.1f} МиБ"
+        if text != last_text:
+            with suppress(TelegramAPIError):
+                await bot.edit_message_text(text, inline_message_id=message_id)
+            last_text = text
+        await asyncio.wait({job[1]}, timeout=3)
+
+    url_hash = hash_url(_expanded_links.get(url, url))
+    cached = await db.get_cached_file(url_hash, _INLINE_CACHE_KEY)
+    if cached and cached["file_size"] <= _user_limit(settings, result.from_user.id):
+        try:
+            await bot.edit_message_media(
+                media=InputMediaVideo(media=cached["file_id"], caption=_CAPTION),
+                inline_message_id=message_id,
+            )
+            return
+        except TelegramAPIError:
+            logger.info("Could not replace inline TikTok status with video", exc_info=True)
+    with suppress(TelegramAPIError):
+        await bot.edit_message_text(
+            "Не удалось подготовить видео TikTok. Попробуйте ещё раз.",
+            inline_message_id=message_id,
+        )
+
+
 async def _send_cached_video(
     message: Message,
     db: Database,
@@ -2008,7 +2198,8 @@ async def _send_cached_video(
             _remember_description(token, description.strip())
         file_id = cached["file_id"]
         keyboard = _video_keyboard(
-            token, with_description, platform == "tiktok"
+            token, with_description, platform == "tiktok",
+            share_url=url if platform == "tiktok" else None,
         )
         caption = _video_caption(bool(source_hdr))
         try:
